@@ -5,11 +5,11 @@ Central design decision of this project: this is the ONLY module that knows
 about both Celery and the publishers. The `publish_job` task:
   1. Persists every job state change to the database (queued -> processing
      -> published/failed), as required by the spec.
-  2. Calls the publisher (a pure function, see app/publishers/fake.py) and
-     translates the typed exceptions it can raise into infrastructure
-     decisions: retry with exponential backoff (TransientError) or route to
-     the dead-letter queue (PermanentError, or a TransientError that
-     exhausted its retries).
+  2. Calls the publisher for the job's platform (a pure function, see
+     app/publishers/) and translates the typed exceptions it can raise into
+     infrastructure decisions: retry with exponential backoff
+     (TransientError) or route to the dead-letter queue (PermanentError, or
+     a TransientError that exhausted its retries).
 The publisher knows nothing about any of this; if the retry policy changes
 tomorrow (e.g. 5 attempts instead of 3), only this file needs to change.
 """
@@ -20,6 +20,19 @@ from app.db import SessionLocal
 from app.exceptions import PermanentError, TransientError
 from app.models import Job, JobStatus
 from app.publishers import fake as fake_publisher
+from app.publishers import youtube as youtube_publisher
+
+# Per-platform publisher routing. Platforms without a real integration yet
+# fall back to the fake publisher, so demo/test platforms keep working
+# exactly as before. Adding a new real publisher later is a one-line change
+# here, not a change to publish_job's retry/DLQ logic.
+_PUBLISHERS_BY_PLATFORM = {
+    "youtube": youtube_publisher.publish,
+}
+
+
+def _get_publisher(platform: str):
+    return _PUBLISHERS_BY_PLATFORM.get(platform, fake_publisher.publish)
 
 
 def _mark_failed_and_deadletter(db, job: Job, error: Exception) -> None:
@@ -49,8 +62,9 @@ def publish_job(self, job_id: int) -> None:
         job.attempts += 1
         db.commit()
 
+        publisher = _get_publisher(job.platform)
         try:
-            fake_publisher.publish(job.platform, job.payload)
+            publisher(job.platform, job.payload)
         except TransientError as exc:
             job.error_message = str(exc)
             db.commit()
