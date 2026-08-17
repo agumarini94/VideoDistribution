@@ -26,7 +26,7 @@ levantar Redis ni un worker.
 
 - Python 3.11+
 - Celery (broker: Redis)
-- SQLAlchemy + SQLite (migraremos a Postgres más adelante; solo cambia `DATABASE_URL`)
+- SQLAlchemy + PostgreSQL (Neon)
 
 ## Setup
 
@@ -35,10 +35,11 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env  # opcional, los defaults ya apuntan a localhost:6379
+cp .env.example .env  # completar DATABASE_URL con tu connection string de Neon
 ```
 
-Redis debe estar corriendo en `localhost:6379` (según el enunciado, ya está levantado).
+Redis debe estar corriendo en `localhost:6379`. `DATABASE_URL` es obligatoria: la app
+falla al arrancar si no está seteada (ver `app/config.py`).
 
 ## Correr todo
 
@@ -56,8 +57,8 @@ celery -A app.celery_app worker --loglevel=info -Q celery,dlq
 python -m scripts.enqueue_demo
 ```
 
-Esto crea la base SQLite (`distribution_engine.db`) si no existe, inserta 10 jobs
-en estado `queued` y los despacha con `publish_job.delay(job.id)`.
+Esto crea las tablas en Postgres si no existen, inserta 10 jobs en estado `queued`
+y los despacha con `publish_job.delay(job.id)`.
 
 **3. Ver el resultado:**
 
@@ -88,7 +89,7 @@ Ver `app/config.py` / `.env.example`:
 | Variable | Default | Descripción |
 |---|---|---|
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis usado como broker y result backend |
-| `DATABASE_URL` | `sqlite:///./distribution_engine.db` | Conexión SQLAlchemy |
+| `DATABASE_URL` | *(sin default, obligatoria)* | Connection string de Postgres (Neon) |
 | `MAX_RETRIES` | `3` | Reintentos máximos ante error transitorio |
 | `RETRY_BACKOFF_BASE` | `2` | Base del backoff exponencial (segundos) |
 | `DLQ_QUEUE_NAME` | `dlq` | Nombre de la cola de dead-letter |
@@ -96,5 +97,6 @@ Ver `app/config.py` / `.env.example`:
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
 - Publishers reales para cada red social (hoy solo existe el fake).
-- Migración de SQLite a Postgres (alcanza con cambiar `DATABASE_URL` cuando llegue el momento).
+- Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
 - Alertas/monitoreo sobre la dead-letter queue (`handle_dead_letter` es un punto de extensión, hoy no hace nada).
+- Deploy en Fly.io y almacenamiento de media en Cloudflare R2 (decisiones de stack para la Fase 2a, ver `CLAUDE.md`; todavía no implementadas).

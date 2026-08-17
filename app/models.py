@@ -1,11 +1,11 @@
 """
-Modelo de datos del job de publicación.
+Data model for a publication job.
 
-Decisión de diseño: el estado del job (JobStatus) modela explícitamente la
-state machine del spec: queued -> processing -> published / failed. No usamos
-strings sueltos ("queued", "processing", ...) desperdigados por el código;
-todo pasa por este enum para que sea imposible, por ejemplo, escribir
-"pending" en un lugar y "queued" en otro.
+Design decision: the job state (JobStatus) explicitly models the spec's
+state machine: queued -> processing -> published / failed. We don't scatter
+loose strings ("queued", "processing", ...) across the code; everything
+goes through this enum so it's impossible to write "pending" in one place
+and "queued" in another.
 """
 
 import enum
@@ -23,14 +23,14 @@ def _utcnow() -> datetime:
 
 class JobStatus(str, enum.Enum):
     """
-    Estados de la state machine del job.
+    States of the job's state machine.
 
-    queued     -> job creado, esperando a que un worker lo tome.
-    processing -> un worker está intentando publicarlo ahora mismo.
-    published  -> se publicó con éxito. Estado terminal.
-    failed     -> se agotaron los reintentos (error transitorio) o el error
-                  fue permanente. Estado terminal; el job queda además
-                  enrutado a la dead-letter queue para revisión manual.
+    queued     -> job created, waiting for a worker to pick it up.
+    processing -> a worker is attempting to publish it right now.
+    published  -> published successfully. Terminal state.
+    failed     -> retries were exhausted (transient error) or the error was
+                  permanent. Terminal state; the job is also routed to the
+                  dead-letter queue for manual review.
     """
 
     QUEUED = "queued"
@@ -41,20 +41,20 @@ class JobStatus(str, enum.Enum):
 
 class Job(Base):
     """
-    Representa un pedido de publicación de contenido en una red social.
+    Represents a request to publish content on a social network.
 
-    payload es JSON libre (texto, imágenes, hashtags, etc.) porque cada
-    plataforma requiere campos distintos; validar su forma es responsabilidad
-    del publisher correspondiente, no de este modelo.
+    payload is free-form JSON (text, images, hashtags, etc.) because each
+    platform requires different fields; validating its shape is the
+    responsibility of the corresponding publisher, not this model.
     """
 
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    # Nombre de la red social destino (ej: "twitter", "instagram"). Es un
-    # string libre y no un enum porque agregar una plataforma nueva no debería
-    # requerir una migración de esquema.
+    # Name of the target social network (e.g. "twitter", "instagram"). It's a
+    # free string rather than an enum because adding a new platform shouldn't
+    # require a schema migration.
     platform: Mapped[str] = mapped_column(String(50), nullable=False)
 
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -65,17 +65,17 @@ class Job(Base):
         default=JobStatus.QUEUED,
     )
 
-    # Cantidad de intentos de publicación realizados (incluye el primero,
-    # no solo los reintentos). Sirve para auditoría y para decidir backoff.
+    # Number of publication attempts made (includes the first attempt, not
+    # just the retries). Used for auditing and for deciding backoff.
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # Mensaje del último error visto (transitorio o permanente). Null si
-    # todavía no hubo ningún intento fallido.
+    # Message of the last error seen (transient or permanent). Null if there
+    # hasn't been a failed attempt yet.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Momento en el que el job debería procesarse. Hoy se usa igual a
-    # created_at al encolar, pero queda preparado para programar publicaciones
-    # a futuro sin cambiar el modelo.
+    # Point in time at which the job should be processed. Today it's set
+    # equal to created_at when enqueued, but this field is ready to support
+    # scheduling future publications without changing the model.
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -83,5 +83,5 @@ class Job(Base):
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
 
-    def __repr__(self) -> str:  # pragma: no cover - solo para debugging
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
         return f"Job(id={self.id}, platform={self.platform!r}, status={self.status.value})"

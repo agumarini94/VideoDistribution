@@ -1,17 +1,17 @@
 """
-Tareas Celery: la capa de orquestación del motor de distribución.
+Celery tasks: the distribution engine's orchestration layer.
 
-Decisión de diseño central del proyecto: este módulo es el ÚNICO que conoce
-tanto a Celery como a los publishers. La tarea `publish_job`:
-  1. Persiste cada cambio de estado del job en la base (queued -> processing
-     -> published/failed), como pide el spec.
-  2. Llama al publisher (una función pura, ver app/publishers/fake.py) y
-     traduce las excepciones tipadas que puede lanzar en decisiones de
-     infraestructura: reintentar con backoff exponencial (TransientError) o
-     mandar a la dead-letter queue (PermanentError, o TransientError que
-     agotó sus reintentos).
-El publisher no sabe nada de esto; si mañana cambia la política de retries
-(por ejemplo, 5 intentos en vez de 3), se toca este archivo y ningún otro.
+Central design decision of this project: this is the ONLY module that knows
+about both Celery and the publishers. The `publish_job` task:
+  1. Persists every job state change to the database (queued -> processing
+     -> published/failed), as required by the spec.
+  2. Calls the publisher (a pure function, see app/publishers/fake.py) and
+     translates the typed exceptions it can raise into infrastructure
+     decisions: retry with exponential backoff (TransientError) or route to
+     the dead-letter queue (PermanentError, or a TransientError that
+     exhausted its retries).
+The publisher knows nothing about any of this; if the retry policy changes
+tomorrow (e.g. 5 attempts instead of 3), only this file needs to change.
 """
 
 from app.celery_app import celery_app
@@ -24,10 +24,9 @@ from app.publishers import fake as fake_publisher
 
 def _mark_failed_and_deadletter(db, job: Job, error: Exception) -> None:
     """
-    Transición común a los dos caminos que terminan en dead-letter:
-    error permanente, o error transitorio que agotó sus reintentos.
-    Queda en un solo lugar para que ambos caminos persistan y enruten
-    exactamente igual.
+    Shared transition for the two paths that end up in the dead-letter
+    queue: a permanent error, or a transient error that exhausted its
+    retries. Kept in one place so both paths persist and route identically.
     """
     job.status = JobStatus.FAILED
     job.error_message = str(error)
@@ -42,8 +41,8 @@ def publish_job(self, job_id: int) -> None:
     try:
         job = db.get(Job, job_id)
         if job is None:
-            # El job no existe (por ejemplo, se borró de la base a mano).
-            # No hay nada que reintentar ni dónde persistir un error.
+            # The job doesn't exist (e.g. it was deleted from the database
+            # by hand). Nothing to retry and nowhere to persist an error.
             return
 
         job.status = JobStatus.PROCESSING
@@ -56,22 +55,23 @@ def publish_job(self, job_id: int) -> None:
             job.error_message = str(exc)
             db.commit()
 
-            # Chequeamos el límite ANTES de llamar a self.retry(): es más
-            # explícito y evita depender de capturar MaxRetriesExceededError,
-            # cuya semántica exacta (qué excepción llega hasta acá) varía
-            # entre ejecución normal y modo eager. self.request.retries es
-            # la cantidad de reintentos ya realizados para esta tarea.
+            # We check the limit BEFORE calling self.retry(): it's more
+            # explicit and avoids depending on catching
+            # MaxRetriesExceededError, whose exact semantics (which
+            # exception actually reaches here) differ between normal
+            # execution and eager mode. self.request.retries is the number
+            # of retries already performed for this task.
             if self.request.retries >= self.max_retries:
-                # Se agotaron los reintentos: un error transitorio persistente
-                # se trata como permanente y se manda a la dead-letter queue.
+                # Retries exhausted: a persistent transient error is treated
+                # as permanent and routed to the dead-letter queue.
                 _mark_failed_and_deadletter(db, job, exc)
             else:
-                # Backoff exponencial: intento 0 -> 1s, intento 1 -> 2s,
-                # intento 2 -> 4s (con retry_backoff_base=2, el default).
+                # Exponential backoff: attempt 0 -> 1s, attempt 1 -> 2s,
+                # attempt 2 -> 4s (with the default retry_backoff_base=2).
                 countdown = settings.retry_backoff_base**self.request.retries
                 self.retry(exc=exc, countdown=countdown)
         except PermanentError as exc:
-            # Errores permanentes no se reintentan nunca: van directo a DLQ.
+            # Permanent errors are never retried: they go straight to the DLQ.
             _mark_failed_and_deadletter(db, job, exc)
         else:
             job.status = JobStatus.PUBLISHED
@@ -83,13 +83,13 @@ def publish_job(self, job_id: int) -> None:
 @celery_app.task
 def handle_dead_letter(job_id: int, reason: str) -> None:
     """
-    Tarea que recibe los jobs enrutados a la cola "dlq".
+    Task that receives jobs routed to the "dlq" queue.
 
-    El job ya quedó persistido como FAILED por publish_job antes de llegar
-    acá; esta tarea es el punto de extensión para lo que se quiera hacer
-    con errores permanentes más adelante (alertar, notificar a un humano,
-    reintentar manualmente vía un endpoint, etc.). Por ahora no hace nada
-    más que existir como destino explícito de la cola "dlq", separado del
-    procesamiento normal.
+    The job has already been persisted as FAILED by publish_job before it
+    gets here; this task is the extension point for whatever should happen
+    with permanent errors later on (alerting, notifying a human, manual
+    retries via an endpoint, etc.). For now it does nothing beyond existing
+    as an explicit destination for the "dlq" queue, separate from normal
+    processing.
     """
     return None

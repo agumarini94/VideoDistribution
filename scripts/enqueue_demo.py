@@ -1,13 +1,13 @@
 """
-Script de demo: crea 10 jobs de prueba y los encola para publicación.
+Demo script: creates 10 test jobs and enqueues them for publication.
 
-Se ejecuta desde la raíz del proyecto con:
+Run it from the project root with:
     python -m scripts.enqueue_demo
 
-Decisión de diseño: este script vive fuera de app/ porque no es parte del
-motor en sí, es una herramienta de operación/demo. Usa las mismas piezas
-(Job, SessionLocal, publish_job) que usaría cualquier otro punto de entrada
-real (una API HTTP, por ejemplo), para probar el flujo end-to-end.
+Design decision: this script lives outside app/ because it isn't part of
+the engine itself, it's an operations/demo tool. It uses the same building
+blocks (Job, SessionLocal, publish_job) that any other real entry point
+(an HTTP API, for example) would use, to exercise the end-to-end flow.
 """
 
 from app.db import SessionLocal, init_db
@@ -19,13 +19,13 @@ PLATFORMS = ["twitter", "instagram", "linkedin", "facebook"]
 
 def build_demo_payload(index: int) -> dict:
     return {
-        "text": f"Post de prueba #{index}",
+        "text": f"Demo post #{index}",
         "hashtags": ["demo", "distribution-engine"],
     }
 
 
 def main() -> None:
-    # Idempotente: si las tablas ya existen no hace nada.
+    # Idempotent: does nothing if the tables already exist.
     init_db()
 
     db = SessionLocal()
@@ -42,12 +42,12 @@ def main() -> None:
 
         db.commit()
 
-        # Recién acá tenemos los ids (autoincrement), así que encolamos
-        # después del commit.
+        # We only have the ids (autoincrement) after the commit, so we
+        # enqueue afterwards.
         for job in jobs:
             publish_job.delay(job.id)
 
-        print(f"Se crearon y encolaron {len(jobs)} jobs de prueba.")
+        print(f"Created and enqueued {len(jobs)} demo jobs.")
     finally:
         db.close()
 

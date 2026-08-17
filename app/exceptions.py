@@ -1,36 +1,37 @@
 """
-Excepciones tipadas del dominio de publicación.
+Typed exceptions for the publication domain.
 
-Decisión de diseño: estas excepciones son el "contrato" entre los publishers
-y la capa de orquestación (Celery). Un publisher nunca decide si algo se
-reintenta o no; solo clasifica el error que tuvo. Quien decide qué hacer con
-esa clasificación es app/tasks.py. Esto permite:
-  - Testear publishers sin Celery (son funciones puras que solo pueden
-    devolver un resultado o lanzar una de estas dos excepciones).
-  - Agregar publishers reales (Twitter, LinkedIn, etc.) más adelante sin
-    tocar la lógica de retry/DLQ: alcanza con que mapeen sus propios errores
-    HTTP a TransientError o PermanentError.
+Design decision: these exceptions are the "contract" between publishers and
+the orchestration layer (Celery). A publisher never decides whether
+something gets retried; it only classifies the error it hit. Whoever
+decides what to do with that classification is app/tasks.py. This enables:
+  - Testing publishers without Celery (they are pure functions that can
+    only return a result or raise one of these two exceptions).
+  - Adding real publishers (Twitter, LinkedIn, etc.) later without touching
+    the retry/DLQ logic: it's enough for them to map their own HTTP errors
+    to TransientError or PermanentError.
 """
 
 
 class PublishError(Exception):
-    """Clase base de cualquier error de publicación."""
+    """Base class for any publication error."""
 
 
 class TransientError(PublishError):
     """
-    Error temporal (ej: HTTP 429 Too Many Requests, HTTP 5xx del proveedor).
+    Temporary error (e.g. HTTP 429 Too Many Requests, HTTP 5xx from the
+    provider).
 
-    Se asume que reintentar más tarde puede resolver el problema, por eso
-    la tarea Celery aplica backoff exponencial ante este tipo de error.
+    Retrying later is assumed to possibly fix the problem, which is why the
+    Celery task applies exponential backoff for this kind of error.
     """
 
 
 class PermanentError(PublishError):
     """
-    Error permanente (ej: HTTP 400 Bad Request: payload inválido, credenciales
-    revocadas, plataforma inexistente).
+    Permanent error (e.g. HTTP 400 Bad Request: invalid payload, revoked
+    credentials, nonexistent platform).
 
-    Reintentar no cambia el resultado, por eso la tarea Celery lo manda
-    directo a la dead-letter queue sin gastar reintentos.
+    Retrying doesn't change the outcome, which is why the Celery task routes
+    it straight to the dead-letter queue without spending retries.
     """

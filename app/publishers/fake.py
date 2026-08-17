@@ -1,44 +1,48 @@
+"""It's like a fake YouTube: it simulates uploading the data, 6 out of 10
+succeed, 3 come back with "I'm overloaded", and 1 errors out. It's basically
+a simulator to use while I don't have YouTube connected yet."""
 """
-Publisher simulado (fake), para desarrollar y probar el motor sin depender
-de ninguna API real de redes sociales todavía.
+Fake publisher, used to develop and test the engine without depending on
+any real social network API yet.
 
-Decisión de diseño clave del proyecto: un publisher es una función pura.
-- No conoce Celery: no sabe qué es un retry, una cola, ni un job_id de
-  base de datos. Solo recibe los datos mínimos para "publicar" y devuelve
-  un resultado o lanza una excepción tipada.
-- No imprime nada a pantalla: si necesitara loggear, sería responsabilidad
-  de quien lo llama (la tarea Celery), no del publisher.
-Esto hace que sea trivial testear el publisher en un test unitario común
-(sin levantar Redis ni un worker) y que, el día que se agregue un publisher
-real (app/publishers/twitter.py, por ejemplo), tenga exactamente la misma
-forma: publish(platform_payload) -> dict | raise TransientError/PermanentError.
+Key design decision of this project: a publisher is a pure function.
+- It doesn't know about Celery: it has no idea what a retry, a queue, or a
+  database job_id is. It only receives the minimum data needed to
+  "publish" and returns a result or raises a typed exception.
+- It doesn't print anything to screen: if logging were needed, that would
+  be the caller's responsibility (the Celery task), not the publisher's.
+This makes it trivial to test the publisher in a plain unit test (without
+spinning up Redis or a worker), and means that the day a real publisher
+gets added (app/publishers/twitter.py, for example), it will have exactly
+the same shape: publish(platform, payload) -> dict | raise
+TransientError/PermanentError.
 """
 
 import random
 
 from app.exceptions import PermanentError, TransientError
 
-# Probabilidades fijas según el spec: 30% error transitorio (429),
-# 10% error permanente (400), 60% éxito.
+# Fixed probabilities per the spec: 30% transient error (429),
+# 10% permanent error (400), 60% success.
 _PROBABILITY_TRANSIENT = 0.30
 _PROBABILITY_PERMANENT = 0.10
 
 
 def publish(platform: str, payload: dict) -> dict:
     """
-    Simula la publicación de `payload` en `platform`.
+    Simulates publishing `payload` on `platform`.
 
-    Devuelve un dict con el resultado simulado si "publica" con éxito.
-    Lanza TransientError (simulando HTTP 429) o PermanentError (simulando
-    HTTP 400) según el resultado aleatorio, para poder ejercitar la lógica
-    de retry/backoff y dead-letter queue del resto del sistema.
+    Returns a dict with the simulated result if it "publishes" successfully.
+    Raises TransientError (simulating HTTP 429) or PermanentError (simulating
+    HTTP 400) based on the random roll, so the rest of the system's
+    retry/backoff and dead-letter queue logic can be exercised.
     """
     roll = random.random()
 
     if roll < _PROBABILITY_TRANSIENT:
-        raise TransientError(f"429 Too Many Requests: rate limit alcanzado en {platform}")
+        raise TransientError(f"429 Too Many Requests: rate limit reached on {platform}")
 
     if roll < _PROBABILITY_TRANSIENT + _PROBABILITY_PERMANENT:
-        raise PermanentError(f"400 Bad Request: payload inválido para {platform}")
+        raise PermanentError(f"400 Bad Request: invalid payload for {platform}")
 
     return {"platform": platform, "external_id": f"fake-{random.randint(100000, 999999)}"}

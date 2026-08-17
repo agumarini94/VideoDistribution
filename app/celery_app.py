@@ -1,10 +1,13 @@
 """
-Instancia de Celery.
+Celery is a Python library for running tasks in the background, outside of
+the main program.
 
-Decisión de diseño: la app de Celery vive en su propio módulo, separada de
-tasks.py. Así, `celery -A app.celery_app worker` no necesita importar primero
-las tareas (evita ciclos) y cualquier script que solo necesite despachar
-tareas (como scripts/enqueue_demo.py) puede importar app.tasks sin sorpresas.
+Celery app instance.
+
+Design decision: the Celery app lives in its own module, separate from
+tasks.py. That way, `celery -A app.celery_app worker` doesn't need to import
+the tasks first (avoids cycles), and any script that just needs to dispatch
+tasks (like scripts/enqueue_demo.py) can import app.tasks without surprises.
 """
 
 from celery import Celery
@@ -24,10 +27,10 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    # Enrutamos explícitamente la tarea de dead-letter a su propia cola.
-    # Un worker normal (`-Q celery`) nunca la procesa; hace falta un worker
-    # dedicado a la cola "dlq" (o el mismo worker escuchando ambas colas)
-    # para que alguien se haga cargo de los errores permanentes.
+    # Explicitly route the dead-letter task to its own queue. A normal
+    # worker (`-Q celery`) never processes it; a worker dedicated to the
+    # "dlq" queue (or the same worker listening to both queues) is needed
+    # for someone to handle permanent errors.
     task_routes={
         "app.tasks.handle_dead_letter": {"queue": settings.dlq_queue_name},
     },

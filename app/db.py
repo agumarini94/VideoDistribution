@@ -1,10 +1,10 @@
 """
-Configuración de SQLAlchemy: engine, sesión y Base declarativa.
+SQLAlchemy setup: engine, session and declarative Base.
 
-Decisión de diseño: Base vive acá (no en models.py) para que db.py no dependa
-de models.py. Es models.py quien importa Base desde acá. Así evitamos import
-circular entre "el módulo que define las tablas" y "el módulo que sabe cómo
-conectarse a la base".
+Design decision: Base lives here (not in models.py) so db.py doesn't depend
+on models.py. It's models.py that imports Base from here. This avoids a
+circular import between "the module that defines the tables" and "the
+module that knows how to connect to the database".
 """
 
 from sqlalchemy import create_engine
@@ -12,12 +12,7 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
 
-# check_same_thread=False es necesario para SQLite cuando la conexión puede
-# ser usada desde distintos threads (workers de Celery, por ejemplo). No
-# aplica a otros motores, así que solo lo agregamos si estamos en SQLite.
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-
-engine = create_engine(settings.database_url, connect_args=connect_args)
+engine = create_engine(settings.database_url)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -28,12 +23,12 @@ class Base(DeclarativeBase):
 
 def init_db() -> None:
     """
-    Crea las tablas si no existen. Idempotente: se puede llamar en cada
-    arranque sin riesgo. Cuando migremos a Postgres, esto se reemplaza por
-    migraciones reales (Alembic); por ahora, para una SQLite de desarrollo,
-    alcanza con create_all.
+    Creates the tables if they don't exist yet. Idempotent: safe to call on
+    every startup. This is a stand-in for real migrations (Alembic) while
+    the schema is still small and changing; once it stabilizes, this should
+    be replaced by proper migrations instead of create_all.
     """
-    # Import local para evitar el ciclo db -> models -> db al importar el módulo.
+    # Local import to avoid the db -> models -> db cycle when this module is imported.
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
