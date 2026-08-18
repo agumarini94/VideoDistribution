@@ -14,6 +14,10 @@ The publisher knows nothing about any of this; if the retry policy changes
 tomorrow (e.g. 5 attempts instead of 3), only this file needs to change.
 """
 
+from datetime import datetime
+
+from sqlalchemy import update
+
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import SessionLocal
@@ -119,3 +123,36 @@ def handle_dead_letter(job_id: int, reason: str) -> None:
         f"Attempts: {attempts}\n"
         f"Error: {reason}"
     )
+
+
+@celery_app.task
+def dispatch_due_jobs() -> None:
+    """
+    Celery Beat task (see beat_schedule in app/celery_app.py), runs every
+    60s. Claims SCHEDULED jobs whose scheduled_at is due and dispatches them.
+
+    The UPDATE ... RETURNING below is the row-level claim: it atomically
+    flips status from SCHEDULED to QUEUED for due jobs in a single
+    statement. If Beat fires this task again before a previous run
+    finished, or multiple workers/beats exist later, only one execution's
+    UPDATE can actually claim a given row — Postgres's row locking means a
+    concurrent UPDATE targeting the same row waits, then finds status is no
+    longer SCHEDULED and matches nothing, instead of both claiming it. This
+    is safer than a SELECT-then-UPDATE, which would race.
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.now()
+        claim = (
+            update(Job)
+            .where(Job.status == JobStatus.SCHEDULED, Job.scheduled_at <= now)
+            .values(status=JobStatus.QUEUED)
+            .returning(Job.id)
+        )
+        claimed_ids = [row[0] for row in db.execute(claim)]
+        db.commit()
+    finally:
+        db.close()
+
+    for job_id in claimed_ids:
+        publish_job.delay(job_id)

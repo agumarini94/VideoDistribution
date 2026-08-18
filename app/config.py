@@ -9,6 +9,7 @@ never the business logic.
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -70,3 +71,79 @@ class Settings:
 
 
 settings = Settings()
+
+
+# --- Time-slot scheduling (Phase 5) -----------------------------------------
+#
+# NOTE ON TIMEZONES: slot times and next_slot_for()'s `now` are naive local
+# time (whatever timezone the server/process runs in). There is no
+# per-platform or per-account timezone support yet, which is fine for a
+# single-region deployment but will need real timezone handling before this
+# runs somewhere with users/accounts across multiple timezones.
+
+_DEFAULT_PLATFORM_TIME_SLOTS: dict[str, list[str]] = {
+    "twitter": ["09:00", "13:00", "18:00"],
+    "tiktok": ["12:00", "19:00"],
+    "youtube": ["15:00"],
+    "default": ["12:00"],
+}
+
+
+def _parse_time_slots_env(raw: str) -> dict[str, list[str]]:
+    """
+    Parses TIME_SLOTS="twitter=09:00,13:00,18:00;tiktok=12:00,19:00" into a
+    dict of platform -> list of "HH:MM" strings, validating each time.
+    Platforms not mentioned keep their default slots (see
+    _build_platform_time_slots below); this only overrides the ones listed.
+    """
+    slots: dict[str, list[str]] = {}
+    for chunk in filter(None, (part.strip() for part in raw.split(";"))):
+        if "=" not in chunk:
+            raise RuntimeError(
+                f"Invalid TIME_SLOTS entry {chunk!r}: expected 'platform=HH:MM,HH:MM'."
+            )
+        platform, times_raw = chunk.split("=", 1)
+        platform = platform.strip().lower()
+        times = [t.strip() for t in times_raw.split(",") if t.strip()]
+        for t in times:
+            try:
+                datetime.strptime(t, "%H:%M")
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid time {t!r} for platform {platform!r} in TIME_SLOTS "
+                    "(expected 24h HH:MM)."
+                ) from exc
+        slots[platform] = times
+    return slots
+
+
+def _build_platform_time_slots() -> dict[str, list[str]]:
+    slots = dict(_DEFAULT_PLATFORM_TIME_SLOTS)
+    raw = os.getenv("TIME_SLOTS", "").strip()
+    if raw:
+        slots.update(_parse_time_slots_env(raw))
+    return slots
+
+
+# platform (lowercase) -> list of "HH:MM" slots. Platforms with no entry
+# fall back to PLATFORM_TIME_SLOTS["default"] (see next_slot_for).
+PLATFORM_TIME_SLOTS: dict[str, list[str]] = _build_platform_time_slots()
+
+
+def next_slot_for(platform: str, now: datetime) -> datetime:
+    """
+    Returns the next datetime (naive, local time) at which `platform` has a
+    configured time slot, starting strictly after `now`: today's next slot
+    if one hasn't passed yet, otherwise tomorrow's earliest slot.
+    """
+    times = PLATFORM_TIME_SLOTS.get(platform.lower(), PLATFORM_TIME_SLOTS["default"])
+    slot_times = sorted(datetime.strptime(t, "%H:%M").time() for t in times)
+
+    for slot_time in slot_times:
+        candidate = datetime.combine(now.date(), slot_time)
+        if candidate > now:
+            return candidate
+
+    # Every slot today has already passed: tomorrow's first one.
+    tomorrow = now.date() + timedelta(days=1)
+    return datetime.combine(tomorrow, slot_times[0])

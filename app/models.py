@@ -2,10 +2,11 @@
 Data model for a publication job.
 
 Design decision: the job state (JobStatus) explicitly models the spec's
-state machine: queued -> processing -> published / failed. We don't scatter
-loose strings ("queued", "processing", ...) across the code; everything
-goes through this enum so it's impossible to write "pending" in one place
-and "queued" in another.
+state machine: scheduled -> queued -> processing -> published / failed
+(scheduled is optional; jobs created without a time slot start at queued).
+We don't scatter loose strings ("queued", "processing", ...) across the
+code; everything goes through this enum so it's impossible to write
+"pending" in one place and "queued" in another.
 """
 
 import enum
@@ -25,7 +26,10 @@ class JobStatus(str, enum.Enum):
     """
     States of the job's state machine.
 
-    queued     -> job created, waiting for a worker to pick it up.
+    scheduled  -> job created for a future time slot (scheduled_at set);
+                  waiting for the dispatch_due_jobs Beat task to claim it
+                  once scheduled_at is due. Skipped entirely for urgent jobs.
+    queued     -> ready for a worker to pick it up right now.
     processing -> a worker is attempting to publish it right now.
     published  -> published successfully. Terminal state.
     failed     -> retries were exhausted (transient error) or the error was
@@ -33,6 +37,7 @@ class JobStatus(str, enum.Enum):
                   dead-letter queue for manual review.
     """
 
+    SCHEDULED = "scheduled"
     QUEUED = "queued"
     PROCESSING = "processing"
     PUBLISHED = "published"
@@ -73,9 +78,9 @@ class Job(Base):
     # hasn't been a failed attempt yet.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Point in time at which the job should be processed. Today it's set
-    # equal to created_at when enqueued, but this field is ready to support
-    # scheduling future publications without changing the model.
+    # Point in time at which a SCHEDULED job becomes due (see
+    # app.config.next_slot_for). Null for jobs that were never scheduled
+    # (created directly as queued, or dispatched urgently).
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

@@ -21,6 +21,12 @@ celery_app = Celery(
     include=["app.tasks"],
 )
 
+# Name of the queue urgent jobs are routed to. A plain constant (not an env
+# var like dlq_queue_name) because nothing about it needs to be
+# configurable yet; callers that dispatch urgent jobs (see
+# scripts/enqueue_demo.py) import this instead of hardcoding "priority".
+PRIORITY_QUEUE_NAME = "priority"
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
@@ -33,5 +39,14 @@ celery_app.conf.update(
     # for someone to handle permanent errors.
     task_routes={
         "app.tasks.handle_dead_letter": {"queue": settings.dlq_queue_name},
+    },
+    # Celery Beat schedule: dispatch_due_jobs runs every 60s to claim
+    # SCHEDULED jobs whose time slot has arrived. Requires a separate
+    # `celery -A app.celery_app beat` process; see README.
+    beat_schedule={
+        "dispatch-due-jobs-every-60s": {
+            "task": "app.tasks.dispatch_due_jobs",
+            "schedule": 60.0,
+        },
     },
 )
