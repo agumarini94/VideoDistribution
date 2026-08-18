@@ -93,10 +93,10 @@ Ver `app/config.py` / `.env.example`:
 | `MAX_RETRIES` | `3` | Reintentos máximos ante error transitorio |
 | `RETRY_BACKOFF_BASE` | `2` | Base del backoff exponencial (segundos) |
 | `DLQ_QUEUE_NAME` | `dlq` | Nombre de la cola de dead-letter |
+| `ALERT_WEBHOOK_URL` | *(vacío, opcional)* | Webhook de Discord o Slack para alertas de dead-letter; si está vacío, no se envían alertas |
 
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
-- Publishers reales para cada red social (hoy solo existe el fake).
+- Publishers reales para cada red social (hoy solo existe YouTube además del fake).
 - Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
-- Alertas/monitoreo sobre la dead-letter queue (`handle_dead_letter` es un punto de extensión, hoy no hace nada).
 - Deploy en Fly.io y almacenamiento de media en Cloudflare R2 (decisiones de stack para la Fase 2a, ver `CLAUDE.md`; todavía no implementadas).

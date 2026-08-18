@@ -19,6 +19,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.exceptions import PermanentError, TransientError
 from app.models import Job, JobStatus
+from app.notifications import send_alert
 from app.publishers import fake as fake_publisher
 from app.publishers import youtube as youtube_publisher
 
@@ -100,10 +101,21 @@ def handle_dead_letter(job_id: int, reason: str) -> None:
     Task that receives jobs routed to the "dlq" queue.
 
     The job has already been persisted as FAILED by publish_job before it
-    gets here; this task is the extension point for whatever should happen
-    with permanent errors later on (alerting, notifying a human, manual
-    retries via an endpoint, etc.). For now it does nothing beyond existing
-    as an explicit destination for the "dlq" queue, separate from normal
-    processing.
+    gets here; this task's job is to alert a human. We re-fetch the job to
+    include platform/attempts in the alert, since publish_job only passes
+    job_id and reason (the error message) as task args.
     """
-    return None
+    db = SessionLocal()
+    try:
+        job = db.get(Job, job_id)
+        platform = job.platform if job else "unknown"
+        attempts = job.attempts if job else "unknown"
+    finally:
+        db.close()
+
+    send_alert(
+        f"Job #{job_id} moved to the dead-letter queue\n"
+        f"Platform: {platform}\n"
+        f"Attempts: {attempts}\n"
+        f"Error: {reason}"
+    )

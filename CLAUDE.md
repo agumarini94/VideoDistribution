@@ -34,6 +34,12 @@ queue for permanent ones.
   `handle_dead_letter`, queued on `dlq`.
 - `app/celery_app.py` — the Celery app instance, kept separate from
   tasks.py to avoid import cycles.
+- `app/notifications.py` — `send_alert(message)` posts to a Discord/Slack
+  incoming webhook (`ALERT_WEBHOOK_URL`), auto-detecting the payload shape
+  by hostname. Same spirit as the publishers: self-contained, never raises
+  (missing config or a webhook failure are logged and swallowed), so
+  alerting can never break job processing. `handle_dead_letter` calls it
+  with the job id, platform, attempts and error message.
 - `app/db.py` / `app/config.py` — SQLAlchemy session/engine and
   environment-based settings. No other module should read `os.environ`
   directly or import SQLAlchemy engine internals.
@@ -77,6 +83,15 @@ unit-tested without Redis or a worker running.
   Code is written to fail with a clear `PermanentError` when credentials
   are absent rather than crash, so the rest of the system keeps working
   without them.
+
+### Phase 4 (partial)
+- **DLQ alerts via Discord/Slack webhook** (`app/notifications.py`) — every
+  job that lands in the dead-letter queue triggers a `send_alert` call from
+  `handle_dead_letter` with the job id, platform, attempts and error
+  message. Configured via `ALERT_WEBHOOK_URL`; alerting is entirely
+  optional and fails silently (logged, not raised) so it can never take
+  down job processing. `scripts/test_alert.py` sends a one-off test alert
+  to verify a webhook independently of a real DLQ event.
 
 ## Running locally
 

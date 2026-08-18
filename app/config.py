@@ -45,6 +45,12 @@ class Settings:
     # Name of the queue that permanent-error jobs are routed to.
     dlq_queue_name: str = os.getenv("DLQ_QUEUE_NAME", "dlq")
 
+    # Discord or Slack incoming webhook URL used by app/notifications.py to
+    # alert on dead-letter jobs. Optional: an empty value disables alerting
+    # without affecting job processing. .strip() guards against stray
+    # whitespace in .env (e.g. "KEY= value").
+    alert_webhook_url: str = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+
     def __post_init__(self) -> None:
         if not self.database_url:
             raise RuntimeError(

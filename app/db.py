@@ -12,7 +12,15 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
 
-engine = create_engine(settings.database_url)
+# pool_pre_ping and pool_recycle guard against Neon's autosuspend: on the
+# free tier, Neon suspends the database after a period of inactivity and
+# drops existing connections. Without these, a pooled connection that
+# survived a suspend looks fine to SQLAlchemy but fails on first use with
+# "SSL connection has been closed unexpectedly". pool_pre_ping issues a
+# cheap SELECT 1 before handing out a pooled connection and transparently
+# reconnects if it's dead; pool_recycle proactively recycles connections
+# older than 300s so we rarely rely on pre_ping alone.
+engine = create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=300)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
