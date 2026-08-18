@@ -159,6 +159,28 @@ unit-tested without Redis or a worker running.
   for every job, to observe scheduling and priority dispatch without
   opening Neon directly.
 
+## Monitoring dashboard (extra, not in the spec)
+
+- `dashboard/` — a monitoring dashboard for the engine, built without any
+  changes to `app/` (models, tasks, publishers). It only reads the same
+  database (`SessionLocal` from `app/db.py`) and, for retries, calls
+  `publish_job.delay` from `app/tasks.py`.
+  - `dashboard/api.py` — FastAPI app: `GET /api/jobs` (filterable by
+    `status`/`platform`, `limit` default 50, newest first), `GET
+    /api/stats` (counts per `JobStatus` plus total), and `POST
+    /api/jobs/{id}/retry` (only for jobs in `FAILED`: resets `status` to
+    `QUEUED`, `attempts` to 0, clears `error_message`, commits, then
+    dispatches `publish_job.delay(id)`; returns 409 for any other status).
+    CORS is open for localhost. Also serves `dashboard/static/` so the
+    whole dashboard runs from a single process.
+  - `dashboard/static/index.html` — single-file vanilla JS frontend (no
+    build step): stat cards per status, a filterable jobs table with
+    status badges and a Retry button on failed rows, auto-refreshing every
+    5s.
+  - Run with `uvicorn dashboard.api:app --reload --port 8000`.
+  - The dashboard is **read-only** except for the retry action.
+  - Not committed yet (per instruction) — exists locally only.
+
 ## Running locally
 
 See `README.md` for full setup and run instructions. Short version: Redis

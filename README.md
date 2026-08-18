@@ -118,6 +118,23 @@ cuenta/plataforma todavía (ver el comentario en `app/config.py`).
 a ningún publisher; probalo de forma aislada con `python -m scripts.test_storage` una vez
 que tengas las credenciales. Ver `CLAUDE.md` (Fase 3) para el checklist completo.
 
+## Dashboard de monitoreo (extra, fuera del spec)
+
+`dashboard/` es un panel de solo lectura sobre el estado de los jobs (salvo
+por la acción de reintentar un job `failed`). No modifica ni depende de
+lógica nueva en `app/` — solo lee de la misma base y usa `publish_job.delay`
+para reintentar.
+
+```bash
+uvicorn dashboard.api:app --reload --port 8000
+```
+
+Abrí `http://localhost:8000` — sirve el frontend (`dashboard/static/index.html`)
+y expone la API en `/api/jobs`, `/api/stats` y `POST /api/jobs/{id}/retry`
+(esta última solo funciona sobre jobs en estado `failed`; devuelve 409 en
+cualquier otro caso). No requiere el worker de Celery corriendo para mostrar
+datos, pero sí para que un retry se procese de verdad.
+
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
 - Publishers reales para cada red social (hoy solo existe YouTube además del fake).
