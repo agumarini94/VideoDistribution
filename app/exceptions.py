@@ -35,3 +35,15 @@ class PermanentError(PublishError):
     Retrying doesn't change the outcome, which is why the Celery task routes
     it straight to the dead-letter queue without spending retries.
     """
+
+
+class StorageNotConfiguredError(Exception):
+    """
+    Raised by app/storage.py when used without R2 credentials configured
+    (R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME).
+
+    Kept separate from PublishError: storage is a distinct concern from
+    publishing (it isn't wired into any publisher yet), and this is about
+    setup being incomplete, not about a specific upload succeeding or
+    failing.
+    """

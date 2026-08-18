@@ -51,6 +51,16 @@ class Settings:
     # whitespace in .env (e.g. "KEY= value").
     alert_webhook_url: str = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
+    # Cloudflare R2 (S3-compatible) credentials for app/storage.py. All
+    # optional at this layer: unlike DATABASE_URL, a missing R2 config
+    # shouldn't stop the whole app from starting, since storage isn't wired
+    # into any publisher yet. app/storage.py itself raises a clear
+    # StorageNotConfiguredError the moment one of these is actually needed.
+    r2_endpoint_url: str = os.getenv("R2_ENDPOINT_URL", "").strip()
+    r2_access_key_id: str = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+    r2_secret_access_key: str = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+    r2_bucket_name: str = os.getenv("R2_BUCKET_NAME", "").strip()
+
     def __post_init__(self) -> None:
         if not self.database_url:
             raise RuntimeError(

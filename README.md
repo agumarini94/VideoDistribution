@@ -94,9 +94,18 @@ Ver `app/config.py` / `.env.example`:
 | `RETRY_BACKOFF_BASE` | `2` | Base del backoff exponencial (segundos) |
 | `DLQ_QUEUE_NAME` | `dlq` | Nombre de la cola de dead-letter |
 | `ALERT_WEBHOOK_URL` | *(vacío, opcional)* | Webhook de Discord o Slack para alertas de dead-letter; si está vacío, no se envían alertas |
+| `R2_ENDPOINT_URL` | *(vacío, opcional)* | Endpoint S3-compatible del bucket de Cloudflare R2 |
+| `R2_ACCESS_KEY_ID` | *(vacío, opcional)* | Access key de un API token de R2 |
+| `R2_SECRET_ACCESS_KEY` | *(vacío, opcional)* | Secret key del mismo API token de R2 |
+| `R2_BUCKET_NAME` | *(vacío, opcional)* | Nombre del bucket de R2 |
+
+`app/storage.py` (subida, URL firmada y borrado de media en R2) todavía no está conectado
+a ningún publisher; probalo de forma aislada con `python -m scripts.test_storage` una vez
+que tengas las credenciales. Ver `CLAUDE.md` (Fase 3) para el checklist completo.
 
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
 - Publishers reales para cada red social (hoy solo existe YouTube además del fake).
 - Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
-- Deploy en Fly.io y almacenamiento de media en Cloudflare R2 (decisiones de stack para la Fase 2a, ver `CLAUDE.md`; todavía no implementadas).
+- Deploy en Fly.io (todavía no implementado).
+- Conectar `app/storage.py` (R2) a los publishers cuando exista un flujo real de media.

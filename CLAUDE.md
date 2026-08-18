@@ -40,6 +40,12 @@ queue for permanent ones.
   (missing config or a webhook failure are logged and swallowed), so
   alerting can never break job processing. `handle_dead_letter` calls it
   with the job id, platform, attempts and error message.
+- `app/storage.py` — Cloudflare R2 (S3-compatible) media staging via boto3:
+  `upload_media`, `generate_signed_url`, `delete_media`. Self-contained,
+  not wired into `app/tasks.py` yet (publishers will adopt it once a real
+  media flow exists). Raises `StorageNotConfiguredError`
+  (`app/exceptions.py`) if R2 credentials are missing, instead of failing
+  cryptically inside boto3.
 - `app/db.py` / `app/config.py` — SQLAlchemy session/engine and
   environment-based settings. No other module should read `os.environ`
   directly or import SQLAlchemy engine internals.
@@ -69,9 +75,7 @@ unit-tested without Redis or a worker running.
   at startup if it's unset. Driver: `psycopg2-binary`.
 - **Fly.io** (planned) — target deploy platform for the Celery worker(s)
   and any future API process. Not yet implemented.
-- **Cloudflare R2** (planned) — target object storage for media assets
-  attached to jobs (images/video) ahead of real publisher integrations.
-  Not yet implemented.
+- **Cloudflare R2** — see Phase 3 below for the storage module.
 
 ### Phase 2b (in progress)
 - **YouTube publisher** (`app/publishers/youtube.py`) — built and wired
@@ -83,6 +87,32 @@ unit-tested without Redis or a worker running.
   Code is written to fail with a clear `PermanentError` when credentials
   are absent rather than crash, so the rest of the system keeps working
   without them.
+
+### Phase 3 (in progress)
+- **Cloudflare R2 media staging** (`app/storage.py`) — S3-compatible object
+  storage for media files (images/video) ahead of publishing: `upload_media`,
+  `generate_signed_url` (presigned GET — what platform APIs will use to
+  ingest media, per the spec) and `delete_media`, backed by boto3. Not
+  wired into `app/tasks.py` yet; publishers will adopt it once a real media
+  flow exists. Raises `StorageNotConfiguredError` if `R2_ENDPOINT_URL`,
+  `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` or `R2_BUCKET_NAME` are
+  missing, instead of failing cryptically inside boto3.
+  `scripts/test_storage.py` verifies a bucket independently (upload, signed
+  URL, delete).
+
+  The spec's 7-day media lifecycle rule is **not implemented in code** — it
+  must be configured as an object lifecycle (expiration) rule on the bucket
+  itself, in the Cloudflare dashboard.
+
+  **When R2 credentials arrive:**
+  1. Set `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+     `R2_BUCKET_NAME` in `.env`.
+  2. Run `python -m scripts.test_storage` to verify the bucket
+     (upload/signed-url/delete round trip).
+  3. In the Cloudflare dashboard, configure a 7-day object lifecycle
+     (expiration) rule on the bucket — this is bucket config, not code.
+  4. Wire `app/storage.py` into the relevant publisher(s) once a real
+     media flow exists.
 
 ### Phase 4 (partial)
 - **DLQ alerts via Discord/Slack webhook** (`app/notifications.py`) — every
