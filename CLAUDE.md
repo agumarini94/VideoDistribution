@@ -8,32 +8,56 @@ transient errors and a dead-letter queue for permanent ones.
 ## Architecture
 
 - `app/models.py` — `Job` SQLAlchemy model: id, platform, payload (JSON),
-  status, attempts, error_message, scheduled_at, created_at, updated_at.
-  `JobStatus` enum models the state machine explicitly (including
-  `SCHEDULED`, for jobs waiting on a future time slot).
+  account_id (nullable FK to `Account`, see Phase 6), status, attempts,
+  error_message, scheduled_at, created_at, updated_at. `JobStatus` enum
+  models the state machine explicitly (including `SCHEDULED`, for jobs
+  waiting on a future time slot). `Account` model (Phase 6): id, platform,
+  name, credentials (JSON), is_active, created_at, updated_at — per-account
+  credentials for platforms with multi-account support (currently just
+  Twitter/X).
 - `app/publishers/` — **pure functions**. A publisher knows nothing about
-  Celery (no retry/queue/job_id concepts) and never prints to screen. It
-  either returns a result or raises a typed exception from
-  `app/exceptions.py` (`TransientError` / `PermanentError`).
+  Celery or the database (no retry/queue/job_id/Account-row concepts) and
+  never prints to screen. It either returns a result or raises a typed
+  exception from `app/exceptions.py` (`TransientError` / `PermanentError`).
+  Signature: `publish(platform, payload, account_credentials=None) -> dict`
+  — the third argument is plain credential data (or `None`) resolved by
+  `app/tasks.py`, never a DB session (see Phase 6).
   - `fake.py` — simulates uploads: ~60% success, ~30% transient 429,
     ~10% permanent 400. Used for every platform without a real publisher.
+    Ignores `account_credentials`.
   - `youtube.py` — real YouTube Data API v3 publisher (`videos.insert`).
     Loads OAuth2 credentials from `token.json` at the project root
     (generated once via `scripts/authorize_youtube.py`) and auto-refreshes
     them; raises `PermanentError` with a clear message if `client_secret.json`
     or `token.json` are missing, or if the refresh fails. Classifies
     `HttpError`s: HTTP 429/5xx and 403 quota/rate-limit reasons ->
-    `TransientError`; other 4xx -> `PermanentError`.
-- `app/tasks.py` — the only module that knows about both Celery and the
-  publishers. `publish_job` looks up the right publisher for the job's
-  `platform` (`_PUBLISHERS_BY_PLATFORM`, defaulting to the fake publisher),
-  persists every state transition to the database, retries transient errors
-  with exponential backoff (checking `self.request.retries >=
-  self.max_retries` explicitly rather than catching
-  `MaxRetriesExceededError`, which behaves inconsistently between eager and
-  normal execution), and routes permanent errors (or exhausted retries) to
-  `handle_dead_letter`, queued on `dlq`. `dispatch_due_jobs` is the Celery
-  Beat task that claims due `SCHEDULED` jobs (see Phase 5).
+    `TransientError`; other 4xx -> `PermanentError`. Ignores
+    `account_credentials` for now (see Phase 6 — natural next candidate to
+    migrate to per-account credentials).
+  - `twitter.py` (Phase 6) — real X API v2 publisher (`POST /2/tweets` via
+    tweepy, OAuth 1.0a user context). App-level `consumer_key`/`secret`
+    always come from `X_API_KEY`/`X_API_SECRET`; the access token comes
+    from `account_credentials` (`access_token`/`access_token_secret`) when
+    the job has an account, otherwise falls back to
+    `X_ACCESS_TOKEN`/`X_ACCESS_TOKEN_SECRET`. Classifies tweepy
+    `HTTPException`s by status code the same way `youtube.py` does: 429/5xx
+    -> `TransientError`; 401/403/other 4xx -> `PermanentError`. Missing
+    app-level or access-token credentials -> `PermanentError` naming
+    exactly what's missing. Payload: `{"text": str}` for now; media comes
+    later via `app/storage.py`.
+- `app/tasks.py` — the only module that knows about Celery, the publishers,
+  *and* the `Account` table. `publish_job` looks up the right publisher for
+  the job's `platform` (`_PUBLISHERS_BY_PLATFORM`, defaulting to the fake
+  publisher), resolves `account_credentials` via `_resolve_account_credentials`
+  (`None` if the job has no `account_id`; raises `PermanentError` if the
+  referenced account is missing or `is_active=False`) and passes it as the
+  publisher's third argument, persists every state transition to the
+  database, retries transient errors with exponential backoff (checking
+  `self.request.retries >= self.max_retries` explicitly rather than
+  catching `MaxRetriesExceededError`, which behaves inconsistently between
+  eager and normal execution), and routes permanent errors (or exhausted
+  retries) to `handle_dead_letter`, queued on `dlq`. `dispatch_due_jobs` is
+  the Celery Beat task that claims due `SCHEDULED` jobs (see Phase 5).
 - `app/celery_app.py` — the Celery app instance, kept separate from
   tasks.py to avoid import cycles. Also defines `PRIORITY_QUEUE_NAME`
   ("priority") and the `beat_schedule` entry for `dispatch_due_jobs`.
@@ -155,9 +179,51 @@ unit-tested without Redis or a worker running.
   slot) and `--urgent N` (first N jobs dispatch immediately via the
   priority queue, bypassing `--schedule`) flags. No flags = today's
   original behavior (10 jobs, immediate, normal queue).
-- `scripts/show_jobs.py` — prints id/platform/status/attempts/scheduled_at
-  for every job, to observe scheduling and priority dispatch without
-  opening Neon directly.
+- `scripts/show_jobs.py` — prints id/platform/account/status/attempts/
+  scheduled_at for every job (account is "-" when the job has no
+  `account_id`), to observe scheduling, priority dispatch and per-account
+  routing without opening Neon directly.
+
+### Phase 6 (current)
+- **Twitter/X publisher** (`app/publishers/twitter.py`) — built and wired
+  into `app/tasks.py` (`platform="twitter"` routes to it). Not yet tested
+  end-to-end: the client hasn't provided real X Developer Portal
+  credentials yet. Code is written to fail with a clear `PermanentError`
+  when credentials are absent (app-level or access-token) rather than
+  crash, so the rest of the system keeps working without them.
+- **Multi-account support, start of** (`app/models.py` `Account`) — a Job
+  can optionally reference an `Account` (`account_id`, nullable) holding
+  per-account `credentials` (JSON) for a platform. This is additive:
+  existing jobs (and platforms without any `Account` rows, like the fake
+  publisher and YouTube for now) keep resolving credentials from env vars
+  exactly as before. `app/tasks.py::_resolve_account_credentials` is the
+  only place that queries the `Account` table — publishers stay pure and
+  never touch the database, they just receive the resolved credentials (or
+  `None`) as a third argument. Twitter is the first publisher to actually
+  use this; YouTube is documented as the natural next one to migrate to
+  the same pattern once multi-account YouTube is needed.
+- `scripts/add_account.py` — CLI to insert or update an `Account` row:
+  `python -m scripts.add_account --platform twitter --name "Main account"
+  access_token=... access_token_secret=...`. Matches on platform+name to
+  decide insert vs. update (so re-running it rotates a token in place).
+
+  **When X credentials arrive:**
+  1. Set `X_API_KEY` and `X_API_SECRET` in `.env` (app-level, from the X
+     Developer Portal).
+  2. Either set `X_ACCESS_TOKEN`/`X_ACCESS_TOKEN_SECRET` in `.env` for
+     single-account use, or run `scripts/add_account.py` to create one or
+     more `Account` rows and put `account_id` on the relevant jobs.
+  3. **Manual schema step (no Alembic yet, see "Qué falta" in README):**
+     `init_db()`'s `create_all` only creates tables that don't exist yet —
+     it will create the new `accounts` table on an existing Neon database,
+     but it will **not** add the new `account_id` column to the existing
+     `jobs` table. Run once, by hand, against Neon:
+     ```sql
+     ALTER TABLE jobs ADD COLUMN account_id INTEGER REFERENCES accounts(id);
+     ```
+  4. Test with a job whose `platform="twitter"` (and optionally
+     `account_id` set) via `scripts/enqueue_demo.py` or a one-off insert,
+     then confirm with `scripts/show_jobs.py`.
 
 ## Monitoring dashboard (extra, not in the spec)
 

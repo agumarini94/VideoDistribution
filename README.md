@@ -108,6 +108,10 @@ Ver `app/config.py` / `.env.example`:
 | `R2_SECRET_ACCESS_KEY` | *(vacío, opcional)* | Secret key del mismo API token de R2 |
 | `R2_BUCKET_NAME` | *(vacío, opcional)* | Nombre del bucket de R2 |
 | `TIME_SLOTS` | *(vacío, usa los defaults)* | Override de horarios por plataforma, formato `twitter=09:00,13:00,18:00;tiktok=12:00,19:00` |
+| `X_API_KEY` | *(vacío, opcional)* | Consumer key de la app de X (Twitter), nivel app, no por cuenta |
+| `X_API_SECRET` | *(vacío, opcional)* | Consumer secret de la app de X, nivel app |
+| `X_ACCESS_TOKEN` | *(vacío, opcional)* | Access token de fallback para jobs sin `account_id` (modo single-account) |
+| `X_ACCESS_TOKEN_SECRET` | *(vacío, opcional)* | Access token secret de fallback, mismo caso que arriba |
 
 Defaults de `TIME_SLOTS` (ver `PLATFORM_TIME_SLOTS` en `app/config.py`): twitter
 09:00/13:00/18:00, tiktok 12:00/19:00, youtube 15:00, cualquier otra plataforma 12:00.
@@ -117,6 +121,18 @@ cuenta/plataforma todavía (ver el comentario en `app/config.py`).
 `app/storage.py` (subida, URL firmada y borrado de media en R2) todavía no está conectado
 a ningún publisher; probalo de forma aislada con `python -m scripts.test_storage` una vez
 que tengas las credenciales. Ver `CLAUDE.md` (Fase 3) para el checklist completo.
+
+`app/publishers/twitter.py` (X API v2, posteo de texto) tampoco fue probado contra la
+API real todavía — faltan las credenciales del cliente. Ver `CLAUDE.md` (Fase 6) para
+el checklist completo, incluida la migración manual de la tabla `jobs` (no hay Alembic
+todavía, así que `account_id` no aparece solo con `init_db()` en una base ya existente).
+
+Para dar de alta o actualizar una cuenta (multi-account, Fase 6):
+
+```bash
+python -m scripts.add_account --platform twitter --name "Cuenta principal" \
+    access_token=xxx access_token_secret=yyy
+```
 
 ## Dashboard de monitoreo (extra, fuera del spec)
 

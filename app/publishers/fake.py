@@ -28,7 +28,7 @@ _PROBABILITY_TRANSIENT = 0.30
 _PROBABILITY_PERMANENT = 0.10
 
 
-def publish(platform: str, payload: dict) -> dict:
+def publish(platform: str, payload: dict, account_credentials: dict | None = None) -> dict:
     """
     Simulates publishing `payload` on `platform`.
 
@@ -36,6 +36,10 @@ def publish(platform: str, payload: dict) -> dict:
     Raises TransientError (simulating HTTP 429) or PermanentError (simulating
     HTTP 400) based on the random roll, so the rest of the system's
     retry/backoff and dead-letter queue logic can be exercised.
+
+    account_credentials is accepted for signature parity with the other
+    publishers (see app/tasks.py, which resolves it uniformly for every
+    platform) but unused here: the fake publisher never checks credentials.
     """
     roll = random.random()
 

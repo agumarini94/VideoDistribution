@@ -44,12 +44,19 @@ TOKEN_PATH = PROJECT_ROOT / "token.json"
 _QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded", "userRateLimitExceeded"}
 
 
-def publish(platform: str, payload: dict) -> dict:
+def publish(platform: str, payload: dict, account_credentials: dict | None = None) -> dict:
     """
     Uploads a video to YouTube via videos.insert.
 
     Expected payload keys: video_path, title, description (optional),
     tags (optional), privacy (optional, defaults to "private").
+
+    account_credentials is accepted for signature parity with the other
+    publishers (see app/tasks.py, which resolves it uniformly for every
+    platform) but unused here: this publisher still reads token.json /
+    client_secret.json directly. It's the natural next candidate to migrate
+    to per-Account credentials (see CLAUDE.md Phase 6) once multi-account
+    YouTube support is needed.
     """
     try:
         _validate_payload(payload)

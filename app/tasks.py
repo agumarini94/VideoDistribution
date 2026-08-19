@@ -22,9 +22,10 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import SessionLocal
 from app.exceptions import PermanentError, TransientError
-from app.models import Job, JobStatus
+from app.models import Account, Job, JobStatus
 from app.notifications import send_alert
 from app.publishers import fake as fake_publisher
+from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
 
 # Per-platform publisher routing. Platforms without a real integration yet
@@ -33,11 +34,34 @@ from app.publishers import youtube as youtube_publisher
 # here, not a change to publish_job's retry/DLQ logic.
 _PUBLISHERS_BY_PLATFORM = {
     "youtube": youtube_publisher.publish,
+    "twitter": twitter_publisher.publish,
 }
 
 
 def _get_publisher(platform: str):
     return _PUBLISHERS_BY_PLATFORM.get(platform, fake_publisher.publish)
+
+
+def _resolve_account_credentials(db, job: Job) -> dict | None:
+    """
+    Returns the JSON credentials for the job's Account, or None if the job
+    has no account_id (single-account / env-var-only mode, unchanged from
+    before Phase 6). Resolving the Account here — not inside the publisher
+    — is what keeps publishers pure: they receive plain credential data,
+    never a database session.
+
+    A job pointing at a missing or deactivated account is a permanent
+    configuration error, not something a retry would fix.
+    """
+    if job.account_id is None:
+        return None
+
+    account = db.get(Account, job.account_id)
+    if account is None:
+        raise PermanentError(f"Job {job.id} references account_id={job.account_id}, which does not exist")
+    if not account.is_active:
+        raise PermanentError(f"Account {account.id} ({account.name}) is inactive")
+    return account.credentials
 
 
 def _mark_failed_and_deadletter(db, job: Job, error: Exception) -> None:
@@ -69,7 +93,8 @@ def publish_job(self, job_id: int) -> None:
 
         publisher = _get_publisher(job.platform)
         try:
-            publisher(job.platform, job.payload)
+            account_credentials = _resolve_account_credentials(db, job)
+            publisher(job.platform, job.payload, account_credentials)
         except TransientError as exc:
             job.error_message = str(exc)
             db.commit()
