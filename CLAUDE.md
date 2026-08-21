@@ -272,6 +272,44 @@ unit-tested without Redis or a worker running.
   ```
   This is exactly `Credentials.to_json()`'s output — never hand-write it.
 
+### Phase 8 (current)
+- **Proactive OAuth token refresh** (spec section 4, "Automated Token
+  Refresh") — `refresh_expiring_tokens` (`app/tasks.py`), a Celery Beat
+  task scheduled every 30 minutes (`beat_schedule` in `app/celery_app.py`).
+  Iterates active `Account` rows on platforms whose tokens expire
+  (`_TOKEN_REFRESH_MODULES_BY_PLATFORM`, currently just `"youtube"` —
+  Twitter's OAuth 1.0a access tokens don't expire, so it's intentionally
+  absent). For each account whose stored token expires within the next 45
+  minutes (`_TOKEN_REFRESH_WINDOW_SECONDS`) — or whose `expiry` is
+  missing/unparseable, treated the same way — it refreshes and persists the
+  new credentials, reusing the same "publisher returns data, task persists
+  it" pattern as Phase 7's post-publish refresh.
+  - All OAuth mechanics live in the publisher module, not the task: two new
+    pure helpers in `app/publishers/youtube.py`,
+    `token_expires_within(credentials, seconds)` (expiry check) and
+    `refresh_stored_credentials(credentials)` (force-refresh, returns the
+    new credentials dict or raises `TransientError`/`PermanentError`).
+    `refresh_stored_credentials` classifies the error using google-auth's
+    own `RefreshError.retryable` flag (network/5xx from the token endpoint
+    -> `TransientError`; an invalid/revoked refresh token, e.g.
+    `invalid_grant` -> `PermanentError`) rather than guessing from the
+    message string.
+  - On `PermanentError` (refresh token invalid/revoked):
+    `_refresh_account_if_needed` sets the `Account`'s `is_active=False` (so
+    `_resolve_account_credentials` stops routing jobs to it) and calls
+    `send_alert` with the account name and a "needs re-authorization"
+    message pointing at `scripts/authorize_youtube.py --account NAME`.
+  - On `TransientError`: logged and skipped, no state change — the next
+    scheduled run (30 min later) retries automatically.
+  - **Reactivation**: re-running `scripts/authorize_youtube.py --account
+    NAME` upserts the account via the shared `upsert_account` helper
+    (`scripts/add_account.py`), which defaults `is_active=True` on both
+    insert and update — so a fresh interactive authorization automatically
+    revives a deactivated account, no separate "reactivate" step needed.
+- `scripts/show_accounts.py` — companion to `scripts/show_jobs.py`: prints
+  id/platform/name/active/token_expiry/updated_at for every `Account`, so
+  token freshness and deactivation can be observed without opening Neon.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, built without any

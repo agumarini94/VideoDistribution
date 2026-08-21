@@ -181,6 +181,40 @@ python -m scripts.enqueue_youtube_test --video /ruta/al/video.mp4 --account "Can
 Crea un job `platform="youtube"` privado con un título de prueba generado, y
 lo despacha de inmediato.
 
+### Refresh proactivo de tokens OAuth (Fase 8)
+
+Además del refresh reactivo de la Fase 7 (durante un publish), ahora hay un
+**tercer proceso de Celery Beat**, `refresh_expiring_tokens`, que corre cada
+30 minutos y refresca de forma proactiva los tokens OAuth de las cuentas
+activas en plataformas cuyos tokens expiran (hoy solo `youtube`; los access
+tokens OAuth 1.0a de Twitter no expiran). Si el token de una cuenta vence en
+los próximos 45 minutos (o no se puede leer su expiry), lo refresca y guarda
+las credenciales nuevas.
+
+Si el refresh falla porque el refresh token es inválido o fue revocado, la
+cuenta se marca `is_active=False` (deja de recibir jobs) y se manda una
+alerta a Discord/Slack (mismo `ALERT_WEBHOOK_URL` que la dead-letter queue)
+pidiendo re-autorización. Para reactivarla:
+
+```bash
+python -m scripts.authorize_youtube --account "Canal cliente X"
+```
+
+(re-autorizar reactiva la cuenta automáticamente — `upsert_account` deja
+`is_active=True` tanto al crear como al actualizar).
+
+Corré este tercer proceso junto a los otros tres (worker, beat, dashboard
+opcional) — usa el mismo `celery -A app.celery_app beat`, no hace falta un
+proceso aparte, ya que `dispatch_due_jobs` y `refresh_expiring_tokens`
+comparten el mismo `beat_schedule`.
+
+Para ver el estado de las cuentas (incluida la expiración del token) sin
+abrir Neon:
+
+```bash
+python -m scripts.show_accounts
+```
+
 ## Dashboard de monitoreo (extra, fuera del spec)
 
 `dashboard/` es un panel de solo lectura sobre el estado de los jobs (salvo

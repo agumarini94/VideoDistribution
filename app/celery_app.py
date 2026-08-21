@@ -48,5 +48,11 @@ celery_app.conf.update(
             "task": "app.tasks.dispatch_due_jobs",
             "schedule": 60.0,
         },
+        # Phase 8: proactively refreshes OAuth tokens (currently youtube)
+        # nearing expiry, before a publish attempt can hit an expired one.
+        "refresh-expiring-tokens-every-30m": {
+            "task": "app.tasks.refresh_expiring_tokens",
+            "schedule": 1800.0,
+        },
     },
 )

@@ -32,9 +32,18 @@ Credentials aren't provided yet by the client for either mode, so every
 code path that depends on them raises a clear PermanentError instead of
 crashing, and nothing here executes at import time — credentials are only
 read when publish() actually runs.
+
+Proactive refresh (Phase 8): app/tasks.py::refresh_expiring_tokens (a Celery
+Beat task) needs to refresh an Account's stored token before it expires,
+independent of any publish() call. token_expires_within() and
+refresh_stored_credentials() below are the pure helpers it uses — this
+module still owns all Google OAuth knowledge (credential shape, refresh
+mechanics, how to tell a permanently-invalid refresh token from a transient
+failure), the task just decides what to do with the outcome.
 """
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google.auth.exceptions import RefreshError
@@ -159,6 +168,57 @@ def _load_credentials(account_credentials: dict | None) -> tuple[Credentials, bo
         raise PermanentError(f"YouTube credentials are invalid or incomplete, {reauth_hint}.")
 
     return creds, refreshed
+
+
+def token_expires_within(credentials: dict, seconds: int) -> bool:
+    """
+    True if `credentials` (an Account.credentials dict) has no usable
+    "expiry", or one that falls within `seconds` from now. Used by
+    refresh_expiring_tokens (Phase 8) to decide which accounts need a
+    proactive refresh. Treating a missing/unparseable expiry as "needs
+    refresh" is deliberate: a token we can't validate is safer to refresh
+    than to silently trust.
+    """
+    expiry_raw = credentials.get("expiry")
+    if not expiry_raw:
+        return True
+    try:
+        expiry = datetime.fromisoformat(expiry_raw)
+    except ValueError:
+        return True
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry <= datetime.now(timezone.utc) + timedelta(seconds=seconds)
+
+
+def refresh_stored_credentials(credentials: dict) -> dict:
+    """
+    Force-refreshes a stored (Account-row) credentials dict and returns the
+    refreshed credentials JSON as a dict. Unlike _load_credentials, this
+    always calls refresh() rather than checking creds.expired first — the
+    caller (refresh_expiring_tokens) already decided a refresh is due via
+    token_expires_within.
+
+    Raises PermanentError if the refresh_token is invalid/revoked (Google
+    reports this as a non-retryable RefreshError, e.g. "invalid_grant") —
+    the caller should deactivate the account and alert a human. Raises
+    TransientError for anything else (network blips, a transient error from
+    Google's token endpoint) — the caller should just retry on the next
+    scheduled run.
+    """
+    try:
+        creds = Credentials.from_authorized_user_info(credentials, SCOPES)
+    except (ValueError, KeyError) as exc:
+        raise PermanentError(f"Stored YouTube credentials are invalid or incomplete: {exc}") from exc
+
+    try:
+        creds.refresh(Request())
+    except RefreshError as exc:
+        if exc.retryable:
+            raise TransientError(f"Transient error refreshing YouTube credentials: {exc}") from exc
+        raise PermanentError(f"YouTube refresh token is invalid or has been revoked: {exc}") from exc
+
+    return json.loads(creds.to_json())
 
 
 def _classify_http_error(exc: HttpError) -> PublishError:
