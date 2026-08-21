@@ -1,0 +1,42 @@
+# Local-only compose file for testing the container image end to end. Not
+# used by Fly.io (see fly.toml). Redis and Postgres (Neon) are NOT run
+# here — Redis is expected to already be running on the host (the Mac),
+# and DATABASE_URL in .env points at Neon as always.
+#
+# `host.docker.internal` is how a container reaches services running on
+# the host machine. Docker Desktop on Mac resolves it out of the box; the
+# extra_hosts entry below is what makes the same compose file also work on
+# Linux, where that hostname isn't defined automatically. Set
+# REDIS_URL=redis://host.docker.internal:6379/0 in .env (overriding the
+# `localhost` default in app/config.py) so the containers can reach the
+# Mac's local Redis — see the `environment:` override on each service.
+
+services:
+  worker:
+    build: .
+    command: celery -A app.celery_app worker --loglevel=info -Q priority,celery,dlq
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://host.docker.internal:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  beat:
+    build: .
+    command: celery -A app.celery_app beat --loglevel=info
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://host.docker.internal:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  api:
+    build: .
+    command: uvicorn dashboard.api:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://host.docker.internal:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"

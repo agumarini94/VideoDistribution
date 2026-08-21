@@ -310,6 +310,46 @@ unit-tested without Redis or a worker running.
   id/platform/name/active/token_expiry/updated_at for every `Account`, so
   token freshness and deactivation can be observed without opening Neon.
 
+### Phase 9 (current)
+- **Containerization + Fly.io deploy config** — build-and-run-locally only;
+  no deployment happened (the Fly.io account belongs to the client).
+  - `Dockerfile` — `python:3.13-slim`, non-root user, `WORKDIR /app`.
+    `requirements.txt` is copied and installed before the rest of the code
+    for layer caching. Default `CMD` runs the Celery worker (`-Q
+    priority,celery,dlq`); `beat` and the dashboard `api` process reuse the
+    same image with a different command (see `docker-compose.yml` /
+    `fly.toml`). All configuration still comes from env vars via
+    `app/config.py` — no secrets are baked into the image.
+  - `.dockerignore` — excludes `.venv`, `.env`, `.git`, `*.mp4`,
+    `token.json`, `client_secret.json`, the `celerybeat-schedule*` files,
+    `__pycache__`, `.DS_Store`. `dashboard/` is **included** — it's meant
+    to run in-container too, as the `api` process.
+  - `fly.toml` — ready but unused: placeholder app name
+    `"distribution-engine"`, `[processes]` with `worker`, `beat`, `api`
+    (the last running `uvicorn dashboard.api:app --host 0.0.0.0 --port
+    8000`), `internal_port 8000` on the `api` process only. Comments note
+    that `REDIS_URL`, `DATABASE_URL`, `ALERT_WEBHOOK_URL`, the `X_*` and
+    `R2_*` vars must all be set via `fly secrets set`, never in this file.
+  - `docker-compose.yml` — local-only, not used by Fly.io. Three services
+    (`worker`, `beat`, `api`), all building from the same `Dockerfile` with
+    different commands, `env_file: .env`. Redis is not containerized — it
+    keeps running directly on the Mac, and each service overrides
+    `REDIS_URL=redis://host.docker.internal:6379/0` (documented inline)
+    plus an `extra_hosts: host.docker.internal:host-gateway` entry so the
+    same file also works on Linux, where that hostname isn't automatic.
+    `DATABASE_URL` and everything else still comes from `.env`.
+  - **Why YouTube in production requires multi-account mode**:
+    `token.json` and `client_secret.json` are excluded from the image, so
+    the single-account fallback in `app/publishers/youtube.py` can never
+    work in a deployed container — any YouTube account used in production
+    must exist as an `Account` row (Phase 7,
+    `scripts/authorize_youtube.py --account NAME`), which is why Phase 7's
+    multi-account migration mattered ahead of this phase.
+  - Fly deploy checklist (documented, not executed): client creates the
+    Fly.io account and the app (replacing the `fly.toml` placeholder
+    name), run `fly secrets set` for every env var above, then `fly
+    deploy`.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, built without any

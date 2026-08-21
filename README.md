@@ -232,10 +232,62 @@ y expone la API en `/api/jobs`, `/api/stats` y `POST /api/jobs/{id}/retry`
 cualquier otro caso). No requiere el worker de Celery corriendo para mostrar
 datos, pero sí para que un retry se procese de verdad.
 
+## Docker y Fly.io (Fase 9)
+
+Toda la config sigue viniendo de variables de entorno (`app/config.py`) — la
+imagen no tiene ningún secreto horneado adentro.
+
+**Build de la imagen:**
+
+```bash
+docker build -t distribution-engine .
+```
+
+Base `python:3.13-slim`, usuario no-root, capas separadas para
+`requirements.txt` (cache de pip) y el resto del código. `.dockerignore`
+excluye `.venv`, `.env`, `.git`, `*.mp4`, `token.json`, `client_secret.json`
+y los archivos de `celerybeat-schedule` — ninguno de esos debe terminar en
+la imagen. `dashboard/` **sí** se incluye, porque también corre en
+contenedor (proceso `api`, ver abajo).
+
+**Correr todo localmente con Docker Compose** (en vez de las 3-4 terminales
+manuales de más arriba):
+
+```bash
+docker compose up --build
+```
+
+Levanta `worker`, `beat` y `api`, los tres desde la misma imagen con
+distintos comandos. Redis sigue corriendo directo en la Mac (no hay
+servicio de Redis en el compose); `REDIS_URL` se pisa a
+`redis://host.docker.internal:6379/0` en cada servicio para que los
+contenedores lleguen al Redis del host — ver el comentario en
+`docker-compose.yml`. `DATABASE_URL` y el resto de las variables siguen
+viniendo de `.env` vía `env_file`. El dashboard queda expuesto en
+`http://localhost:8000`.
+
+**Checklist de deploy a Fly.io (pendiente — la cuenta es del cliente):**
+
+`fly.toml` ya está armado (`[processes]` con `worker`, `beat` y `api`;
+`internal_port = 8000` solo para `api`) pero no se usó todavía. Cuando
+exista la cuenta:
+
+1. Reemplazar el nombre placeholder `distribution-engine` en `fly.toml` por
+   el nombre real de la app (`fly apps create ...` o editar el archivo).
+2. `fly secrets set REDIS_URL=... DATABASE_URL=... ALERT_WEBHOOK_URL=...
+   X_API_KEY=... X_API_SECRET=... X_ACCESS_TOKEN=...
+   X_ACCESS_TOKEN_SECRET=... R2_...` — nunca en `fly.toml` ni en la imagen.
+3. **YouTube en producción solo puede usar modo multi-account** (Fase 7):
+   `token.json` / `client_secret.json` no viajan en la imagen (están en
+   `.dockerignore`), así que cualquier cuenta de YouTube tiene que existir
+   como fila `Account` en la base (`scripts/authorize_youtube.py
+   --account NAME`) antes de correr en Fly.io.
+4. `fly deploy`.
+
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
 - Publishers reales para cada red social (hoy solo existe YouTube además del fake).
 - Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
-- Deploy en Fly.io (todavía no implementado).
+- Deploy real en Fly.io (el `fly.toml` y el Dockerfile están listos, pero nadie corrió `fly deploy` — falta la cuenta del cliente).
 - Conectar `app/storage.py` (R2) a los publishers cuando exista un flujo real de media.
 - Timezone real por cuenta/plataforma para el scheduling (hoy es naive local time, ver `app/config.py`).

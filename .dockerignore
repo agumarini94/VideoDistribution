@@ -1,0 +1,13 @@
+.venv/
+venv/
+.env
+.git/
+*.mp4
+token.json
+client_secret.json
+celerybeat-schedule
+celerybeat-schedule-shm
+celerybeat-schedule-wal
+__pycache__/
+*.pyc
+.DS_Store

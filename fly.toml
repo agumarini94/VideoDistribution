@@ -1,0 +1,39 @@
+# Fly.io deploy config — READY BUT UNUSED. The Fly.io account belongs to
+# the client; nothing here has been deployed. Replace the placeholder app
+# name once that account exists, then follow the checklist in README.md /
+# CLAUDE.md (Phase 9) to deploy.
+#
+# No secrets go in this file. REDIS_URL, DATABASE_URL, ALERT_WEBHOOK_URL,
+# X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET,
+# R2_* etc. must all be set with `fly secrets set NAME=value` against the
+# real app once it exists.
+
+app = "distribution-engine"
+primary_region = "eze"
+
+[build]
+
+[processes]
+worker = "celery -A app.celery_app worker --loglevel=info -Q priority,celery,dlq"
+beat = "celery -A app.celery_app beat --loglevel=info"
+api = "uvicorn dashboard.api:app --host 0.0.0.0 --port 8000"
+
+# Only the api process serves HTTP traffic; worker and beat are
+# background-only and have no [[services]] block.
+[[services]]
+processes = ["api"]
+internal_port = 8000
+protocol = "tcp"
+
+  [[services.ports]]
+  handlers = ["http"]
+  port = 80
+
+  [[services.ports]]
+  handlers = ["tls", "http"]
+  port = 443
+
+  [[services.http_checks]]
+  path = "/api/stats"
+  interval = "30s"
+  timeout = "5s"
