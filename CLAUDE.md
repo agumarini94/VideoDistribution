@@ -225,6 +225,53 @@ unit-tested without Redis or a worker running.
      `account_id` set) via `scripts/enqueue_demo.py` or a one-off insert,
      then confirm with `scripts/show_jobs.py`.
 
+### Phase 7 (current)
+- **YouTube migrated to multi-account credentials** — `youtube.py` now
+  branches on `account_credentials` the same way `twitter.py` does:
+  - Job has an `account_id`: `Credentials.from_authorized_user_info` builds
+    OAuth2 credentials directly from `Account.credentials`, which must
+    contain the same fields Google's `Credentials.to_json()` produces —
+    `token`, `refresh_token`, `token_uri`, `client_id`, `client_secret`,
+    `scopes` (optionally `expiry`). Missing/invalid fields ->
+    `PermanentError` naming the problem.
+  - Job has no `account_id`: unchanged single-account fallback to
+    `token.json` / `client_secret.json` at the project root.
+  - **Refresh persistence**: publishers are pure and can't write to the
+    database, so when a token refresh happens against `account_credentials`,
+    `publish()` includes the new credentials JSON in its result dict under
+    `"refreshed_credentials"` (present only when a refresh actually
+    happened). `app/tasks.py::publish_job` checks for that key after a
+    successful publish and, if the job has an `account_id`, writes it back
+    onto the `Account` row and commits
+    (`_persist_refreshed_credentials`). In single-account mode the
+    refreshed token is still written straight to `token.json`, as before —
+    that path doesn't go through this mechanism.
+- `scripts/authorize_youtube.py --account NAME` — runs the same interactive
+  OAuth flow as before, but saves the resulting credentials onto an
+  `Account` row (`platform="youtube"`, `name=NAME`) instead of `token.json`,
+  via the same insert-or-update helper as `scripts/add_account.py`
+  (`upsert_account`, now shared between the two scripts). Re-running it with
+  the same `--account NAME` rotates that account's stored token in place.
+  Without `--account`, behavior is unchanged (writes `token.json`).
+- `scripts/enqueue_youtube_test.py` — replaces the inline `python -c`
+  smoke-test blocks: `--video PATH` (required) and `--account NAME`
+  (optional) create one `platform="youtube"` job (private, generated test
+  title), linked to that `Account` if given, and dispatch it immediately.
+
+  **Credentials JSON shape** (what both `Account.credentials` for a youtube
+  account and `token.json` contain):
+  ```json
+  {
+    "token": "...",
+    "refresh_token": "...",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "client_id": "...",
+    "client_secret": "...",
+    "scopes": ["https://www.googleapis.com/auth/youtube.upload"]
+  }
+  ```
+  This is exactly `Credentials.to_json()`'s output — never hand-write it.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, built without any

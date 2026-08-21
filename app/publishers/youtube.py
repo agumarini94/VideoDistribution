@@ -7,13 +7,31 @@ raises TransientError / PermanentError. This means tasks.py doesn't need to
 change its retry/DLQ logic to support this publisher — only the routing
 (which publisher to call for which platform) changes.
 
-Authorization: this module expects a `token.json` (OAuth2 user credentials
-with a refresh token, generated once via scripts/authorize_youtube.py) and
-`client_secret.json` (an OAuth Client ID downloaded from Google Cloud
-Console) at the project root. Credentials aren't provided yet by the client,
-so every code path that depends on them raises a clear PermanentError
-instead of crashing, and nothing here executes at import time — the files
-are only read when publish() actually runs.
+Authorization, two modes (Phase 7 — multi-account):
+  - account_credentials given (job has an account_id): built directly from
+    that dict via Credentials.from_authorized_user_info, expecting the same
+    fields Google's Credentials.to_json() produces (token, refresh_token,
+    token_uri, client_id, client_secret, scopes). See
+    scripts/authorize_youtube.py --account and scripts/add_account.py for
+    how an Account row gets these.
+  - account_credentials is None (single-account mode, unchanged since
+    Phase 2b): falls back to `token.json` (OAuth2 user credentials with a
+    refresh token, generated once via scripts/authorize_youtube.py) and
+    `client_secret.json` (an OAuth Client ID downloaded from Google Cloud
+    Console) at the project root.
+
+Since publishers are pure and can't write to the database, a refresh that
+happens against account_credentials can't be persisted here: publish()
+includes the refreshed credentials JSON in its result dict under
+"refreshed_credentials" (only when a refresh actually happened), and
+app/tasks.py is responsible for saving it back onto the Account row. In
+single-account mode, the refreshed token is still written to token.json
+directly, same as before.
+
+Credentials aren't provided yet by the client for either mode, so every
+code path that depends on them raises a clear PermanentError instead of
+crashing, and nothing here executes at import time — credentials are only
+read when publish() actually runs.
 """
 
 import json
@@ -51,16 +69,14 @@ def publish(platform: str, payload: dict, account_credentials: dict | None = Non
     Expected payload keys: video_path, title, description (optional),
     tags (optional), privacy (optional, defaults to "private").
 
-    account_credentials is accepted for signature parity with the other
-    publishers (see app/tasks.py, which resolves it uniformly for every
-    platform) but unused here: this publisher still reads token.json /
-    client_secret.json directly. It's the natural next candidate to migrate
-    to per-Account credentials (see CLAUDE.md Phase 6) once multi-account
-    YouTube support is needed.
+    account_credentials (Phase 7): when given, credentials are built from it
+    instead of token.json — see the module docstring for the expected shape
+    and for how a refresh gets surfaced back to app/tasks.py via the
+    "refreshed_credentials" key of the returned dict.
     """
     try:
         _validate_payload(payload)
-        creds = _load_credentials()
+        creds, refreshed = _load_credentials(account_credentials)
 
         video_path = Path(payload["video_path"])
         if not video_path.is_file():
@@ -72,7 +88,10 @@ def publish(platform: str, payload: dict, account_credentials: dict | None = Non
         youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
         response = youtube.videos().insert(part="snippet,status", body=body, media_body=media).execute()
 
-        return {"platform": "youtube", "external_id": response["id"]}
+        result = {"platform": "youtube", "external_id": response["id"]}
+        if refreshed:
+            result["refreshed_credentials"] = json.loads(creds.to_json())
+        return result
     except (TransientError, PermanentError):
         raise
     except HttpError as exc:
@@ -100,37 +119,46 @@ def _build_request_body(payload: dict) -> dict:
     }
 
 
-def _load_credentials() -> Credentials:
-    missing = [path.name for path in (CLIENT_SECRET_PATH, TOKEN_PATH) if not path.exists()]
-    if missing:
-        raise PermanentError(
-            "YouTube authorization has not been set up yet (missing: "
-            f"{', '.join(missing)}). Place client_secret.json in the project "
-            "root and run `python -m scripts.authorize_youtube` to generate token.json."
-        )
+def _load_credentials(account_credentials: dict | None) -> tuple[Credentials, bool]:
+    """
+    Returns (credentials, refreshed) where refreshed indicates a token
+    refresh happened during this call, so the caller knows whether it needs
+    to persist anything.
+    """
+    if account_credentials is not None:
+        reauth_hint = "re-run scripts/authorize_youtube.py --account <NAME> for this account"
+        try:
+            creds = Credentials.from_authorized_user_info(account_credentials, SCOPES)
+        except (ValueError, KeyError) as exc:
+            raise PermanentError(f"Account credentials for YouTube are invalid or incomplete, {reauth_hint}: {exc}") from exc
+    else:
+        reauth_hint = "re-run scripts/authorize_youtube.py"
+        missing = [path.name for path in (CLIENT_SECRET_PATH, TOKEN_PATH) if not path.exists()]
+        if missing:
+            raise PermanentError(
+                "YouTube authorization has not been set up yet (missing: "
+                f"{', '.join(missing)}). Place client_secret.json in the project "
+                "root and run `python -m scripts.authorize_youtube` to generate token.json."
+            )
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        except (ValueError, KeyError) as exc:
+            raise PermanentError(f"token.json is invalid or incomplete, {reauth_hint}: {exc}") from exc
 
-    try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-    except (ValueError, KeyError) as exc:
-        raise PermanentError(
-            f"token.json is invalid or incomplete, re-run scripts/authorize_youtube.py: {exc}"
-        ) from exc
-
+    refreshed = False
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
         except RefreshError as exc:
-            raise PermanentError(
-                f"Failed to refresh YouTube credentials, re-run scripts/authorize_youtube.py: {exc}"
-            ) from exc
-        TOKEN_PATH.write_text(creds.to_json())
+            raise PermanentError(f"Failed to refresh YouTube credentials, {reauth_hint}: {exc}") from exc
+        refreshed = True
+        if account_credentials is None:
+            TOKEN_PATH.write_text(creds.to_json())
 
     if not creds.valid:
-        raise PermanentError(
-            "YouTube credentials are invalid or incomplete, re-run scripts/authorize_youtube.py."
-        )
+        raise PermanentError(f"YouTube credentials are invalid or incomplete, {reauth_hint}.")
 
-    return creds
+    return creds, refreshed
 
 
 def _classify_http_error(exc: HttpError) -> PublishError:

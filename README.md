@@ -134,6 +134,53 @@ python -m scripts.add_account --platform twitter --name "Cuenta principal" \
     access_token=xxx access_token_secret=yyy
 ```
 
+### YouTube multi-account (Fase 7)
+
+`app/publishers/youtube.py` ahora soporta credenciales por cuenta, igual que
+twitter.py: si el job tiene `account_id`, arma las credenciales OAuth2 desde
+`Account.credentials` en vez de leer `token.json`. El JSON de credenciales
+(tanto en `Account.credentials` como en `token.json`) tiene el mismo shape
+que devuelve `Credentials.to_json()` de Google:
+
+```json
+{
+  "token": "...",
+  "refresh_token": "...",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "client_id": "...",
+  "client_secret": "...",
+  "scopes": ["https://www.googleapis.com/auth/youtube.upload"]
+}
+```
+
+Para dar de alta una cuenta de YouTube (corre el flujo OAuth interactivo y
+guarda el resultado en una fila `Account` en vez de `token.json`):
+
+```bash
+python -m scripts.authorize_youtube --account "Canal cliente X"
+```
+
+Sin `--account`, el comportamiento es el de siempre (single-account, escribe
+`token.json`).
+
+Como los publishers son funciones puras y no pueden escribir en la base, si
+`publish()` refresca el token contra `account_credentials`, lo devuelve en el
+resultado bajo la clave `"refreshed_credentials"` (solo cuando el refresh
+ocurrió) — `app/tasks.py::publish_job` lo detecta después de un publish
+exitoso y, si el job tiene `account_id`, lo persiste en esa fila `Account`.
+En modo single-account (sin `account_id`) el token refrescado se sigue
+escribiendo directo a `token.json`, como antes.
+
+Para probar una subida real sin escribir `python -c` a mano:
+
+```bash
+python -m scripts.enqueue_youtube_test --video /ruta/al/video.mp4
+python -m scripts.enqueue_youtube_test --video /ruta/al/video.mp4 --account "Canal cliente X"
+```
+
+Crea un job `platform="youtube"` privado con un título de prueba generado, y
+lo despacha de inmediato.
+
 ## Dashboard de monitoreo (extra, fuera del spec)
 
 `dashboard/` es un panel de solo lectura sobre el estado de los jobs (salvo

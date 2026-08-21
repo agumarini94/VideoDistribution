@@ -64,6 +64,27 @@ def _resolve_account_credentials(db, job: Job) -> dict | None:
     return account.credentials
 
 
+def _persist_refreshed_credentials(db, job: Job, result: object) -> None:
+    """
+    Publishers are pure and can't write to the database, so a publisher that
+    refreshed its OAuth token mid-call (currently only youtube.py, see
+    app/publishers/youtube.py Phase 7) surfaces the new credentials in its
+    result dict instead. This is the one place that persists them back onto
+    the Account row, keeping stored tokens fresh.
+    """
+    if job.account_id is None or not isinstance(result, dict):
+        return
+    refreshed_credentials = result.get("refreshed_credentials")
+    if refreshed_credentials is None:
+        return
+
+    account = db.get(Account, job.account_id)
+    if account is None:
+        return
+    account.credentials = refreshed_credentials
+    db.commit()
+
+
 def _mark_failed_and_deadletter(db, job: Job, error: Exception) -> None:
     """
     Shared transition for the two paths that end up in the dead-letter
@@ -94,7 +115,7 @@ def publish_job(self, job_id: int) -> None:
         publisher = _get_publisher(job.platform)
         try:
             account_credentials = _resolve_account_credentials(db, job)
-            publisher(job.platform, job.payload, account_credentials)
+            result = publisher(job.platform, job.payload, account_credentials)
         except TransientError as exc:
             job.error_message = str(exc)
             db.commit()
@@ -118,6 +139,7 @@ def publish_job(self, job_id: int) -> None:
             # Permanent errors are never retried: they go straight to the DLQ.
             _mark_failed_and_deadletter(db, job, exc)
         else:
+            _persist_refreshed_credentials(db, job, result)
             job.status = JobStatus.PUBLISHED
             db.commit()
     finally:

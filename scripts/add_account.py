@@ -48,6 +48,29 @@ def parse_credentials(pairs: list[str]) -> dict:
     return credentials
 
 
+def upsert_account(db, platform: str, name: str, credentials: dict, is_active: bool = True) -> tuple[Account, str]:
+    """
+    Shared insert-or-update logic: matches on platform+name to decide
+    whether to create a new Account row or rotate credentials on an
+    existing one. Used by this script's CLI and by
+    scripts/authorize_youtube.py --account. Returns (account, action) where
+    action is "Created" or "Updated", for the caller to report.
+
+    Does not commit — the caller controls the transaction boundary.
+    """
+    account = db.query(Account).filter(Account.platform == platform, Account.name == name).one_or_none()
+    if account is None:
+        account = Account(platform=platform, name=name, credentials=credentials)
+        db.add(account)
+        action = "Created"
+    else:
+        account.credentials = credentials
+        action = "Updated"
+
+    account.is_active = is_active
+    return account, action
+
+
 def main() -> None:
     args = parse_args()
     credentials = parse_credentials(args.credentials)
@@ -60,20 +83,7 @@ def main() -> None:
 
     db = SessionLocal()
     try:
-        account = (
-            db.query(Account)
-            .filter(Account.platform == args.platform, Account.name == args.name)
-            .one_or_none()
-        )
-        if account is None:
-            account = Account(platform=args.platform, name=args.name, credentials=credentials)
-            db.add(account)
-            action = "Created"
-        else:
-            account.credentials = credentials
-            action = "Updated"
-
-        account.is_active = not args.inactive
+        account, action = upsert_account(db, args.platform, args.name, credentials, is_active=not args.inactive)
         db.commit()
 
         print(f"{action} account #{account.id} ({args.platform}/{args.name}), active={account.is_active}.")
