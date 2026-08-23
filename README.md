@@ -112,6 +112,12 @@ Ver `app/config.py` / `.env.example`:
 | `X_API_SECRET` | *(vacío, opcional)* | Consumer secret de la app de X, nivel app |
 | `X_ACCESS_TOKEN` | *(vacío, opcional)* | Access token de fallback para jobs sin `account_id` (modo single-account) |
 | `X_ACCESS_TOKEN_SECRET` | *(vacío, opcional)* | Access token secret de fallback, mismo caso que arriba |
+| `TIKTOK_CLIENT_KEY` | *(vacío, opcional)* | Client key de la app de TikTok (Developer Portal) |
+| `TIKTOK_CLIENT_SECRET` | *(vacío, opcional)* | Client secret de la app de TikTok |
+| `TIKTOK_REDIRECT_URI` | *(sin default)* | Redirect URI registrada en el Developer Portal (página pública HTTPS, ver más abajo — **no** puede ser localhost) |
+| `TIKTOK_LOCAL_CALLBACK_PORT` | `8910` | Puerto local donde `scripts/authorize_tiktok.py` escucha el callback relayado por la página pública |
+| `TIKTOK_WEBHOOK_SKIP_SIGNATURE` | *(vacío)* | `1` deshabilita la verificación de firma en `POST /webhooks/tiktok` — solo para pruebas locales con curl, nunca en producción (ver Fase 10b) |
+| `TIKTOK_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS` | `300` | Antigüedad máxima aceptada del timestamp firmado en un webhook de TikTok, contra replay |
 
 Defaults de `TIME_SLOTS` (ver `PLATFORM_TIME_SLOTS` en `app/config.py`): twitter
 09:00/13:00/18:00, tiktok 12:00/19:00, youtube 15:00, cualquier otra plataforma 12:00.
@@ -215,22 +221,178 @@ abrir Neon:
 python -m scripts.show_accounts
 ```
 
+### TikTok — Sandbox (Fase 10)
+
+`app/publishers/tiktok.py` implementa la **Content Posting API** de TikTok,
+pero solo en **modo Sandbox**: la revisión de la app en el Developer Portal
+todavía no pasó, así que solo está disponible el scope `video.upload` (no
+`video.publish`). Esto tiene dos consecuencias importantes:
+
+- Se usa el flujo de **inbox upload** (`POST
+  /v2/post/publish/inbox/video/init/` + subida en chunks a `upload_url`), no
+  Direct Post: el video llega como **borrador al inbox de TikTok** de la
+  cuenta, no se publica solo — el dueño de la cuenta tiene que abrir la app
+  de TikTok y publicarlo a mano.
+- Solo funciona contra cuentas dadas de alta como **Sandbox testers** de
+  esta app en el Developer Portal.
+
+El día que se apruebe `video.publish`, pasar a Direct Post es un cambio
+chico y contenido: el endpoint de init y el body de la request están
+aislados en `tiktok.py` (`_INBOX_INIT_URL` / `_DIRECT_POST_INIT_URL` /
+`_build_init_body`, con un comentario marcando el swap) — la subida en
+chunks no cambia.
+
+A diferencia de `youtube.py`/`twitter.py`, **no hay modo single-account**
+para TikTok (no existe un equivalente a `token.json` o `X_ACCESS_TOKEN`):
+todo job `platform="tiktok"` necesita `account_id`.
+
+**El Developer Portal rechaza redirect URIs `localhost`/`127.0.0.1`.**
+`TIKTOK_REDIRECT_URI` tiene que ser una página pública HTTPS que no hace
+nada más que reenviar el callback a la máquina local vía JS
+(`location.replace`). El truco más simple es GitHub Pages: un repo público
+con un `callback.html` como este,
+
+```html
+<!doctype html>
+<script>
+  location.replace("http://localhost:8910/callback" + location.search);
+</script>
+```
+
+publicado en `https://<usuario>.github.io/<repo>/callback.html` — esa URL
+es la que se registra en el Developer Portal y la que va en
+`TIKTOK_REDIRECT_URI`. El `8910` del snippet tiene que coincidir con
+`TIKTOK_LOCAL_CALLBACK_PORT` (default `8910`); si lo cambiás, actualizá
+también el `callback.html` publicado.
+
+`scripts/authorize_tiktok.py` nunca toca `TIKTOK_REDIRECT_URI` directamente
+más que para mandárselo a TikTok (URL de autorización + exchange de
+token, donde tiene que matchear exacto con el Portal) — el servidor HTTP
+local de un solo uso siempre escucha en `localhost:TIKTOK_LOCAL_CALLBACK_PORT`,
+independientemente del valor de `TIKTOK_REDIRECT_URI`.
+
+Para dar de alta una cuenta (corre el flujo OAuth interactivo):
+
+```bash
+python -m scripts.authorize_tiktok --account "Cuenta cliente X"
+```
+
+El refresh proactivo de tokens (mismo mecanismo que YouTube, Fase 8) también
+cubre TikTok — ver `_TOKEN_REFRESH_MODULES_BY_PLATFORM` en `app/tasks.py`.
+
+### Webhook de TikTok (Fase 10b)
+
+`POST /webhooks/tiktok` (agregado a la misma app FastAPI del dashboard,
+`dashboard/api.py`) recibe los callbacks de estado del Content Posting API
+de TikTok. Como el Developer Portal todavía no deja registrar una callback
+URL real de Sandbox (mismo bloqueo que el resto de la Fase 10), está armado
+para poder probarse **enteramente en local**, con curl o con
+`scripts/simulate_tiktok_webhook.py`.
+
+**Cómo corre:**
+
+- `dashboard/api.py::tiktok_webhook` verifica la firma, parsea el envelope
+  y guarda un registro de auditoría en la tabla `webhook_events`
+  (`app/models.py::WebhookEvent`) — y ahí responde `200` enseguida.
+- El trabajo real (buscar el `Job`, cambiar su estado, mandar la alerta a
+  Discord/Slack) pasa a una task de Celery,
+  `app.tasks.handle_tiktok_webhook_event`, así una alerta lenta nunca
+  demora la respuesta que TikTok espera. **Corré el worker de Celery** para
+  que esta parte se procese (ver "Correr todo" más arriba).
+
+**Verificación de firma:** el header `TikTok-Signature` viene como
+`t=<timestamp>,s=<hmac>`; se verifica con HMAC-SHA256 usando
+`TIKTOK_CLIENT_SECRET` sobre `"<timestamp>.<body crudo>"`, más una
+tolerancia de antigüedad del timestamp
+(`TIKTOK_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`, default 300s) contra replay.
+Una firma inválida devuelve `401` (a propósito: enmascararla como `200`
+ocultaría un problema real de configuración o un intento de spoof).
+
+**Para probar en local sin firma real**, seteá en `.env`:
+
+```bash
+TIKTOK_WEBHOOK_SKIP_SIGNATURE=1
+```
+
+El dashboard imprime un warning bien visible al arrancar mientras esto esté
+seteado — **nunca dejarlo así en producción**.
+
+**Con `scripts/simulate_tiktok_webhook.py`** (firma cualquier request con
+`TIKTOK_CLIENT_SECRET`, no necesita `TIKTOK_WEBHOOK_SKIP_SIGNATURE`):
+
+```bash
+# evento de éxito (video.publish.completed) — matchea si el publish_id
+# coincide con el external_id de algún Job platform="tiktok"
+python -m scripts.simulate_tiktok_webhook --scenario delivered --publish-id v_pub_url~v2.123
+
+# evento de falla (video.upload.failed) — marca el Job como failed y manda
+# la alerta configurada en ALERT_WEBHOOK_URL
+python -m scripts.simulate_tiktok_webhook --scenario failed --publish-id v_pub_url~v2.123
+
+# publish_id que no matchea ningún Job — se audita y se responde 200,
+# sin hacer que TikTok reintente
+python -m scripts.simulate_tiktok_webhook --scenario delivered --publish-id no-existe
+
+# --skip-signature para probar TIKTOK_WEBHOOK_SKIP_SIGNATURE=1
+python -m scripts.simulate_tiktok_webhook --scenario delivered --publish-id v_pub_url~v2.123 --skip-signature
+```
+
+**O con curl directo** (requiere `TIKTOK_WEBHOOK_SKIP_SIGNATURE=1` en el
+server, porque curl no firma el body):
+
+```bash
+curl -X POST http://localhost:8000/webhooks/tiktok \
+  -H "Content-Type: application/json" \
+  -d '{"event":"video.publish.completed","create_time":1735689600,"content":"{\"publish_id\":\"v_pub_url~v2.123\"}"}'
+
+curl -X POST http://localhost:8000/webhooks/tiktok \
+  -H "Content-Type: application/json" \
+  -d '{"event":"video.upload.failed","create_time":1735689600,"content":"{\"publish_id\":\"v_pub_url~v2.123\",\"fail_reason\":\"video_format_check_failed\"}"}'
+```
+
+**Matching (`Job.external_id`):** los publishers ya devolvían un
+`external_id` en su resultado, pero antes se descartaba —
+`app/tasks.py::_persist_external_id` ahora lo persiste en `Job.external_id`
+después de un publish exitoso, que es contra lo que matchea el webhook.
+**Paso manual de esquema** (mismo patrón que `account_id` en la Fase 6):
+`init_db()` crea la tabla nueva `webhook_events` sola, pero no agrega la
+columna a la tabla `jobs` existente. Correr una vez, a mano, contra Neon:
+
+```sql
+ALTER TABLE jobs ADD COLUMN external_id VARCHAR(255);
+```
+
+**Nombres de evento — advertencia:** los únicos eventos de Content Posting
+que la documentación oficial (`developers.tiktok.com/doc/webhooks-events`)
+lista hoy son `video.upload.failed` y `video.publish.completed` — no
+`post.publish.failed` / `post.publish.inbox.delivered` como aparece en
+otras partes de la documentación/marketing de TikTok. Como todavía no se
+puede registrar un webhook real de Sandbox para observar un payload real,
+`app/webhooks/tiktok.py::classify_event` clasifica por substring
+(`"failed"`/`"fail"` → falla, `"completed"`/`"delivered"`/`"success"` →
+éxito) en vez de una lista cerrada — debería seguir funcionando ante
+cualquiera de los dos esquemas de nombres, pero conviene reverificarlo
+contra un evento real apenas se pueda.
+
 ## Dashboard de monitoreo (extra, fuera del spec)
 
 `dashboard/` es un panel de solo lectura sobre el estado de los jobs (salvo
-por la acción de reintentar un job `failed`). No modifica ni depende de
-lógica nueva en `app/` — solo lee de la misma base y usa `publish_job.delay`
-para reintentar.
+por la acción de reintentar un job `failed` y, desde la Fase 10b, recibir
+el webhook de TikTok — ver arriba). No modifica ni depende de lógica nueva
+en `app/` — solo lee de la misma base y llama a `publish_job.delay` /
+`handle_tiktok_webhook_event.delay` para el trabajo real.
 
 ```bash
 uvicorn dashboard.api:app --reload --port 8000
 ```
 
 Abrí `http://localhost:8000` — sirve el frontend (`dashboard/static/index.html`)
-y expone la API en `/api/jobs`, `/api/stats` y `POST /api/jobs/{id}/retry`
+y expone la API en `/api/jobs`, `/api/stats`, `POST /api/jobs/{id}/retry`
 (esta última solo funciona sobre jobs en estado `failed`; devuelve 409 en
-cualquier otro caso). No requiere el worker de Celery corriendo para mostrar
-datos, pero sí para que un retry se procese de verdad.
+cualquier otro caso) y `POST /webhooks/tiktok` (Fase 10b, ver arriba). No
+requiere el worker de Celery corriendo para mostrar datos, pero sí para que
+un retry o un webhook de TikTok se procesen de verdad (el endpoint del
+webhook responde 200 igual, pero el matching/alerta no ocurre sin worker).
 
 ## Docker y Fly.io (Fase 9)
 
@@ -286,8 +448,9 @@ exista la cuenta:
 
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
-- Publishers reales para cada red social (hoy solo existe YouTube además del fake).
 - Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
 - Deploy real en Fly.io (el `fly.toml` y el Dockerfile están listos, pero nadie corrió `fly deploy` — falta la cuenta del cliente).
 - Conectar `app/storage.py` (R2) a los publishers cuando exista un flujo real de media.
 - Timezone real por cuenta/plataforma para el scheduling (hoy es naive local time, ver `app/config.py`).
+- TikTok Direct Post (`video.publish`, pendiente de la revisión de la app).
+- Registrar la callback URL real del webhook de TikTok en el Developer Portal (bloqueado por el mismo motivo que el resto del setup de Sandbox — ver Fase 10b) y confirmar los nombres de evento reales contra un payload real la primera vez que llegue uno.

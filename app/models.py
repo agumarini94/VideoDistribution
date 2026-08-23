@@ -133,6 +133,15 @@ class Job(Base):
     # (created directly as queued, or dispatched urgently).
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Platform-assigned identifier for the published content (e.g. TikTok's
+    # publish_id, a YouTube video id, a tweet id) — every publisher already
+    # returns this as result["external_id"]; app/tasks.py persists it here
+    # after a successful publish (see _persist_external_id). Null for jobs
+    # published before this field existed. TikTok's webhook listener (Phase
+    # 10b) is the first consumer: it matches an incoming event's publish_id
+    # back to this column to find the Job it's about.
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -140,3 +149,40 @@ class Job(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging only
         return f"Job(id={self.id}, platform={self.platform!r}, status={self.status.value})"
+
+
+class WebhookEvent(Base):
+    """
+    Audit trail of inbound platform webhook events (Phase 10b: TikTok
+    Content Posting API status callbacks, POST /webhooks/tiktok in
+    dashboard/api.py). Every request that passes signature verification is
+    stored here — whether or not it can be matched to a Job — so nothing a
+    platform sends is ever silently lost even if the matching/processing
+    logic downstream has a bug.
+    """
+
+    __tablename__ = "webhook_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Free string, same rationale as Job.platform: only "tiktok" today, but
+    # adding another platform's webhook shouldn't require a schema change.
+    platform: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # The platform's identifier for the content this event is about (e.g.
+    # TikTok's publish_id), matched against Job.external_id. Nullable:
+    # some event types aren't about a specific piece of content (e.g.
+    # TikTok's authorization.removed).
+    publish_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # The full webhook envelope exactly as received (after JSON-decoding
+    # the request body), kept verbatim for auditing/debugging regardless of
+    # whether it was understood or matched to a job.
+    raw_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return f"WebhookEvent(id={self.id}, platform={self.platform!r}, event_type={self.event_type!r})"

@@ -13,8 +13,8 @@ transient errors and a dead-letter queue for permanent ones.
   models the state machine explicitly (including `SCHEDULED`, for jobs
   waiting on a future time slot). `Account` model (Phase 6): id, platform,
   name, credentials (JSON), is_active, created_at, updated_at — per-account
-  credentials for platforms with multi-account support (currently just
-  Twitter/X).
+  credentials for platforms with multi-account support (Twitter/X, YouTube,
+  TikTok).
 - `app/publishers/` — **pure functions**. A publisher knows nothing about
   Celery or the database (no retry/queue/job_id/Account-row concepts) and
   never prints to screen. It either returns a result or raises a typed
@@ -45,6 +45,17 @@ transient errors and a dead-letter queue for permanent ones.
     app-level or access-token credentials -> `PermanentError` naming
     exactly what's missing. Payload: `{"text": str}` for now; media comes
     later via `app/storage.py`.
+  - `tiktok.py` (Phase 10) — real TikTok Content Posting API publisher,
+    Sandbox mode: inbox-upload flow only (`POST
+    /v2/post/publish/inbox/video/init/` then chunked `PUT` to the returned
+    `upload_url`), since Sandbox only grants `video.upload` —
+    `video.publish` (Direct Post) is gated behind app review. No
+    single-account fallback: `account_credentials` is required (bearer
+    `access_token`), from an `Account` row created via
+    `scripts/authorize_tiktok.py`. Also exposes `token_expires_within` /
+    `refresh_stored_credentials` (same shape as `youtube.py`) for
+    `refresh_expiring_tokens`, and `exchange_authorization_code` for the
+    one-time authorization script.
 - `app/tasks.py` — the only module that knows about Celery, the publishers,
   *and* the `Account` table. `publish_job` looks up the right publisher for
   the job's `platform` (`_PUBLISHERS_BY_PLATFORM`, defaulting to the fake
@@ -350,26 +361,237 @@ unit-tested without Redis or a worker running.
     name), run `fly secrets set` for every env var above, then `fly
     deploy`.
 
+### Phase 10 (current)
+- **TikTok publisher** (`app/publishers/tiktok.py`) — built and wired into
+  `app/tasks.py` (`platform="tiktok"` routes to it). **Sandbox mode only**:
+  the app's TikTok Developer Portal review hasn't passed, so it only has the
+  `video.upload` scope — `video.publish` is gated behind review. As a
+  result the publisher implements the **inbox-upload flow**
+  (`POST /v2/post/publish/inbox/video/init/`, then chunked `PUT` to the
+  returned `upload_url`): the video lands as a **draft in the target
+  account's TikTok inbox**, not a live post — the account owner has to open
+  the TikTok app and manually publish it. It also only works against
+  Sandbox target accounts registered as testers for this app in the
+  Developer Portal, and getting the app itself listed publicly requires
+  submitting a demo video showing the full posting flow as part of the
+  review.
+  - **Direct Post migration path**: the inbox-vs-Direct-Post difference is
+    isolated to the init endpoint and request body (`_INBOX_INIT_URL` /
+    `_DIRECT_POST_INIT_URL` and `_build_init_body` in `tiktok.py`, with an
+    inline comment marking the swap) — the chunked-upload mechanics are
+    identical either way, so switching once `video.publish` is approved is
+    a small, contained change, not a rewrite.
+  - **No single-account fallback**: unlike `youtube.py`/`twitter.py`,
+    `tiktok.py` has no env-var fallback credential path (there's no TikTok
+    equivalent of `token.json` or `X_ACCESS_TOKEN`) — every `platform="tiktok"`
+    job needs an `account_id`, resolved the same way as the other platforms
+    via `_resolve_account_credentials`.
+  - Error classification, consistent with `youtube.py`/`twitter.py`: HTTP
+    429/5xx -> `TransientError`; other 4xx (invalid params, bad/expired
+    auth) -> `PermanentError`; missing credentials -> `PermanentError`
+    naming exactly what's missing. The Content Posting API reports most
+    logical errors as HTTP 200 with a nested `error.code` (`_raise_for_api_error`),
+    while the OAuth token endpoint reports them as top-level
+    `error`/`error_description` strings (`_raise_for_token_error`) — these
+    are two different response shapes and are classified separately on
+    purpose.
+  - **Proactive token refresh**: exposes `token_expires_within` /
+    `refresh_stored_credentials`, same contract as `youtube.py`, registered
+    in `_TOKEN_REFRESH_MODULES_BY_PLATFORM` (`app/tasks.py`) so
+    `refresh_expiring_tokens` (Phase 8) manages TikTok accounts the same
+    way it manages YouTube ones. The re-authorization alert on a
+    revoked/invalid refresh token now looks up the right script per
+    platform (`_REAUTHORIZE_SCRIPT_BY_PLATFORM` in `app/tasks.py`) instead
+    of hardcoding `scripts/authorize_youtube.py`.
+- `scripts/authorize_tiktok.py --account NAME` (required, no default) —
+  interactive OAuth: opens a browser for the authorization URL
+  (`video.upload` + `user.info.basic` scopes), waits for the authorization
+  code, exchanges it for tokens via `tiktok.py`'s
+  `exchange_authorization_code`, and upserts an `Account` row
+  (`platform="tiktok"`) via the same `upsert_account` helper as the other
+  authorize scripts. Prints setup instructions if `TIKTOK_CLIENT_KEY` /
+  `TIKTOK_CLIENT_SECRET` / `TIKTOK_REDIRECT_URI` are missing.
+  - **`TIKTOK_REDIRECT_URI` is a public HTTPS forwarder page, not
+    localhost**: the TikTok Developer Portal rejects
+    localhost/127.0.0.1 redirect URIs outright, so the registered URI has
+    to be a real public page. The trick: a static page (e.g. published via
+    GitHub Pages) whose entire content is a `location.replace()` that
+    forwards the callback's query string to
+    `http://localhost:8910/callback`:
+    ```html
+    <!doctype html>
+    <script>
+      location.replace("http://localhost:8910/callback" + location.search);
+    </script>
+    ```
+    That public page's URL is what's registered in the Portal and what's
+    set as `TIKTOK_REDIRECT_URI` — it's sent to TikTok verbatim (authorize
+    URL + token exchange, where it must match the Portal exactly) but the
+    script itself never connects to it. `_wait_for_callback(port)` in the
+    script instead always binds a one-shot local HTTP server to
+    `localhost:TIKTOK_LOCAL_CALLBACK_PORT` (env var, default `8910`,
+    path `/callback`) — that's the actual target the forwarder page's
+    `location.replace()` hits, independent of whatever
+    `TIKTOK_REDIRECT_URI` is set to. The literal `8910` hardcoded in the
+    forwarder page's JS has to match `TIKTOK_LOCAL_CALLBACK_PORT` — if that
+    env var changes (e.g. port conflict), the published page must be
+    updated too.
+  - **PKCE (required by TikTok's OAuth, unlike Google's/X's) — and
+    non-standard**: `_generate_pkce_pair()` in the script generates a
+    `code_verifier` (`secrets.token_urlsafe`) and a `code_challenge`, sent
+    as `code_challenge`/`code_challenge_method=S256` on the authorize URL.
+    The challenge is the **hex** digest of SHA-256(verifier)
+    (`hashlib.sha256(...).hexdigest()`), *not* RFC 7636's
+    BASE64URL(SHA256(verifier)) — TikTok's Login Kit for Desktop docs
+    (developers.tiktok.com/doc/login-kit-desktop) require the hex form, and
+    the standard base64url form gets rejected by TikTok's login page with a
+    `code_challenge` error. This deviation is deliberate and documented
+    in-code precisely so it doesn't get "corrected" back to base64url
+    later. The verifier is kept in memory (never sent until the token
+    exchange) and passed straight into
+    `exchange_authorization_code(code, redirect_uri, code_verifier)`, which
+    includes it as `code_verifier` in the token request body — TikTok
+    recomputes hex(SHA256(verifier)) server-side and checks it against the
+    challenge it received earlier.
+
+  **When TikTok credentials arrive:**
+  1. Publish the forwarder page (see above) somewhere public over HTTPS
+     (GitHub Pages is the easy option) — its URL is `TIKTOK_REDIRECT_URI`.
+  2. In the TikTok for Developers portal, create/select the app, add the
+     target account(s) as Sandbox testers, register that forwarder page's
+     URL under Login Kit, and request the `video.upload` scope.
+  3. Set `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`, `TIKTOK_REDIRECT_URI`
+     (the forwarder page URL) in `.env`. `TIKTOK_LOCAL_CALLBACK_PORT` only
+     needs setting if `8910` is taken locally (and then the forwarder
+     page's JS must be updated to match).
+  4. Run `python -m scripts.authorize_tiktok --account NAME` per Sandbox
+     account.
+  5. Test with a job whose `platform="tiktok"` and `account_id` set to that
+     account — the video lands as a draft in the account's TikTok inbox,
+     not a live post (Sandbox limitation, see above).
+  6. When ready for production: submit the app for review (including the
+     required demo video of the full posting flow) to get `video.publish`
+     granted, then switch `tiktok.py` to the Direct Post endpoint per the
+     migration path documented above.
+
+### Phase 10b (current)
+- **TikTok webhook listener** — `POST /webhooks/tiktok`, added to the same
+  FastAPI app as the dashboard (`dashboard/api.py`), for TikTok's Content
+  Posting API status callbacks. Built fully testable locally with curl /
+  `scripts/simulate_tiktok_webhook.py` since the Developer Portal blocks
+  registering a real Sandbox webhook URL right now (see Phase 10's "Live
+  test pending" note) — there is no live payload to have observed yet.
+  - **Event-naming caveat**: the only Content Posting-adjacent webhook
+    events documented at developers.tiktok.com/doc/webhooks-events are
+    `video.upload.failed` and `video.publish.completed` (envelope carries
+    the content identifier in a field migrated from `share_id` to
+    `publish_id`). This does **not** match the `post.publish.*` naming
+    sometimes seen elsewhere in TikTok's docs/marketing. Since a real
+    Sandbox payload can't be observed yet to settle this,
+    `app/webhooks/tiktok.py::classify_event` matches by substring
+    (`"failed"`/`"fail"` -> failure, `"completed"`/`"delivered"`/`"success"`
+    -> success) instead of an exhaustive hardcoded event list — it should
+    keep working under either naming scheme without a code change once a
+    real webhook can be registered and observed. Re-verify this the first
+    time a real event arrives (see the "what remains" note below).
+  - **Signature verification** (`app/webhooks/tiktok.py::verify_signature`,
+    per developers.tiktok.com/doc/webhooks-verification): the
+    `TikTok-Signature` header is `t=<unix_ts>,s=<hex hmac-sha256>`; the
+    signed message is `<unix_ts>.<raw_json_body>`, HMAC-SHA256'd with
+    `TIKTOK_CLIENT_SECRET`. Verifies against the raw request bytes (not a
+    re-serialized dict, which isn't guaranteed to reproduce them), and
+    rejects timestamps older than `TIKTOK_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS`
+    (default 300s) as a replay guard. A failed verification is a 401, not a
+    200 — unlike an unresolvable `publish_id`, a bad signature is a
+    security-relevant rejection that must not be silently masked (TikTok's
+    own retry-with-backoff gives a legitimate-but-misfiring request another
+    chance).
+  - **`TIKTOK_WEBHOOK_SKIP_SIGNATURE=1`** disables verification entirely —
+    local curl/`scripts/simulate_tiktok_webhook.py` testing only.
+    `dashboard/api.py` logs a loud warning banner at process startup
+    whenever it's set, so it can't accidentally go unnoticed in a deploy.
+  - **Matching**: every publisher already returns the platform's id for the
+    published content as `result["external_id"]` (`app/publishers/*.py`) —
+    `publish_job` now persists it onto `Job.external_id`
+    (`_persist_external_id`, `app/tasks.py`), which is what the webhook
+    matches against. **Manual schema step**, same pattern as Phase 6's
+    `account_id`: `init_db()`'s `create_all` only creates tables that don't
+    exist yet, so on an existing Neon database this creates the new
+    `webhook_events` table but does **not** add `jobs.external_id`. Run
+    once, by hand, against Neon:
+    ```sql
+    ALTER TABLE jobs ADD COLUMN external_id VARCHAR(255);
+    ```
+    Jobs published before this column existed have `external_id = NULL`
+    and can't be matched retroactively.
+  - **Processing is off the request path**: the route
+    (`dashboard/api.py::tiktok_webhook`) only verifies the signature,
+    parses the envelope, inserts a `WebhookEvent` audit row, and dispatches
+    `handle_tiktok_webhook_event.delay(...)` — a Celery task
+    (`app/tasks.py`) that does the actual `Job` lookup, status transition,
+    and `send_alert` call. This keeps the HTTP response fast regardless of
+    Discord/Slack latency, matching TikTok's requirement to respond 200
+    promptly (docs say it retries with backoff for up to 72h on anything
+    else, with at-least-once delivery — processing is written to be
+    idempotent: a success event never resurrects a job a failure event
+    already marked `FAILED`, and re-processing the same event just
+    re-applies the same transition).
+  - **Outcomes**: a failure-classified event sets the job `FAILED` with
+    `error_message` from the event (preferring `content.fail_reason` when
+    present) and calls `send_alert` — same Discord/Slack channel as the
+    dead-letter queue, but this path does **not** go through
+    `handle_dead_letter`/the `dlq` queue, since this isn't a publish
+    attempt that could be retried, it's TikTok's own after-the-fact status
+    report on content it already accepted. A success-classified event is a
+    no-op if the job is already `PUBLISHED` (the common case — `publish_job`
+    already marks it `PUBLISHED` right after the chunked upload succeeds;
+    this webhook is TikTok's later confirmation). An unrecognized event
+    type, or one with no `publish_id`, or one whose `publish_id` matches no
+    `Job`, is logged and left as an audit-only `WebhookEvent` row — nothing
+    else happens, and the HTTP layer already answered 200 so TikTok won't
+    retry it.
+  - `app/models.py::WebhookEvent` — the audit table: `platform`,
+    `event_type`, `publish_id` (nullable), `raw_payload` (the full envelope,
+    JSON), `received_at`. Every request that passes signature verification
+    is stored here regardless of whether it could be parsed/matched.
+  - `scripts/simulate_tiktok_webhook.py` — builds a real
+    `TikTok-Signature` header from `TIKTOK_CLIENT_SECRET` and POSTs one of
+    three scenarios (`--scenario delivered|failed|unknown`) with a given
+    `--publish-id` against a running dashboard instance. `--skip-signature`
+    tests the `TIKTOK_WEBHOOK_SKIP_SIGNATURE=1` path instead. See README
+    for example invocations.
+  - **What remains** (out of scope here, same blocker as Phase 10's live
+    test): registering the real callback URL in the TikTok Developer
+    Portal once Sandbox/app-review access allows it, and re-verifying the
+    event-naming assumption above against a real payload the first time
+    one arrives.
+
 ## Monitoring dashboard (extra, not in the spec)
 
-- `dashboard/` — a monitoring dashboard for the engine, built without any
-  changes to `app/` (models, tasks, publishers). It only reads the same
-  database (`SessionLocal` from `app/db.py`) and, for retries, calls
-  `publish_job.delay` from `app/tasks.py`.
+- `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)
+  the TikTok webhook receiver, built without changing what `app/`, `tasks`
+  and the publishers are responsible for. It only imports from `app/`
+  (`SessionLocal`, `Job`, `JobStatus`, `WebhookEvent`, `publish_job`,
+  `handle_tiktok_webhook_event`, `app.webhooks.tiktok`) and never the other
+  way around — for the webhook route this means the same split as retry:
+  the route itself does no business logic (verify signature, store the raw
+  event, dispatch a task), the actual matching/status-transition/alerting
+  logic lives in `app/tasks.py`, see Phase 10b above.
   - `dashboard/api.py` — FastAPI app: `GET /api/jobs` (filterable by
     `status`/`platform`, `limit` default 50, newest first), `GET
-    /api/stats` (counts per `JobStatus` plus total), and `POST
+    /api/stats` (counts per `JobStatus` plus total), `POST
     /api/jobs/{id}/retry` (only for jobs in `FAILED`: resets `status` to
     `QUEUED`, `attempts` to 0, clears `error_message`, commits, then
-    dispatches `publish_job.delay(id)`; returns 409 for any other status).
-    CORS is open for localhost. Also serves `dashboard/static/` so the
-    whole dashboard runs from a single process.
+    dispatches `publish_job.delay(id)`; returns 409 for any other status),
+    and `POST /webhooks/tiktok` (Phase 10b, see above). CORS is open for
+    localhost. Also serves `dashboard/static/` so the whole dashboard runs
+    from a single process.
   - `dashboard/static/index.html` — single-file vanilla JS frontend (no
     build step): stat cards per status, a filterable jobs table with
     status badges and a Retry button on failed rows, auto-refreshing every
     5s.
   - Run with `uvicorn dashboard.api:app --reload --port 8000`.
-  - The dashboard is **read-only** except for the retry action.
+  - Read-only except for the retry action and receiving TikTok webhooks.
   - Not committed yet (per instruction) — exists locally only.
 
 ## Running locally
