@@ -7,3 +7,4 @@ venv/
 *.sqlite3
 client_secret.json
 token.json
+.DS_Store
