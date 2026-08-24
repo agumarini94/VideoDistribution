@@ -6,114 +6,185 @@
 <title>Distribution Engine — Dashboard</title>
 <style>
   :root {
-    color-scheme: dark light;
-    --bg: #0f1115;
-    --panel: #171a21;
-    --panel-border: #262b36;
-    --text: #e6e8eb;
-    --text-dim: #9aa2b1;
-    --accent: #5b8def;
+    color-scheme: light;
+    --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", "Courier New", monospace;
 
-    --published: #3ecf8e;
-    --failed: #f2545b;
-    --scheduled: #e8a33d;
-    --neutral: #8891a5;
-  }
+    --bg: #ffffff;
+    --ink: #000000;
+    --panel: #ffffff;
 
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #f5f6f8;
-      --panel: #ffffff;
-      --panel-border: #e2e5ea;
-      --text: #1a1d24;
-      --text-dim: #5c6270;
-    }
+    --violet: #9D00FF;
+    --green: #22C55E;
+    --yellow: #FDE047;
+    --red: #EF4444;
+    --blue: #2B6CFF;
+    --gray: #9CA3AF;
+
+    --published: var(--green);
+    --failed: var(--red);
+    --scheduled: var(--blue);
+    --queued: var(--yellow);
+    --processing: var(--yellow);
+    --neutral: var(--gray);
+
+    --shadow-lg: 4px 4px 0 var(--ink);
+    --shadow-sm: 2px 2px 0 var(--ink);
+    --border: 3px solid var(--ink);
   }
 
   * { box-sizing: border-box; }
 
   body {
     margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-family: var(--font-mono);
     background: var(--bg);
-    color: var(--text);
-    padding: 24px 32px 48px;
+    color: var(--ink);
+    padding: 0 0 48px;
   }
 
   header {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 8px;
-    margin-bottom: 24px;
+    background: var(--violet);
+    border-bottom: var(--border);
+    padding: 20px 32px;
+    margin-bottom: 20px;
   }
 
   h1 {
-    font-size: 20px;
-    font-weight: 600;
+    font-size: 22px;
+    font-weight: 800;
     margin: 0;
+    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
   }
 
   #last-updated {
-    color: var(--text-dim);
-    font-size: 13px;
+    color: #fff;
+    font-size: 12px;
+    text-transform: uppercase;
+    font-weight: 700;
   }
+
+  main {
+    padding: 0 32px;
+  }
+
+  /* Buttons — shared neobrutalist button system: flat bg, black border,
+     hard offset shadow; hover presses the button toward the shadow. */
+  .btn {
+    font-family: var(--font-mono);
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    border: var(--border);
+    border-radius: 0;
+    background: #fff;
+    color: var(--ink);
+    padding: 9px 18px;
+    font-size: 12px;
+    box-shadow: var(--shadow-lg);
+    cursor: pointer;
+    transition: transform 0.05s ease, box-shadow 0.05s ease;
+  }
+
+  .btn:hover:not(:disabled) {
+    transform: translate(2px, 2px);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .btn:active:not(:disabled) {
+    transform: translate(4px, 4px);
+    box-shadow: 0 0 0 var(--ink);
+  }
+
+  .btn:disabled { opacity: 0.5; cursor: default; }
+
+  .btn-green { background: var(--green); }
+
+  /* Tabs */
+  .tabs {
+    display: flex;
+    gap: 12px;
+    margin: 0 32px 24px;
+    flex-wrap: wrap;
+  }
+
+  .tab-btn.active { background: var(--ink); color: #fff; }
+
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
 
   .stat-cards {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 16px;
     margin-bottom: 28px;
   }
 
   .card {
     background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 10px;
+    border: var(--border);
+    box-shadow: var(--shadow-lg);
     padding: 14px 16px;
   }
 
   .card .label {
     font-size: 12px;
     text-transform: uppercase;
+    font-weight: 800;
     letter-spacing: 0.04em;
-    color: var(--text-dim);
-    margin-bottom: 6px;
+    color: var(--ink);
+    margin-bottom: 8px;
   }
 
   .card .value {
-    font-size: 26px;
-    font-weight: 700;
+    font-size: 32px;
+    font-weight: 800;
+    font-family: var(--font-mono);
   }
 
   .card.published .value { color: var(--published); }
   .card.failed .value { color: var(--failed); }
   .card.scheduled .value { color: var(--scheduled); }
   .card.queued .value,
-  .card.processing .value { color: var(--neutral); }
+  .card.processing .value { color: #CA8A04; }
 
   .filters {
     display: flex;
-    gap: 10px;
+    gap: 12px;
     align-items: center;
-    margin-bottom: 14px;
+    margin-bottom: 18px;
     flex-wrap: wrap;
   }
 
-  select {
-    background: var(--panel);
-    color: var(--text);
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    padding: 6px 10px;
+  select, input[type="text"], input[type="file"] {
+    background: #fff;
+    color: var(--ink);
+    border: var(--border);
+    box-shadow: var(--shadow-sm);
+    border-radius: 0;
+    padding: 8px 12px;
     font-size: 13px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+  }
+
+  select { text-transform: uppercase; appearance: none; cursor: pointer; }
+
+  select:focus, input:focus {
+    outline: none;
+    box-shadow: var(--shadow-lg);
   }
 
   .table-wrap {
     background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 10px;
+    border: var(--border);
+    box-shadow: var(--shadow-lg);
     overflow: auto;
   }
 
@@ -127,19 +198,26 @@
   th, td {
     text-align: left;
     padding: 10px 14px;
-    border-bottom: 1px solid var(--panel-border);
+    border-bottom: 3px solid var(--ink);
+    border-right: 3px solid var(--ink);
     white-space: nowrap;
   }
 
-  th {
-    color: var(--text-dim);
-    font-weight: 600;
+  th:last-child, td:last-child { border-right: none; }
+
+  thead th {
+    background: var(--violet);
+    color: #fff;
+    font-weight: 800;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+    border-bottom: 3px solid var(--ink);
   }
 
   tr:last-child td { border-bottom: none; }
+
+  tr.row-failed td { background: #FEE2E2; }
 
   td.error-cell {
     max-width: 260px;
@@ -150,82 +228,183 @@
 
   .badge {
     display: inline-block;
-    padding: 2px 9px;
-    border-radius: 999px;
+    padding: 3px 10px;
+    border: 2px solid var(--ink);
+    border-radius: 0;
     font-size: 11px;
-    font-weight: 600;
-    text-transform: capitalize;
+    font-weight: 800;
+    text-transform: uppercase;
+    color: var(--ink);
   }
 
-  .badge.published { background: rgba(62, 207, 142, 0.15); color: var(--published); }
-  .badge.failed { background: rgba(242, 84, 91, 0.15); color: var(--failed); }
-  .badge.scheduled { background: rgba(232, 163, 61, 0.15); color: var(--scheduled); }
-  .badge.queued, .badge.processing { background: rgba(136, 145, 165, 0.15); color: var(--neutral); }
+  .badge.published { background: var(--green); }
+  .badge.failed { background: var(--red); color: #fff; }
+  .badge.scheduled { background: var(--blue); color: #fff; }
+  .badge.queued, .badge.processing { background: var(--yellow); }
 
-  button.retry {
-    background: var(--accent);
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 5px 12px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  button.retry:hover { opacity: 0.85; }
-  button.retry:disabled { opacity: 0.5; cursor: default; }
+  .badge.platform { background: var(--yellow); }
+  .badge.active { background: var(--green); }
+  .badge.inactive { background: var(--gray); }
 
   .empty {
     padding: 24px;
     text-align: center;
-    color: var(--text-dim);
+    color: var(--ink);
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 12px;
   }
 
   .readonly-note {
-    color: var(--text-dim);
+    color: var(--ink);
     font-size: 12px;
-    margin-top: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    margin-top: 14px;
   }
+
+  /* New job form */
+  .form-card {
+    max-width: 480px;
+  }
+
+  .field {
+    margin-bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .field label {
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .field select, .field input { width: 100%; }
+
+  .result-box {
+    margin-top: 16px;
+    padding: 12px 14px;
+    border: var(--border);
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  .result-box.ok { background: var(--green); }
+  .result-box.err { background: var(--red); color: #fff; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Distribution Engine — Dashboard</h1>
+  <h1>Distribution Engine</h1>
   <div id="last-updated">Loading…</div>
 </header>
 
-<div class="stat-cards" id="stat-cards"></div>
+<nav class="tabs">
+  <button class="btn tab-btn active" data-tab="monitor">Monitor</button>
+  <button class="btn tab-btn" data-tab="newjob">New Job</button>
+  <button class="btn tab-btn" data-tab="accounts">Accounts</button>
+</nav>
 
-<div class="filters">
-  <select id="filter-status">
-    <option value="">All statuses</option>
-  </select>
-  <select id="filter-platform">
-    <option value="">All platforms</option>
-  </select>
-</div>
+<main>
 
-<div class="table-wrap">
-  <table>
-    <thead>
-      <tr>
-        <th>ID</th>
-        <th>Platform</th>
-        <th>Status</th>
-        <th>Attempts</th>
-        <th>Scheduled at</th>
-        <th>Error</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="jobs-body"></tbody>
-  </table>
-  <div class="empty" id="empty-msg" style="display:none;">No jobs match the current filters.</div>
-</div>
+<section class="tab-panel active" id="tab-monitor">
 
-<p class="readonly-note">Read-only, except the Retry action on failed jobs. Auto-refreshes every 5s.</p>
+  <div class="stat-cards" id="stat-cards"></div>
+
+  <div class="filters">
+    <select id="filter-status">
+      <option value="">All statuses</option>
+    </select>
+    <select id="filter-platform">
+      <option value="">All platforms</option>
+    </select>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Platform</th>
+          <th>Status</th>
+          <th>Attempts</th>
+          <th>Scheduled at</th>
+          <th>Error</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="jobs-body"></tbody>
+    </table>
+    <div class="empty" id="empty-msg" style="display:none;">No jobs match the current filters.</div>
+  </div>
+
+  <p class="readonly-note">Read-only, except the Retry action on failed jobs. Auto-refreshes every 5s.</p>
+
+</section>
+
+<section class="tab-panel" id="tab-newjob">
+
+  <div class="card form-card">
+    <form id="new-job-form">
+      <div class="field">
+        <label for="job-platform">Platform</label>
+        <select id="job-platform" required>
+          <option value="">Select platform…</option>
+          <option value="youtube">YouTube</option>
+          <option value="tiktok">TikTok</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="job-account">Account</label>
+        <select id="job-account" disabled>
+          <option value="">Select a platform first…</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="job-file">Video file</label>
+        <input type="file" id="job-file" accept="video/*" required>
+      </div>
+
+      <div class="field">
+        <label for="job-title">Title (optional)</label>
+        <input type="text" id="job-title" placeholder="Auto-generated if left blank">
+      </div>
+
+      <button type="submit" class="btn btn-green" id="job-submit">Create job</button>
+    </form>
+
+    <div id="job-result"></div>
+  </div>
+
+</section>
+
+<section class="tab-panel" id="tab-accounts">
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Platform</th>
+          <th>Name</th>
+          <th>Status</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody id="accounts-body"></tbody>
+    </table>
+    <div class="empty" id="accounts-empty" style="display:none;">No accounts found.</div>
+  </div>
+
+</section>
+
+</main>
 
 <script>
 const STATUSES = ["scheduled", "queued", "processing", "published", "failed"];
@@ -318,6 +497,7 @@ function renderJobs(jobs) {
 
   jobs.forEach(job => {
     const tr = document.createElement("tr");
+    if (job.status === "failed") tr.classList.add("row-failed");
 
     const errorText = job.error_message || "";
     const truncated = errorText.length > 60 ? errorText.slice(0, 60) + "…" : errorText || "—";
@@ -334,7 +514,7 @@ function renderJobs(jobs) {
 
     if (job.status === "failed") {
       const btn = document.createElement("button");
-      btn.className = "retry";
+      btn.className = "btn btn-green";
       btn.textContent = "Retry";
       btn.onclick = async () => {
         btn.disabled = true;
@@ -382,6 +562,136 @@ platformFilter.addEventListener("change", refresh);
 
 refresh();
 setInterval(refresh, REFRESH_MS);
+
+// --- Tabs ---------------------------------------------------------------
+
+const tabButtons = document.querySelectorAll(".tab-btn");
+const tabPanels = {
+  monitor: document.getElementById("tab-monitor"),
+  newjob: document.getElementById("tab-newjob"),
+  accounts: document.getElementById("tab-accounts"),
+};
+
+function showTab(name) {
+  tabButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === name));
+  Object.entries(tabPanels).forEach(([key, el]) => el.classList.toggle("active", key === name));
+  if (name === "accounts") loadAccountsTab();
+  if (name === "newjob") loadAccountOptions(jobPlatformSelect.value);
+}
+
+tabButtons.forEach(btn => btn.addEventListener("click", () => showTab(btn.dataset.tab)));
+
+// --- Accounts tab ---------------------------------------------------------
+
+const accountsBody = document.getElementById("accounts-body");
+const accountsEmpty = document.getElementById("accounts-empty");
+
+async function loadAccountsTab() {
+  accountsBody.innerHTML = "";
+  try {
+    const accounts = await fetchJson("/api/accounts");
+    accountsEmpty.style.display = accounts.length === 0 ? "block" : "none";
+    accounts.forEach(a => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${a.id}</td>
+        <td><span class="badge platform">${escapeHtml(a.platform)}</span></td>
+        <td>${escapeHtml(a.name)}</td>
+        <td><span class="badge ${a.is_active ? "active" : "inactive"}">${a.is_active ? "Active" : "Inactive"}</span></td>
+        <td>${fmtDate(a.created_at)}</td>
+      `;
+      accountsBody.appendChild(tr);
+    });
+  } catch (e) {
+    accountsEmpty.style.display = "none";
+    accountsBody.innerHTML = `<tr><td colspan="5">Failed to load accounts: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+// --- New job tab ----------------------------------------------------------
+
+const jobPlatformSelect = document.getElementById("job-platform");
+const jobAccountSelect = document.getElementById("job-account");
+const jobFileInput = document.getElementById("job-file");
+const jobTitleInput = document.getElementById("job-title");
+const jobForm = document.getElementById("new-job-form");
+const jobResult = document.getElementById("job-result");
+const jobSubmitBtn = document.getElementById("job-submit");
+
+function resultBox(ok, msg) {
+  return `<div class="result-box ${ok ? "ok" : "err"}">${escapeHtml(msg)}</div>`;
+}
+
+async function loadAccountOptions(platform) {
+  if (!platform) {
+    jobAccountSelect.innerHTML = '<option value="">Select a platform first…</option>';
+    jobAccountSelect.disabled = true;
+    return;
+  }
+  jobAccountSelect.disabled = false;
+  jobAccountSelect.innerHTML = '<option value="">Loading…</option>';
+  try {
+    const accounts = await fetchJson("/api/accounts?" + new URLSearchParams({ platform }));
+    jobAccountSelect.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = platform === "tiktok" ? "Select an account…" : "No account (single-account fallback)";
+    jobAccountSelect.appendChild(placeholder);
+    accounts.filter(a => a.is_active).forEach(a => {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = a.name;
+      jobAccountSelect.appendChild(opt);
+    });
+  } catch (e) {
+    jobAccountSelect.innerHTML = `<option value="">Failed to load accounts</option>`;
+  }
+}
+
+jobPlatformSelect.addEventListener("change", () => loadAccountOptions(jobPlatformSelect.value));
+
+jobForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  jobResult.innerHTML = "";
+
+  const platform = jobPlatformSelect.value;
+  const file = jobFileInput.files[0];
+
+  if (!platform) {
+    jobResult.innerHTML = resultBox(false, "Select a platform.");
+    return;
+  }
+  if (!file) {
+    jobResult.innerHTML = resultBox(false, "Choose a video file.");
+    return;
+  }
+  if (platform === "tiktok" && !jobAccountSelect.value) {
+    jobResult.innerHTML = resultBox(false, "TikTok jobs require an account.");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("platform", platform);
+  formData.append("file", file);
+  if (jobAccountSelect.value) formData.append("account_id", jobAccountSelect.value);
+  if (jobTitleInput.value.trim()) formData.append("title", jobTitleInput.value.trim());
+
+  jobSubmitBtn.disabled = true;
+  jobSubmitBtn.textContent = "Creating…";
+  try {
+    const created = await fetchJson("/api/jobs", { method: "POST", body: formData });
+    jobResult.innerHTML = resultBox(true, `Job #${created.id} created and dispatched.`);
+    jobForm.reset();
+    loadAccountOptions("");
+    showTab("monitor");
+    refresh();
+  } catch (err) {
+    jobResult.innerHTML = resultBox(false, `Failed: ${err.message}`);
+  } finally {
+    jobSubmitBtn.disabled = false;
+    jobSubmitBtn.textContent = "Create job";
+  }
+});
 </script>
 
 </body>

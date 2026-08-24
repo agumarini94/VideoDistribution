@@ -8,3 +8,4 @@ venv/
 client_secret.json
 token.json
 .DS_Store
+uploads/

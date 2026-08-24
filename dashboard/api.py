@@ -14,9 +14,11 @@ matching/alerting logic lives in app/tasks.py, not here.
 """
 
 import logging
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,7 +26,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.models import Job, JobStatus, WebhookEvent
+from app.models import Account, Job, JobStatus, WebhookEvent
 from app.tasks import handle_tiktok_webhook_event, publish_job
 from app.webhooks import tiktok as tiktok_webhooks
 
@@ -66,6 +68,18 @@ def get_db():
         db.close()
 
 
+# Upload target for POST /api/jobs (see below): same project-root "uploads/"
+# directory scripts/enqueue_tiktok_test.py and enqueue_youtube_test.py point
+# a job's payload["video_path"] at, just written to by this process instead
+# of passed in by hand. Excluded from git (see .gitignore).
+_UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
+
+# Only platforms scripts/enqueue_*_test.py already know how to build a
+# payload for. Other platforms (fake, twitter, ...) don't take file uploads
+# through this flow.
+_SUPPORTED_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
+
+
 class JobOut(BaseModel):
     id: int
     platform: str
@@ -98,6 +112,31 @@ class StatsOut(BaseModel):
 class RetryOut(BaseModel):
     id: int
     status: JobStatus
+
+
+class AccountOut(BaseModel):
+    id: int
+    platform: str
+    name: str
+    is_active: bool
+    created_at: str
+    # Deliberately no credentials field: this response is served to the
+    # browser, and Account.credentials holds live OAuth tokens / API
+    # secrets (see app/models.py) that must never leave the server.
+
+    @staticmethod
+    def from_account(account: Account) -> "AccountOut":
+        return AccountOut(
+            id=account.id,
+            platform=account.platform,
+            name=account.name,
+            is_active=account.is_active,
+            created_at=account.created_at.isoformat(),
+        )
+
+
+class JobCreateOut(BaseModel):
+    id: int
 
 
 @app.get("/api/jobs", response_model=list[JobOut])
@@ -144,6 +183,86 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
     publish_job.delay(job_id)
 
     return RetryOut(id=job.id, status=job.status)
+
+
+@app.get("/api/accounts", response_model=list[AccountOut])
+def list_accounts(platform: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Account)
+    if platform is not None:
+        query = query.filter(Account.platform == platform)
+    accounts = query.order_by(Account.platform, Account.name).all()
+    return [AccountOut.from_account(account) for account in accounts]
+
+
+@app.post("/api/jobs", response_model=JobCreateOut, status_code=201)
+async def create_job(
+    platform: str = Form(...),
+    file: UploadFile = File(...),
+    account_id: int | None = Form(default=None),
+    title: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload-driven job creation for the dashboard's "New Job" tab. Builds the
+    same payload shape scripts/enqueue_tiktok_test.py and
+    enqueue_youtube_test.py do, then dispatches exactly like they do
+    (publish_job.delay) — this route is a thin HTTP front end over that same
+    pattern, not a new way of constructing jobs.
+    """
+    if platform not in _SUPPORTED_UPLOAD_PLATFORMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported platform {platform!r}; must be one of {sorted(_SUPPORTED_UPLOAD_PLATFORMS)}",
+        )
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    account = None
+    if account_id is not None:
+        account = db.get(Account, account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+        if account.platform != platform:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Account {account_id} is a {account.platform} account, not {platform}",
+            )
+        if not account.is_active:
+            raise HTTPException(status_code=400, detail=f"Account {account_id} is inactive")
+    elif platform == "tiktok":
+        # Same rule app/publishers/tiktok.py enforces: no single-account
+        # fallback (see scripts/enqueue_tiktok_test.py --account being
+        # required, unlike YouTube's).
+        raise HTTPException(status_code=400, detail="TikTok jobs require an account (no single-account fallback)")
+
+    _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(file.filename).name
+    dest_path = _UPLOADS_DIR / f"{uuid.uuid4().hex}_{safe_name}"
+    dest_path.write_bytes(await file.read())
+
+    job_title = title.strip() if title and title.strip() else (
+        f"Distribution engine upload {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+    )
+
+    if platform == "tiktok":
+        payload = {"video_path": str(dest_path), "title": job_title}
+    else:
+        payload = {"video_path": str(dest_path), "title": job_title, "privacy": "private"}
+
+    job = Job(
+        platform=platform,
+        payload=payload,
+        account_id=account.id if account else None,
+        status=JobStatus.QUEUED,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    publish_job.delay(job.id)
+
+    return JobCreateOut(id=job.id)
 
 
 @app.post("/webhooks/tiktok")
