@@ -14,12 +14,16 @@ matching/alerting logic lives in app/tasks.py, not here.
 """
 
 import logging
+import os
+import secrets
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -47,6 +51,66 @@ if tiktok_webhooks.verification_skipped():
         "TikTok. Local curl testing ONLY — never set this in production.\n"
         + "!" * 78
     )
+
+# HTTP Basic auth, pre-deploy hardening (not part of the original spec).
+# Both DASHBOARD_USERNAME and DASHBOARD_PASSWORD must be set for auth to be
+# enforced; if either is missing the app still runs (local dev convenience)
+# but logs a loud warning, same style as the TIKTOK_WEBHOOK_SKIP_SIGNATURE
+# one above.
+_DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "").strip()
+_DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+_AUTH_ENABLED = bool(_DASHBOARD_USERNAME and _DASHBOARD_PASSWORD)
+
+if not _AUTH_ENABLED:
+    logger.warning(
+        "\n"
+        + "!" * 78
+        + "\nDASHBOARD_USERNAME / DASHBOARD_PASSWORD not both set: the dashboard "
+        "is UNPROTECTED.\nAnyone who can reach this process can read job/account "
+        "data and trigger retries.\nLocal dev ONLY — never run without both set "
+        "in production.\n"
+        + "!" * 78
+    )
+
+# Path exempted from Basic auth: TikTok's servers POST here directly and
+# can't supply dashboard credentials — the request's own signature
+# (TikTok-Signature header, verified in tiktok_webhook below) is its auth.
+_WEBHOOK_PATH = "/webhooks/tiktok"
+
+_basic_auth = HTTPBasic(auto_error=False)
+
+
+def _credentials_valid(credentials: HTTPBasicCredentials | None) -> bool:
+    if credentials is None:
+        return False
+    # Both comparisons always run (no short-circuit on username) so a
+    # mismatched username doesn't skip the password comparison and leak
+    # timing information about which part was wrong.
+    valid_username = secrets.compare_digest(credentials.username, _DASHBOARD_USERNAME)
+    valid_password = secrets.compare_digest(credentials.password, _DASHBOARD_PASSWORD)
+    return valid_username and valid_password
+
+
+# A single HTTP middleware (rather than a per-route Depends) so this covers
+# every route uniformly — API routes, the StaticFiles mount, and FastAPI's
+# auto-generated /docs, /redoc, /openapi.json — without having to remember
+# to wire it into each one individually. Registered before CORSMiddleware
+# below so CORS ends up as the outer layer and keeps handling preflight
+# OPTIONS requests (which never carry credentials) without hitting auth.
+@app.middleware("http")
+async def enforce_basic_auth(request: Request, call_next):
+    if not _AUTH_ENABLED or request.url.path == _WEBHOOK_PATH:
+        return await call_next(request)
+
+    credentials = await _basic_auth(request)
+    if not _credentials_valid(credentials):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing credentials"},
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return await call_next(request)
+
 
 # Dev-only CORS: the frontend is normally served by this same process (see
 # the StaticFiles mount below), but allowing localhost lets it also be

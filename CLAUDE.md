@@ -566,6 +566,39 @@ unit-tested without Redis or a worker running.
     event-naming assumption above against a real payload the first time
     one arrives.
 
+### Phase 11 (current)
+- **HTTP Basic auth for the dashboard** (pre-deploy hardening, not in the
+  original spec) — `dashboard/api.py` adds a single `@app.middleware("http")`
+  (`enforce_basic_auth`) that protects every route uniformly: `/api/*`, the
+  `StaticFiles` mount (the frontend), and FastAPI's auto-generated `/docs`,
+  `/redoc`, `/openapi.json`. A middleware was used instead of a per-route
+  `Depends` specifically so nothing new can be added later and accidentally
+  ship unauthenticated — `StaticFiles` and the auto docs routes don't take a
+  `Depends` the way a normal path operation does.
+  - **`POST /webhooks/tiktok` is exempt by path** (`_WEBHOOK_PATH` in
+    `dashboard/api.py`) — TikTok's servers can't supply dashboard
+    credentials, and the route already has its own auth (the
+    `TikTok-Signature` verification from Phase 10b), so exempting it doesn't
+    reduce security.
+  - **Credentials**: `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` env vars,
+    compared with `secrets.compare_digest` (both comparisons always run, so
+    a wrong username doesn't short-circuit before the password comparison
+    and leak timing information). Built on `fastapi.security.HTTPBasic`.
+  - **Fail-open for local dev, loud otherwise**: if both vars are set, auth
+    is enforced. If either is missing, the app still starts (so a fresh
+    clone with no `.env` still runs) but logs an unmissable startup warning
+    banner — same style as the existing
+    `TIKTOK_WEBHOOK_SKIP_SIGNATURE` warning (Phase 10b) — since an
+    unprotected dashboard exposes job/account data and the retry action to
+    anyone who can reach the process.
+  - **Middleware ordering matters**: `enforce_basic_auth` is registered
+    *before* `CORSMiddleware`'s `app.add_middleware(...)` call, so CORS ends
+    up wrapping around it (Starlette's middleware stack runs the
+    most-recently-added middleware outermost/first). This keeps CORS
+    preflight `OPTIONS` requests — which never carry an `Authorization`
+    header — handled by `CORSMiddleware` before they'd otherwise hit the
+    auth check and get rejected.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

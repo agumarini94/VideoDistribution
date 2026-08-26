@@ -118,6 +118,8 @@ Ver `app/config.py` / `.env.example`:
 | `TIKTOK_LOCAL_CALLBACK_PORT` | `8910` | Puerto local donde `scripts/authorize_tiktok.py` escucha el callback relayado por la página pública |
 | `TIKTOK_WEBHOOK_SKIP_SIGNATURE` | *(vacío)* | `1` deshabilita la verificación de firma en `POST /webhooks/tiktok` — solo para pruebas locales con curl, nunca en producción (ver Fase 10b) |
 | `TIKTOK_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS` | `300` | Antigüedad máxima aceptada del timestamp firmado en un webhook de TikTok, contra replay |
+| `DASHBOARD_USERNAME` | *(vacío)* | Usuario para HTTP Basic auth del dashboard; si falta este o `DASHBOARD_PASSWORD`, el dashboard queda sin proteger (ver Fase 11) |
+| `DASHBOARD_PASSWORD` | *(vacío)* | Password para HTTP Basic auth del dashboard, mismo caso que arriba |
 
 Defaults de `TIME_SLOTS` (ver `PLATFORM_TIME_SLOTS` en `app/config.py`): twitter
 09:00/13:00/18:00, tiktok 12:00/19:00, youtube 15:00, cualquier otra plataforma 12:00.
@@ -393,6 +395,35 @@ cualquier otro caso) y `POST /webhooks/tiktok` (Fase 10b, ver arriba). No
 requiere el worker de Celery corriendo para mostrar datos, pero sí para que
 un retry o un webhook de TikTok se procesen de verdad (el endpoint del
 webhook responde 200 igual, pero el matching/alerta no ocurre sin worker).
+
+**Protegido con HTTP Basic auth** (Fase 11) si `DASHBOARD_USERNAME` y
+`DASHBOARD_PASSWORD` están seteados — ver más abajo.
+
+### Autenticación del dashboard (Fase 11)
+
+Con `DASHBOARD_USERNAME` y `DASHBOARD_PASSWORD` seteados en `.env`, **toda**
+ruta de `dashboard/api.py` pide HTTP Basic auth: `/api/*`, el frontend
+estático (`/`), y `/docs`/`/redoc`/`/openapi.json`. La única excepción es
+`POST /webhooks/tiktok`: los servidores de TikTok le pegan directo y no
+pueden mandar las credenciales del dashboard — ese endpoint ya tiene su
+propia autenticación (la verificación de `TikTok-Signature`, Fase 10b), así
+que exponerlo sin Basic auth no baja la seguridad.
+
+Si falta cualquiera de las dos variables, el dashboard sigue arrancando
+(para no trabar el desarrollo local) pero imprime un warning bien visible al
+arrancar — mismo estilo que el de `TIKTOK_WEBHOOK_SKIP_SIGNATURE`. **Nunca
+desplegar así**: sin ambas variables seteadas, cualquiera que llegue al
+proceso puede leer jobs/cuentas y disparar retries.
+
+```bash
+# .env
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=una-contraseña-fuerte
+```
+
+```bash
+curl -u admin:una-contraseña-fuerte http://localhost:8000/api/jobs
+```
 
 ## Docker y Fly.io (Fase 9)
 
