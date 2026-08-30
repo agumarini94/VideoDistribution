@@ -326,21 +326,49 @@ unit-tested without Redis or a worker running.
   no deployment happened (the Fly.io account belongs to the client).
   - `Dockerfile` — `python:3.13-slim`, non-root user, `WORKDIR /app`.
     `requirements.txt` is copied and installed before the rest of the code
-    for layer caching. Default `CMD` runs the Celery worker (`-Q
-    priority,celery,dlq`); `beat` and the dashboard `api` process reuse the
-    same image with a different command (see `docker-compose.yml` /
-    `fly.toml`). All configuration still comes from env vars via
+    for layer caching. Default `CMD` runs `scripts/start_all.sh` (made
+    executable in the image via `RUN chmod +x`), which starts worker +
+    beat + the dashboard api together in one container — see the
+    single-machine mode note above. `docker-compose.yml`'s three services
+    still override `command:` individually to run worker/beat/api as
+    separate local containers (that file doesn't have Fly's
+    separate-machine constraint, since compose containers on one Mac don't
+    share `uploads/` either way without an explicit volume — out of scope
+    here). All configuration still comes from env vars via
     `app/config.py` — no secrets are baked into the image.
   - `.dockerignore` — excludes `.venv`, `.env`, `.git`, `*.mp4`,
     `token.json`, `client_secret.json`, the `celerybeat-schedule*` files,
     `__pycache__`, `.DS_Store`. `dashboard/` is **included** — it's meant
     to run in-container too, as the `api` process.
   - `fly.toml` — ready but unused: placeholder app name
-    `"distribution-engine"`, `[processes]` with `worker`, `beat`, `api`
-    (the last running `uvicorn dashboard.api:app --host 0.0.0.0 --port
-    8000`), `internal_port 8000` on the `api` process only. Comments note
-    that `REDIS_URL`, `DATABASE_URL`, `ALERT_WEBHOOK_URL`, the `X_*` and
-    `R2_*` vars must all be set via `fly secrets set`, never in this file.
+    `"distribution-engine"`. Comments note that `REDIS_URL`,
+    `DATABASE_URL`, `ALERT_WEBHOOK_URL`, the `X_*` and `R2_*` vars must all
+    be set via `fly secrets set`, never in this file.
+  - **Single-machine mode (deliberate, pre-R2)**: `[processes]` has a
+    single entry, `app = "scripts/start_all.sh"`, instead of separate
+    `worker`/`beat`/`api` processes. Reason: the NEW JOB upload flow
+    (`dashboard/api.py::create_job`, operator UI) writes files to local
+    disk under `uploads/`, so the process that later reads that path (the
+    worker) must share a filesystem with the process that wrote it (the
+    api process) — on Fly, separate `[processes]` entries can land on
+    separate machines, so they can't safely split while uploads live on
+    local disk. `scripts/start_all.sh` (bash, `set -e`) starts the Celery
+    worker (`-Q priority,celery,dlq`) and Celery beat in the background,
+    logs a line per service started, then `exec`s `uvicorn
+    dashboard.api:app --host 0.0.0.0 --port 8000` in the foreground so it
+    becomes PID 1. **Split back into separate `worker`/`beat`/`api`
+    processes once R2 storage (Phase 3) is wired into the upload flow** and
+    uploads no longer live on local disk. `[[services]]` targets this one
+    `"app"` process; `internal_port 8000` unchanged.
+  - **`GET /health`** (`dashboard/api.py`) — liveness probe, exempt from
+    HTTP Basic auth the same way the TikTok webhook route is (Phase 11):
+    runs a cheap `SELECT 1` and reports `db: "ok"/"error"`, but always
+    returns HTTP 200 (even if the DB check fails) since this is a liveness
+    probe, not a readiness/dependency check — a transient DB blip
+    shouldn't get the machine restarted by Fly. `fly.toml`'s
+    `http_checks.path` points here instead of `/api/stats` (which would've
+    required auth or an exemption of its own, and returns real data on
+    every probe for no reason).
   - `docker-compose.yml` — local-only, not used by Fly.io. Three services
     (`worker`, `beat`, `api`), all building from the same `Dockerfile` with
     different commands, `env_file: .env`. Redis is not containerized — it

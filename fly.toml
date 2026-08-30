@@ -9,19 +9,25 @@
 # real app once it exists.
 
 app = "distribution-engine"
-primary_region = "eze"
+primary_region = "gru"
 
 [build]
 
+# Single-machine mode, deliberate: the NEW JOB upload flow
+# (dashboard/api.py::create_job) writes files to local disk under uploads/,
+# so whichever process later reads that path (the worker) must share a
+# filesystem with whichever process wrote it (the api process) — meaning
+# they must run on the same machine, not as separate Fly processes/machines.
+# scripts/start_all.sh starts the worker and beat in the background and
+# execs uvicorn in the foreground. Split this back into separate
+# worker/beat/api [processes] entries once R2 storage (see CLAUDE.md
+# Phase 3) is wired into the upload flow and uploads no longer live on
+# local disk.
 [processes]
-worker = "celery -A app.celery_app worker --loglevel=info -Q priority,celery,dlq"
-beat = "celery -A app.celery_app beat --loglevel=info"
-api = "uvicorn dashboard.api:app --host 0.0.0.0 --port 8000"
+app = "scripts/start_all.sh"
 
-# Only the api process serves HTTP traffic; worker and beat are
-# background-only and have no [[services]] block.
 [[services]]
-processes = ["api"]
+processes = ["app"]
 internal_port = 8000
 protocol = "tcp"
 
@@ -34,6 +40,6 @@ protocol = "tcp"
   port = 443
 
   [[services.http_checks]]
-  path = "/api/stats"
+  path = "/health"
   interval = "30s"
   timeout = "5s"

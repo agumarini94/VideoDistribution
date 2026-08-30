@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
@@ -72,10 +72,15 @@ if not _AUTH_ENABLED:
         + "!" * 78
     )
 
-# Path exempted from Basic auth: TikTok's servers POST here directly and
-# can't supply dashboard credentials — the request's own signature
-# (TikTok-Signature header, verified in tiktok_webhook below) is its auth.
+# Paths exempted from Basic auth:
+# - the TikTok webhook: TikTok's servers POST here directly and can't
+#   supply dashboard credentials — the request's own signature
+#   (TikTok-Signature header, verified in tiktok_webhook below) is its auth.
+# - /health: Fly's http_check probes this before the machine is considered
+#   up; it never carries credentials either, and exposes no sensitive data.
 _WEBHOOK_PATH = "/webhooks/tiktok"
+_HEALTH_PATH = "/health"
+_NO_AUTH_PATHS = {_WEBHOOK_PATH, _HEALTH_PATH}
 
 _basic_auth = HTTPBasic(auto_error=False)
 
@@ -99,7 +104,7 @@ def _credentials_valid(credentials: HTTPBasicCredentials | None) -> bool:
 # OPTIONS requests (which never carry credentials) without hitting auth.
 @app.middleware("http")
 async def enforce_basic_auth(request: Request, call_next):
-    if not _AUTH_ENABLED or request.url.path == _WEBHOOK_PATH:
+    if not _AUTH_ENABLED or request.url.path in _NO_AUTH_PATHS:
         return await call_next(request)
 
     credentials = await _basic_auth(request)
@@ -201,6 +206,23 @@ class AccountOut(BaseModel):
 
 class JobCreateOut(BaseModel):
     id: int
+
+
+@app.get("/health")
+def health(db: Session = Depends(get_db)):
+    """
+    Liveness probe for Fly's http_check (see fly.toml) — no auth (see
+    _NO_AUTH_PATHS above), and always answers 200 even if the DB check
+    fails, since a DB outage should surface as a degraded `db` field, not
+    take the machine out of rotation/restart it.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+        db_status = "ok"
+    except Exception:
+        logger.exception("Health check DB probe failed")
+        db_status = "error"
+    return {"status": "ok", "db": db_status}
 
 
 @app.get("/api/jobs", response_model=list[JobOut])
