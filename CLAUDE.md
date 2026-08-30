@@ -34,17 +34,21 @@ transient errors and a dead-letter queue for permanent ones.
     `TransientError`; other 4xx -> `PermanentError`. Ignores
     `account_credentials` for now (see Phase 6 — natural next candidate to
     migrate to per-account credentials).
-  - `twitter.py` (Phase 6) — real X API v2 publisher (`POST /2/tweets` via
-    tweepy, OAuth 1.0a user context). App-level `consumer_key`/`secret`
-    always come from `X_API_KEY`/`X_API_SECRET`; the access token comes
-    from `account_credentials` (`access_token`/`access_token_secret`) when
-    the job has an account, otherwise falls back to
-    `X_ACCESS_TOKEN`/`X_ACCESS_TOKEN_SECRET`. Classifies tweepy
-    `HTTPException`s by status code the same way `youtube.py` does: 429/5xx
-    -> `TransientError`; 401/403/other 4xx -> `PermanentError`. Missing
-    app-level or access-token credentials -> `PermanentError` naming
-    exactly what's missing. Payload: `{"text": str}` for now; media comes
-    later via `app/storage.py`.
+  - `twitter.py` (Phase 6, extended Phase 17) — real X API v2 publisher
+    (`POST /2/tweets` via tweepy, OAuth 1.0a user context). App-level
+    `consumer_key`/`secret` always come from `X_API_KEY`/`X_API_SECRET`;
+    the access token comes from `account_credentials`
+    (`access_token`/`access_token_secret`) when the job has an account,
+    otherwise falls back to `X_ACCESS_TOKEN`/`X_ACCESS_TOKEN_SECRET`.
+    Classifies tweepy `HTTPException`s by status code the same way
+    `youtube.py` does: 429/5xx -> `TransientError`; 401/403/other 4xx ->
+    `PermanentError`. Missing app-level or access-token credentials ->
+    `PermanentError` naming exactly what's missing. Payload (Phase 17):
+    `{"text": str}` for a single tweet, optionally with `"media_paths"`
+    (local file paths); or `{"thread": [{"text", "media_paths"?}, ...]}`
+    for a thread — `"text"` and `"thread"` are mutually exclusive. Media
+    still comes from local disk, not yet from `app/storage.py`. See Phase
+    17 below for the media-upload and threading details.
   - `tiktok.py` (Phase 10) — real TikTok Content Posting API publisher,
     Sandbox mode: inbox-upload flow only (`POST
     /v2/post/publish/inbox/video/init/` then chunked `PUT` to the returned
@@ -708,6 +712,71 @@ unit-tested without Redis or a worker running.
     window doesn't alert again; a job whose last alert is older than the
     re-alert window alerts again; a `PUBLISHED` job is never considered
     stalled regardless of `updated_at` age.
+
+### Phase 17 (current)
+- **X (Twitter) media attachments + thread chaining** — the two biggest
+  spec gaps against `app/publishers/twitter.py`. Still no real X
+  credentials (client is creating the Developer Portal account), so
+  everything is unit-tested against fully mocked HTTP
+  (`tests/test_publisher_twitter_media.py`), same as the rest of the
+  publisher. The pure-publisher contract (no Celery/DB imports, typed
+  `TransientError`/`PermanentError`) and Phase 6's multi-account
+  credential resolution are unchanged — `_resolve_credentials` now returns
+  a plain dict (`api_key`/`api_secret`/`access_token`/`access_token_secret`)
+  instead of building a `tweepy.Client` directly, since Phase 17 needs to
+  build *two* tweepy objects from the same resolved credentials: `Client`
+  (v2, tweet creation) and `API`/`OAuth1UserHandler` (v1.1, media upload —
+  media upload lives on a different API version/host,
+  `upload.twitter.com`, than tweet creation).
+  - **Chunked media upload** (`_upload_media`/`_upload_one_media`): INIT ->
+    APPEND (4 MiB chunks) -> FINALIZE against
+    `upload.twitter.com/1.1/media/upload.json`, OAuth 1.0a signed. Built on
+    `tweepy.API`'s already-correct low-level methods
+    (`chunked_upload_init`/`_append`/`_finalize`/`get_media_upload_status`)
+    reused purely for their OAuth signing and endpoint plumbing —
+    deliberately *not* tweepy's own higher-level `chunked_upload()`/
+    `media_upload()` combinators, since this module needs to drive the
+    processing-status polling itself
+    (`processing_info.state`: pending/in_progress/succeeded/failed) so a
+    failed async video/gif processing step raises `PermanentError` with
+    the reason, the same way every other error here is reported. Static
+    images finalize synchronously (no `processing_info`), so no STATUS
+    polling happens for them. Errors classified via the same
+    `_classify_http_error` used for tweet creation (429/5xx ->
+    `TransientError`; 401/403/other 4xx -> `PermanentError`) — it's generic
+    over any tweepy `HTTPException`, v1.1 or v2.
+  - **Payload contract, backwards compatible**:
+    - `"text"` alone -> single tweet, unchanged.
+    - optional `"media_paths"`: list of local file paths, uploaded then
+      attached via `media_ids`. X caps (validated pre-flight, before any
+      upload starts): 4 images or 1 video per tweet, never mixed.
+    - optional `"thread"`: ordered list of `{"text", "media_paths"?}`
+      dicts, posted sequentially, each reply chained to the previous via
+      `in_reply_to_tweet_id`. **Every tweet's text (280-char guard, Phase
+      13) and media caps are validated up front, across the whole thread,
+      before tweet #1 is posted** (`_validate_thread`) — a validation error
+      we could have caught never leaves a half-posted thread.
+    - `"text"` and `"thread"` are mutually exclusive:
+      `_validate_top_level_payload` raises `PermanentError` if both or
+      neither are present.
+    - Result dict: `external_id` is the first tweet's id; threads
+      additionally return `"tweet_ids"` (every tweet's id, in order).
+  - **Partial-thread failure reporting**: if a mid-thread API call fails
+    (tweet creation or media upload), `_publish_thread` catches the typed
+    error per-tweet and re-raises the *same* error class with an augmented
+    message stating how many tweets were already posted and the last
+    successful tweet id — this is what ends up in `Job.error_message`/the
+    DLQ alert, so a partial thread is diagnosable instead of just "some
+    tweet failed."
+  - Covered by `tests/test_publisher_twitter_media.py`: media cap
+    validation (5 images, 2 videos, mixed image+video, missing file — all
+    rejected with zero HTTP calls made); chunked upload happy path for
+    video (INIT/APPEND x2/FINALIZE/STATUS poll to `succeeded`) and image
+    (no STATUS poll); failed processing -> `PermanentError` with the
+    reason and no tweet posted; thread happy path asserting the actual
+    `in_reply_to_tweet_id` chaining in each request body; an over-280-char
+    tweet anywhere in a thread posts nothing; mid-thread failure reports
+    the posted count and last tweet id.
 
 ## Monitoring dashboard (extra, not in the spec)
 

@@ -486,12 +486,14 @@ orquestación: verificación de firma/parseo/clasificación del webhook de
 TikTok (`app/webhooks/tiktok.py`), clasificación de errores de los
 publishers de TikTok y Twitter/X (`app/publishers/tiktok.py`,
 `app/publishers/twitter.py`, incluida una subida chunked completa contra
-HTTP mockeado), generación del par PKCE (`scripts/authorize_tiktok.py`), y
-la task `handle_tiktok_webhook_event` (`app/tasks.py`) contra una base
-SQLite descartable. No hace falta Redis, un worker de Celery corriendo, ni
-la `DATABASE_URL` real de Neon: todo el HTTP está mockeado (`responses` /
-monkeypatch) y `tests/conftest.py` apunta `DATABASE_URL` a un SQLite
-temporal antes de importar cualquier módulo de `app/`.
+HTTP mockeado), la subida chunked de media y los threads de X
+(`tests/test_publisher_twitter_media.py`, Fase 17), generación del par PKCE
+(`scripts/authorize_tiktok.py`), y la task `handle_tiktok_webhook_event`
+(`app/tasks.py`) contra una base SQLite descartable. No hace falta Redis, un
+worker de Celery corriendo, ni la `DATABASE_URL` real de Neon: todo el HTTP
+está mockeado (`responses` / monkeypatch) y `tests/conftest.py` apunta
+`DATABASE_URL` a un SQLite temporal antes de importar cualquier módulo de
+`app/`.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -500,7 +502,7 @@ pytest
 
 ## Guardas de payload de X (Fase 13)
 
-`app/publishers/twitter.py::_validate_payload` rechaza en pre-flight (con
+`app/publishers/twitter.py::_validate_text` rechaza en pre-flight (con
 `PermanentError`, sin llamar a la API) cualquier `text` de más de 280
 caracteres, contando con `len()` simple. Esto es una aproximación: X cuenta
 cada URL como 23 caracteres fijos (su wrapper `t.co`), sin importar la
@@ -535,11 +537,54 @@ a una tabla `jobs` ya existente. Correr una vez, a mano, contra Neon:
 ALTER TABLE jobs ADD COLUMN last_stall_alert_at TIMESTAMPTZ;
 ```
 
+## Media y threads de X (Fase 17)
+
+`app/publishers/twitter.py` gana dos capacidades que eran los huecos más
+grandes contra el spec, manteniendo el contrato de publisher puro (nada de
+Celery/DB, solo `TransientError`/`PermanentError`) y la resolución de
+credenciales multi-cuenta exacta de la Fase 6. Seguimos sin credenciales
+reales de X (el cliente todavía está creando la cuenta de developer), así
+que todo esto está probado con HTTP completamente mockeado
+(`tests/test_publisher_twitter_media.py`).
+
+- **Adjuntar media (`payload["media_paths"]`)**: lista de rutas de archivo
+  locales. Cada una se sube a X vía el endpoint v1.1
+  (`upload.twitter.com/1.1/media/upload.json`, INIT -> APPEND en chunks de
+  4 MiB -> FINALIZE), firmado OAuth 1.0a igual que el tweet en sí — para
+  esto se reutiliza `tweepy.API`/`OAuth1UserHandler` (mismas credenciales de
+  acceso por cuenta que ya resuelve `_resolve_credentials`), pero el módulo
+  maneja el chunking, la categoría de media y el polling de estado a mano,
+  en vez de usar el combinador `chunked_upload()` de tweepy — así un fallo
+  de procesamiento asíncrono (video/gif) se puede clasificar y reportar
+  igual que cualquier otro error de este módulo. Videos/gifs quedan en
+  `processing_info.state` = pending/in_progress hasta terminar de procesarse
+  server-side; se hace polling a `GET .../media/upload.json?command=STATUS`
+  hasta `succeeded` o `failed` (este último -> `PermanentError` con el
+  motivo). Imágenes finalizan sync, sin `processing_info` — no hay polling.
+  Límite de X validado en pre-flight, antes de subir nada: 4 imágenes o 1
+  video por tweet, nunca mezclados.
+- **Threads (`payload["thread"]`)**: lista ordenada de `{"text", opcional
+  "media_paths"}`, publicados secuencialmente, cada uno encadenado al
+  anterior vía `in_reply_to_tweet_id`. **Se valida todo el thread antes de
+  publicar el tweet #1** — el límite de 280 caracteres de cada texto (Fase
+  13) y los límites de media de cada tweet — para nunca dejar un thread a
+  medio publicar por un error que se podía detectar de antemano. Si falla
+  una llamada a mitad del thread, el error (`Transient`/`PermanentError`)
+  se re-lanza con cuántos tweets se llegaron a publicar y el id del último
+  tweet exitoso (info para `error_message`/la alerta de DLQ). `"thread"` y
+  `"text"` a nivel raíz del payload son mutuamente excluyentes:
+  `PermanentError` si vienen los dos o ninguno.
+- **Resultado**: `external_id` es el id del primer tweet; los threads además
+  devuelven `"tweet_ids"` con el id de cada tweet publicado, en orden.
+- Los archivos de `media_paths` son rutas locales — todavía no pasan por
+  `app/storage.py` (R2), ver la nota de "Qué falta" más abajo.
+
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
 - Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
 - Deploy real en Fly.io (el `fly.toml` y el Dockerfile están listos, pero nadie corrió `fly deploy` — falta la cuenta del cliente).
-- Conectar `app/storage.py` (R2) a los publishers cuando exista un flujo real de media.
+- Conectar `app/storage.py` (R2) a los publishers cuando exista un flujo real de media (incluido X: hoy `media_paths` son rutas locales).
 - Timezone real por cuenta/plataforma para el scheduling (hoy es naive local time, ver `app/config.py`).
 - TikTok Direct Post (`video.publish`, pendiente de la revisión de la app).
 - Registrar la callback URL real del webhook de TikTok en el Developer Portal (bloqueado por el mismo motivo que el resto del setup de Sandbox — ver Fase 10b) y confirmar los nombres de evento reales contra un payload real la primera vez que llegue uno.
+- Credenciales reales de X (Developer Portal): la Fase 17 (media + threads) sigue sin poder probarse contra la API real hasta que el cliente las provea.
