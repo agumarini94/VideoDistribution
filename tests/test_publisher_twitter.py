@@ -46,6 +46,29 @@ class TestMissingCredentials:
             twitter_publisher.publish("twitter", {}, ACCOUNT_CREDENTIALS)
 
 
+class TestCharacterLimit:
+    @responses.activate
+    def test_exactly_280_chars_passes_validation(self):
+        responses.add(
+            responses.POST,
+            _TWEETS_URL,
+            json={"data": {"id": "1", "text": "x" * 280}},
+            status=201,
+        )
+
+        result = twitter_publisher.publish("twitter", {"text": "x" * 280}, ACCOUNT_CREDENTIALS)
+
+        assert result == {"platform": "twitter", "external_id": "1"}
+
+    @responses.activate
+    def test_281_chars_raises_permanent_error_without_sending(self):
+        # No responses.add(...): if the code somehow reached an HTTP call
+        # despite the validation error, this mock would raise a connection
+        # error instead of letting a real request out.
+        with pytest.raises(PermanentError, match="281"):
+            twitter_publisher.publish("twitter", {"text": "x" * 281}, ACCOUNT_CREDENTIALS)
+
+
 class TestHttpErrorClassification:
     @responses.activate
     def test_http_429_is_transient(self):

@@ -142,6 +142,13 @@ class Job(Base):
     # back to this column to find the Job it's about.
     external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Timestamp of the last "this job looks stalled" alert sent by
+    # detect_stalled_jobs (Phase 14, app/tasks.py). Null if never alerted.
+    # Read back before re-alerting so a job stuck for hours doesn't trigger
+    # a fresh Discord/Slack message on every 10-minute Beat run — only once
+    # settings.stall_realert_minutes has passed since this value.
+    last_stall_alert_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

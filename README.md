@@ -103,6 +103,8 @@ Ver `app/config.py` / `.env.example`:
 | `RETRY_BACKOFF_BASE` | `2` | Base del backoff exponencial (segundos) |
 | `DLQ_QUEUE_NAME` | `dlq` | Nombre de la cola de dead-letter |
 | `ALERT_WEBHOOK_URL` | *(vacío, opcional)* | Webhook de Discord o Slack para alertas de dead-letter; si está vacío, no se envían alertas |
+| `STALL_THRESHOLD_MINUTES` | `30` | Minutos que un job puede estar en `queued`/`processing` sin actualizarse antes de considerarse estancado (Fase 14) |
+| `STALL_REALERT_MINUTES` | `120` | Minutos de espera antes de volver a alertar sobre un job que sigue estancado |
 | `R2_ENDPOINT_URL` | *(vacío, opcional)* | Endpoint S3-compatible del bucket de Cloudflare R2 |
 | `R2_ACCESS_KEY_ID` | *(vacío, opcional)* | Access key de un API token de R2 |
 | `R2_SECRET_ACCESS_KEY` | *(vacío, opcional)* | Secret key del mismo API token de R2 |
@@ -494,6 +496,43 @@ temporal antes de importar cualquier módulo de `app/`.
 ```bash
 pip install -r requirements-dev.txt
 pytest
+```
+
+## Guardas de payload de X (Fase 13)
+
+`app/publishers/twitter.py::_validate_payload` rechaza en pre-flight (con
+`PermanentError`, sin llamar a la API) cualquier `text` de más de 280
+caracteres, contando con `len()` simple. Esto es una aproximación: X cuenta
+cada URL como 23 caracteres fijos (su wrapper `t.co`), sin importar la
+longitud real — un tweet con URLs muy largas puede pasar esta validación y
+igual ser rechazado por la API real. Aceptable por ahora; ver el comentario
+en el código.
+
+## Detección de jobs estancados (Fase 14)
+
+Nueva task de Celery Beat, `detect_stalled_jobs` (`app/tasks.py`), corre
+cada 10 minutos (`beat_schedule` en `app/celery_app.py`) — no hace falta un
+proceso aparte, comparte el mismo `celery -A app.celery_app beat` que
+`dispatch_due_jobs` y `refresh_expiring_tokens`.
+
+Busca jobs en estado `queued` o `processing` cuyo `updated_at` no cambió en
+más de `STALL_THRESHOLD_MINUTES` (default 30) — típicamente un worker caído,
+un Beat que dejó de correr, o una task que quedó colgada — y manda **una
+sola** alerta (mismo `ALERT_WEBHOOK_URL` que la dead-letter queue) listando
+todos los jobs encontrados, en vez de una alerta por job.
+
+Para no floodear el canal de alertas si el estancamiento sigue varias
+corridas seguidas, cada `Job` tiene una columna `last_stall_alert_at`
+(nullable) que se actualiza solo cuando se manda una alerta por ese job —
+no se vuelve a alertar sobre el mismo job hasta que pasen
+`STALL_REALERT_MINUTES` (default 120) desde la última alerta.
+
+**Paso manual de esquema** (mismo patrón que `account_id` en la Fase 6 y
+`external_id` en la Fase 10b): `init_db()`/`create_all` no agrega columnas
+a una tabla `jobs` ya existente. Correr una vez, a mano, contra Neon:
+
+```sql
+ALTER TABLE jobs ADD COLUMN last_stall_alert_at TIMESTAMPTZ;
 ```
 
 ## Qué falta (a propósito, fuera de alcance de esta etapa)

@@ -54,5 +54,11 @@ celery_app.conf.update(
             "task": "app.tasks.refresh_expiring_tokens",
             "schedule": 1800.0,
         },
+        # Phase 14: alerts if jobs are stuck in queued/processing longer
+        # than STALL_THRESHOLD_MINUTES — see app/tasks.py::detect_stalled_jobs.
+        "detect-stalled-jobs-every-10m": {
+            "task": "app.tasks.detect_stalled_jobs",
+            "schedule": 600.0,
+        },
     },
 )

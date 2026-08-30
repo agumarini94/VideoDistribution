@@ -16,7 +16,7 @@ tomorrow (e.g. 5 attempts instead of 3), only this file needs to change.
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import update
 
@@ -68,6 +68,18 @@ _TOKEN_REFRESH_WINDOW_SECONDS = 45 * 60
 
 def _get_publisher(platform: str):
     return _PUBLISHERS_BY_PLATFORM.get(platform, fake_publisher.publish)
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    """
+    Normalizes a datetime read back from the DB to timezone-aware UTC.
+    Values are always written as aware UTC (see models.py::_utcnow), but
+    Postgres round-trips them as aware while SQLite (used by the test
+    suite) round-trips them as naive — comparing/subtracting an aware and a
+    naive datetime raises. Same normalization pattern as
+    app/publishers/youtube.py::token_expires_within.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _resolve_account_credentials(db, job: Job) -> dict | None:
@@ -376,5 +388,55 @@ def handle_tiktok_webhook_event(webhook_event_id: int) -> None:
                 "TikTok webhook event #%s: unrecognized event type %r for job #%s, no status change.",
                 event.id, event.event_type, job.id,
             )
+    finally:
+        db.close()
+
+
+@celery_app.task
+def detect_stalled_jobs() -> None:
+    """
+    Celery Beat task (Phase 14, spec section 5 "queue stalls" alerting),
+    runs every 10 minutes (see beat_schedule in app/celery_app.py). Finds
+    jobs stuck in QUEUED or PROCESSING for longer than
+    settings.stall_threshold_minutes and sends ONE alert listing all of
+    them — a single Beat/worker outage can stall many jobs at once, and one
+    combined alert is more useful (and less spammy) than one per job.
+
+    Avoids re-alerting on every run for a job that's still stuck:
+    Job.last_stall_alert_at (nullable, see app/models.py) is only updated
+    when an alert actually fires for that job, and a job alerted within
+    settings.stall_realert_minutes is skipped until that window passes.
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        stall_cutoff = now - timedelta(minutes=settings.stall_threshold_minutes)
+        realert_cutoff = now - timedelta(minutes=settings.stall_realert_minutes)
+
+        stalled = (
+            db.query(Job)
+            .filter(Job.status.in_((JobStatus.QUEUED, JobStatus.PROCESSING)), Job.updated_at <= stall_cutoff)
+            .all()
+        )
+        to_alert = [
+            job
+            for job in stalled
+            if job.last_stall_alert_at is None or _ensure_utc(job.last_stall_alert_at) <= realert_cutoff
+        ]
+        if not to_alert:
+            return
+
+        lines = "\n".join(
+            f"- Job #{job.id} ({job.platform}, {job.status.value}), stuck since {_ensure_utc(job.updated_at).isoformat()}"
+            for job in to_alert
+        )
+        send_alert(
+            f"{len(to_alert)} job(s) appear stalled (no progress for over "
+            f"{settings.stall_threshold_minutes} min):\n{lines}"
+        )
+
+        for job in to_alert:
+            job.last_stall_alert_at = now
+        db.commit()
     finally:
         db.close()

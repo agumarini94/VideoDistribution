@@ -651,6 +651,64 @@ unit-tested without Redis or a worker running.
   time-slot scheduling, and the retry/backoff/DLQ logic in
   `publish_job` — natural next candidates when the suite grows.
 
+### Phase 13 (current)
+- **X (Twitter) 280-character pre-flight guard** — spec-audit gap fix, no
+  behavior change beyond this one validation.
+  `app/publishers/twitter.py::_validate_payload` now rejects any `text`
+  over 280 characters with a `PermanentError` naming the actual length,
+  before any HTTP call is made. Counts with plain `len()`; a comment in
+  the code notes this is an approximation, since X counts every URL as a
+  fixed 23 characters (its `t.co` wrapper) regardless of its real length —
+  a tweet whose text is mostly a very long URL can pass this check and
+  still be rejected upstream. Accepted as a known limitation rather than
+  reimplementing X's URL-counting rules. Covered by
+  `tests/test_publisher_twitter.py::TestCharacterLimit` (280 exactly
+  passes and reaches the mocked API; 281 raises `PermanentError` without
+  any HTTP call being made).
+
+### Phase 14 (current)
+- **Queue stall detection** (spec section 5, "queue stalls" alerting) —
+  `detect_stalled_jobs` (`app/tasks.py`), a Celery Beat task scheduled
+  every 10 minutes (`beat_schedule` in `app/celery_app.py`, same pattern
+  as `dispatch_due_jobs`/`refresh_expiring_tokens` — no separate process
+  needed). Queries jobs in `QUEUED` or `PROCESSING` whose `updated_at` is
+  older than `settings.stall_threshold_minutes` (env `STALL_THRESHOLD_MINUTES`,
+  default 30) and sends **one** `send_alert` call listing all of them
+  (id, platform, status, how long they've been stuck) — a single
+  Beat/worker outage can stall many jobs at once, and one combined alert
+  beats flooding the channel with one per job.
+  - **Anti-spam re-alerting**: `Job.last_stall_alert_at` (new nullable
+    column, `app/models.py`) is set only when an alert actually fires for
+    that job; a job whose `last_stall_alert_at` is within
+    `settings.stall_realert_minutes` (env `STALL_REALERT_MINUTES`, default
+    120) of now is skipped, so a job stuck for hours doesn't generate a
+    fresh alert on every 10-minute run — only once the re-alert window has
+    passed.
+  - **Timezone normalization**: `app/tasks.py::_ensure_utc` treats a
+    naive datetime read back from the DB as UTC before comparing/
+    subtracting against `datetime.now(timezone.utc)` — needed because
+    Postgres round-trips `DateTime(timezone=True)` columns as aware but
+    SQLite (the test suite's DB) round-trips them as naive. Same pattern
+    already used by `app/publishers/youtube.py::token_expires_within`.
+    The SQL-side cutoff filter (`Job.updated_at <= stall_cutoff`) doesn't
+    need this — comparisons executed by the DB engine aren't affected by
+    Python-side tzinfo, only the Python-side re-alert check and the
+    alert's stuck-since timestamps are.
+  - **Manual schema step**, same pattern as `account_id` (Phase 6) and
+    `external_id` (Phase 10b): `init_db()`'s `create_all` only creates
+    tables that don't exist yet, so on an existing Neon database this
+    does **not** add `last_stall_alert_at` to the existing `jobs` table.
+    Run once, by hand, against Neon:
+    ```sql
+    ALTER TABLE jobs ADD COLUMN last_stall_alert_at TIMESTAMPTZ;
+    ```
+  - Covered by `tests/test_tasks_detect_stalled_jobs.py`: a stalled
+    `QUEUED` job triggers one alert and sets `last_stall_alert_at`; a
+    fresh job doesn't alert; a job already alerted within the re-alert
+    window doesn't alert again; a job whose last alert is older than the
+    re-alert window alerts again; a `PUBLISHED` job is never considered
+    stalled regardless of `updated_at` age.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

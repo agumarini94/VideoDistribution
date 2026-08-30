@@ -52,6 +52,16 @@ class Settings:
     # whitespace in .env (e.g. "KEY= value").
     alert_webhook_url: str = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
+    # How many minutes a job can sit in QUEUED or PROCESSING with no update
+    # before app/tasks.py::detect_stalled_jobs (Phase 14) considers it
+    # stalled and alerts.
+    stall_threshold_minutes: int = int(os.getenv("STALL_THRESHOLD_MINUTES", "30"))
+
+    # How many minutes must pass since a job's last stall alert before
+    # detect_stalled_jobs alerts on it again — avoids re-alerting on every
+    # Beat run (every 10 min) for a job that's still stuck.
+    stall_realert_minutes: int = int(os.getenv("STALL_REALERT_MINUTES", "120"))
+
     # Cloudflare R2 (S3-compatible) credentials for app/storage.py. All
     # optional at this layer: unlike DATABASE_URL, a missing R2 config
     # shouldn't stop the whole app from starting, since storage isn't wired

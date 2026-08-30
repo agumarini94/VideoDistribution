@@ -32,6 +32,8 @@ import tweepy
 
 from app.exceptions import PermanentError, PublishError, TransientError
 
+_MAX_TWEET_LENGTH = 280
+
 
 def publish(platform: str, payload: dict, account_credentials: dict | None = None) -> dict:
     """
@@ -58,8 +60,20 @@ def publish(platform: str, payload: dict, account_credentials: dict | None = Non
 
 
 def _validate_payload(payload: dict) -> None:
-    if not payload.get("text"):
+    text = payload.get("text")
+    if not text:
         raise PermanentError("Missing required payload field: text")
+
+    # Simple len() count. X actually counts each URL as a fixed 23 chars
+    # (via its t.co wrapper) regardless of the URL's real length, so a
+    # tweet whose text is mostly a very long URL could pass this check and
+    # still get rejected upstream as too long — acceptable for now, this is
+    # a cheap pre-flight guard, not a reimplementation of X's counting rules.
+    length = len(text)
+    if length > _MAX_TWEET_LENGTH:
+        raise PermanentError(
+            f"Tweet text exceeds X's {_MAX_TWEET_LENGTH} character limit ({length} characters)"
+        )
 
 
 def _build_client(account_credentials: dict | None) -> tweepy.Client:
