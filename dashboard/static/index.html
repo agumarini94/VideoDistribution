@@ -376,6 +376,29 @@
         <input type="text" id="job-title" placeholder="Auto-generated if left blank">
       </div>
 
+      <div id="job-youtube-fields" style="display:none;">
+        <div class="field">
+          <label for="job-privacy">Privacy</label>
+          <select id="job-privacy">
+            <option value="private">Private</option>
+            <option value="unlisted">Unlisted</option>
+            <option value="public">Public</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="job-shorts">
+            <input type="checkbox" id="job-shorts" style="width:auto;">
+            Shorts (must be ≤60s, vertical)
+          </label>
+        </div>
+
+        <div class="field">
+          <label for="job-playlist-id">Playlist ID (optional)</label>
+          <input type="text" id="job-playlist-id" placeholder="e.g. PLxxxxxxxxxxxxxxxx">
+        </div>
+      </div>
+
       <button type="submit" class="btn btn-green" id="job-submit">Create job</button>
     </form>
 
@@ -576,7 +599,10 @@ function showTab(name) {
   tabButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === name));
   Object.entries(tabPanels).forEach(([key, el]) => el.classList.toggle("active", key === name));
   if (name === "accounts") loadAccountsTab();
-  if (name === "newjob") loadAccountOptions(jobPlatformSelect.value);
+  if (name === "newjob") {
+    loadAccountOptions(jobPlatformSelect.value);
+    toggleYoutubeFields(jobPlatformSelect.value);
+  }
 }
 
 tabButtons.forEach(btn => btn.addEventListener("click", () => showTab(btn.dataset.tab)));
@@ -617,6 +643,14 @@ const jobTitleInput = document.getElementById("job-title");
 const jobForm = document.getElementById("new-job-form");
 const jobResult = document.getElementById("job-result");
 const jobSubmitBtn = document.getElementById("job-submit");
+const jobYoutubeFields = document.getElementById("job-youtube-fields");
+const jobPrivacySelect = document.getElementById("job-privacy");
+const jobShortsCheckbox = document.getElementById("job-shorts");
+const jobPlaylistIdInput = document.getElementById("job-playlist-id");
+
+function toggleYoutubeFields(platform) {
+  jobYoutubeFields.style.display = platform === "youtube" ? "block" : "none";
+}
 
 function resultBox(ok, msg) {
   return `<div class="result-box ${ok ? "ok" : "err"}">${escapeHtml(msg)}</div>`;
@@ -648,7 +682,10 @@ async function loadAccountOptions(platform) {
   }
 }
 
-jobPlatformSelect.addEventListener("change", () => loadAccountOptions(jobPlatformSelect.value));
+jobPlatformSelect.addEventListener("change", () => {
+  loadAccountOptions(jobPlatformSelect.value);
+  toggleYoutubeFields(jobPlatformSelect.value);
+});
 
 jobForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -675,6 +712,11 @@ jobForm.addEventListener("submit", async (e) => {
   formData.append("file", file);
   if (jobAccountSelect.value) formData.append("account_id", jobAccountSelect.value);
   if (jobTitleInput.value.trim()) formData.append("title", jobTitleInput.value.trim());
+  if (platform === "youtube") {
+    formData.append("privacy", jobPrivacySelect.value);
+    if (jobShortsCheckbox.checked) formData.append("shorts", "true");
+    if (jobPlaylistIdInput.value.trim()) formData.append("playlist_id", jobPlaylistIdInput.value.trim());
+  }
 
   jobSubmitBtn.disabled = true;
   jobSubmitBtn.textContent = "Creating…";
@@ -683,6 +725,7 @@ jobForm.addEventListener("submit", async (e) => {
     jobResult.innerHTML = resultBox(true, `Job #${created.id} created and dispatched.`);
     jobForm.reset();
     loadAccountOptions("");
+    toggleYoutubeFields("");
     showTab("monitor");
     refresh();
   } catch (err) {

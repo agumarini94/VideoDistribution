@@ -40,9 +40,22 @@ refresh_stored_credentials() below are the pure helpers it uses — this
 module still owns all Google OAuth knowledge (credential shape, refresh
 mechanics, how to tell a permanently-invalid refresh token from a transient
 failure), the task just decides what to do with the outcome.
+
+Shorts + playlists (Phase 15): two optional payload keys, backwards
+compatible (both absent -> unchanged behavior).
+  - "shorts" (bool, default False): when true, the video is probed with
+    ffprobe (app/media_probe.py) *before* upload; a duration over 60s or a
+    non-vertical aspect ratio raises PermanentError naming the actual
+    value, so nothing is uploaded that Shorts would reject anyway.
+  - "playlist_id": after a successful upload, the video is added to this
+    playlist via playlistItems.insert. The video is already live by that
+    point, so a playlist failure must never fail the job or trigger a
+    retry that would re-upload it — it's caught, logged, and surfaced as
+    result["playlist_error"] instead of raised.
 """
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,11 +66,22 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
+from app import media_probe
 from app.exceptions import PermanentError, PublishError, TransientError
 
-# Scope needed to upload videos. Shared with scripts/authorize_youtube.py so
-# the token generated there always matches what this publisher expects.
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+logger = logging.getLogger(__name__)
+
+# "youtube.upload" is enough to insert videos; playlistItems.insert (Phase
+# 15) needs the broader "youtube" scope. Existing tokens issued before
+# Phase 15 only have "youtube.upload" and must be re-authorized (re-run
+# scripts/authorize_youtube.py [--account NAME]) before playlist_id can be
+# used against them — playlistItems.insert will otherwise fail with an
+# insufficient-scope error, surfaced as result["playlist_error"] (see
+# module docstring), not a hard job failure.
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube",
+]
 
 # Resolved from this file's location (not the current working directory) so
 # the publisher works the same whether it's invoked from a script or a
@@ -91,6 +115,9 @@ def publish(platform: str, payload: dict, account_credentials: dict | None = Non
         if not video_path.is_file():
             raise PermanentError(f"Video file not found: {video_path}")
 
+        if payload.get("shorts", False):
+            _validate_shorts(video_path)
+
         body = _build_request_body(payload)
         media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True)
 
@@ -100,6 +127,11 @@ def publish(platform: str, payload: dict, account_credentials: dict | None = Non
         result = {"platform": "youtube", "external_id": response["id"]}
         if refreshed:
             result["refreshed_credentials"] = json.loads(creds.to_json())
+
+        playlist_id = payload.get("playlist_id")
+        if playlist_id:
+            _assign_to_playlist(youtube, playlist_id, response["id"], result)
+
         return result
     except (TransientError, PermanentError):
         raise
@@ -126,6 +158,58 @@ def _build_request_body(payload: dict) -> dict:
             "privacyStatus": payload.get("privacy", "private"),
         },
     }
+
+
+# YouTube Shorts eligibility: 60 seconds or less, vertical (taller than wide).
+_SHORTS_MAX_DURATION_SECONDS = 60
+
+
+def _validate_shorts(video_path: Path) -> None:
+    """
+    Probes the file with ffprobe (app/media_probe.py) before upload and
+    rejects it with a PermanentError naming the actual value if it wouldn't
+    qualify as a Short — so nothing gets uploaded that YouTube would reject
+    (or silently not treat as a Short) anyway.
+    """
+    info = media_probe.probe(str(video_path))
+    duration = info["duration_seconds"]
+    width = info["width"]
+    height = info["height"]
+
+    if duration > _SHORTS_MAX_DURATION_SECONDS:
+        raise PermanentError(
+            f"Video is {duration:.1f}s long, but Shorts require "
+            f"{_SHORTS_MAX_DURATION_SECONDS}s or less: {video_path}"
+        )
+    if height <= width:
+        raise PermanentError(
+            f"Video is {width}x{height} (not vertical), but Shorts require "
+            f"a vertical aspect ratio (height > width): {video_path}"
+        )
+
+
+def _assign_to_playlist(youtube, playlist_id: str, video_id: str, result: dict) -> None:
+    """
+    Best-effort playlist assignment after a successful upload. The video is
+    already live by this point, so any error here (invalid playlist id,
+    insufficient scope, transient API failure) must never fail the job or
+    trigger a retry that would re-upload the video — it's caught, logged,
+    and surfaced as result["playlist_error"] instead of raised. The result
+    still reports the video's external_id as a normal success.
+    """
+    try:
+        youtube.playlistItems().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "playlistId": playlist_id,
+                    "resourceId": {"kind": "youtube#video", "videoId": video_id},
+                }
+            },
+        ).execute()
+    except Exception as exc:
+        logger.warning("Failed to add video %s to playlist %s: %s", video_id, playlist_id, exc)
+        result["playlist_error"] = str(exc)
 
 
 def _load_credentials(account_credentials: dict | None) -> tuple[Credentials, bool]:

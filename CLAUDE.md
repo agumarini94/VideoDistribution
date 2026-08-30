@@ -713,6 +713,72 @@ unit-tested without Redis or a worker running.
     re-alert window alerts again; a `PUBLISHED` job is never considered
     stalled regardless of `updated_at` age.
 
+### Phase 15 (current)
+- **`app/media_probe.py`** (new) — `probe(path) -> {"duration_seconds":
+  float, "width": int, "height": int}`, a pure subprocess wrapper around
+  `ffprobe` (`ffprobe -v error -select_streams v:0 -show_entries
+  stream=width,height:format=duration -of json`). Raises `PermanentError`
+  (never `TransientError`, matching the publisher exceptions' semantics —
+  see `app/exceptions.py`) if `ffprobe` isn't on `PATH`, the process fails
+  to start or times out (30s), exits non-zero, or its output can't be
+  parsed (e.g. a file with no video stream). Written to be reused by any
+  publisher that needs a video's shape before uploading — `youtube.py` is
+  the first caller (below); `tiktok.py` is a natural next candidate if it
+  ever needs its own duration/aspect-ratio constraints.
+- **YouTube Shorts validation** (`app/publishers/youtube.py`) — new
+  optional payload key `"shorts"` (bool, default `False`), backwards
+  compatible. When `True`, the video is probed with `media_probe.probe()`
+  *before* upload (no HTTP call made if validation fails): duration over
+  60s, or a non-vertical aspect ratio (`height <= width`), raises
+  `PermanentError` naming the actual duration/dimensions. When absent or
+  `False`, no probing happens at all — behavior is unchanged from before
+  this phase.
+- **YouTube playlist assignment** (`app/publishers/youtube.py`) — new
+  optional payload key `"playlist_id"`. After a successful
+  `videos.insert`, `_assign_to_playlist` calls `playlistItems.insert` to
+  add the video. **Deliberate failure semantics**: the video is already
+  live on YouTube by that point, so a playlist failure must never fail the
+  job or trigger a retry — `publish_job`'s retry path would re-upload the
+  video, which is worse than just not being in a playlist. The playlist
+  call is wrapped in its own `try/except Exception` *inside* `publish()`,
+  so it can never reach the outer `except HttpError`/`except Exception`
+  blocks that classify and raise; instead it's logged as a warning and
+  surfaced as `result["playlist_error"]`, while `result["external_id"]`
+  still reports the successful upload.
+- **Scope change**: `playlistItems.insert` needs the broader
+  `https://www.googleapis.com/auth/youtube` scope — `youtube.upload` alone
+  (the only scope requested through Phase 14) isn't enough. `SCOPES` in
+  `youtube.py` now requests both, shared as always with
+  `scripts/authorize_youtube.py`. **Any `Account` (or single-account
+  `token.json`) authorized before this phase only has `youtube.upload`
+  and must be re-authorized** (`python -m scripts.authorize_youtube
+  [--account NAME]`) before `playlist_id` will work against it — until
+  then, `playlist_id` jobs for that account/token will upload
+  successfully but always land in `result["playlist_error"]` with an
+  insufficient-scope error.
+- **Dashboard NEW JOB form** (`dashboard/`, not `app/`) — when
+  `platform=youtube`, three new optional fields: a privacy select
+  (private/unlisted/public, default private), a "Shorts" checkbox, and a
+  playlist ID text input. `dashboard/api.py::create_job` gained matching
+  `Form(...)` parameters (`privacy`, `shorts`, `playlist_id`) and passes
+  them straight into the job payload for youtube jobs — no validation of
+  its own beyond what the upload flow already does; `youtube.py` owns all
+  the actual Shorts/playlist validation, same separation as every other
+  publisher-specific payload field.
+- Covered by `tests/test_media_probe.py` (ffprobe missing, non-zero exit,
+  malformed JSON, no video stream, subprocess timeout — `subprocess.run`
+  and `shutil.which` mocked, no real `ffprobe` invoked) and
+  `tests/test_publisher_youtube.py` (61s video rejected with no upload
+  call made; horizontal video rejected; valid 30s vertical video uploads;
+  `shorts` absent skips probing entirely — asserted by making `probe()`
+  raise if called; playlist success adds the item; playlist failure still
+  returns `external_id` with `playlist_error` set and doesn't raise). The
+  YouTube API itself is mocked by replacing `build()` with an in-memory
+  fake service object (`googleapiclient` talks `httplib2`, not `requests`,
+  so `responses` — used for tiktok.py/twitter.py — doesn't apply here);
+  credential loading is mocked by replacing `_load_credentials` directly,
+  same spirit as the rest of the suite avoiding real OAuth/network calls.
+
 ### Phase 17 (current)
 - **X (Twitter) media attachments + thread chaining** — the two biggest
   spec gaps against `app/publishers/twitter.py`. Still no real X

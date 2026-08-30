@@ -286,6 +286,9 @@ async def create_job(
     file: UploadFile = File(...),
     account_id: int | None = Form(default=None),
     title: str | None = Form(default=None),
+    privacy: str | None = Form(default=None),
+    shorts: bool = Form(default=False),
+    playlist_id: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     """
@@ -294,6 +297,12 @@ async def create_job(
     enqueue_youtube_test.py do, then dispatches exactly like they do
     (publish_job.delay) — this route is a thin HTTP front end over that same
     pattern, not a new way of constructing jobs.
+
+    privacy/shorts/playlist_id (Phase 15) are youtube-only and passed
+    straight through into the payload — app/publishers/youtube.py owns all
+    the actual validation (Shorts duration/aspect-ratio, playlist
+    assignment), this route does no validation of its own beyond what the
+    generic upload flow already does.
     """
     if platform not in _SUPPORTED_UPLOAD_PLATFORMS:
         raise HTTPException(
@@ -334,7 +343,15 @@ async def create_job(
     if platform == "tiktok":
         payload = {"video_path": str(dest_path), "title": job_title}
     else:
-        payload = {"video_path": str(dest_path), "title": job_title, "privacy": "private"}
+        payload = {
+            "video_path": str(dest_path),
+            "title": job_title,
+            "privacy": privacy or "private",
+        }
+        if shorts:
+            payload["shorts"] = True
+        if playlist_id and playlist_id.strip():
+            payload["playlist_id"] = playlist_id.strip()
 
     job = Job(
         platform=platform,

@@ -487,7 +487,9 @@ TikTok (`app/webhooks/tiktok.py`), clasificación de errores de los
 publishers de TikTok y Twitter/X (`app/publishers/tiktok.py`,
 `app/publishers/twitter.py`, incluida una subida chunked completa contra
 HTTP mockeado), la subida chunked de media y los threads de X
-(`tests/test_publisher_twitter_media.py`, Fase 17), generación del par PKCE
+(`tests/test_publisher_twitter_media.py`, Fase 17), la validación de
+Shorts y la asignación a playlist de YouTube (`tests/test_publisher_youtube.py`,
+`tests/test_media_probe.py`, Fase 15), generación del par PKCE
 (`scripts/authorize_tiktok.py`), y la task `handle_tiktok_webhook_event`
 (`app/tasks.py`) contra una base SQLite descartable. No hace falta Redis, un
 worker de Celery corriendo, ni la `DATABASE_URL` real de Neon: todo el HTTP
@@ -536,6 +538,54 @@ a una tabla `jobs` ya existente. Correr una vez, a mano, contra Neon:
 ```sql
 ALTER TABLE jobs ADD COLUMN last_stall_alert_at TIMESTAMPTZ;
 ```
+
+## Shorts y playlists de YouTube (Fase 15)
+
+`app/publishers/youtube.py` gana dos capacidades opcionales por payload,
+retrocompatibles (si no se mandan, el comportamiento es exactamente el de
+antes):
+
+- **`"shorts": true`** — antes de subir el video, se lo probea con
+  `ffprobe` (nuevo módulo `app/media_probe.py`, subprocess puro, pensado
+  para que `tiktok.py` lo reutilice el día que necesite sus propias
+  validaciones de duración/aspecto). Si dura más de 60s o no es vertical
+  (`height <= width`), `PermanentError` nombrando la duración/dimensión
+  real — **sin subir nada**. Si `"shorts"` no viene o es `false`, no se
+  probea el archivo en absoluto.
+- **`"playlist_id": "PL..."`** — después de un `videos.insert` exitoso, se
+  llama a `playlistItems.insert` para sumar el video a esa playlist.
+  **Importante**: en ese punto el video ya está subido a YouTube, así que
+  un error en la playlist (id inválido, scope insuficiente, error
+  transitorio de la API) **nunca** hace fallar el job ni dispara un
+  reintento — eso re-subiría el video. El error se loguea como warning y
+  se devuelve en `result["playlist_error"]`, y el resultado sigue
+  reportando `external_id` como éxito normal.
+
+**Requiere `ffmpeg` instalado localmente** (trae `ffprobe`) para que
+`"shorts": true` funcione — `brew install ffmpeg` en Mac. Si falta,
+`PermanentError` con el mensaje de instalación en vez de un crash.
+
+**Cambio de scope**: `playlistItems.insert` necesita el scope
+`https://www.googleapis.com/auth/youtube` (más amplio que
+`youtube.upload`, el único que se pedía hasta la Fase 14).
+`SCOPES` en `youtube.py` ahora pide los dos. **Cualquier cuenta autorizada
+antes de esta fase** (`Account` o `token.json` single-account) **solo tiene
+`youtube.upload`** y hay que re-autorizarla:
+
+```bash
+python -m scripts.authorize_youtube --account "Canal cliente X"
+```
+
+Mientras eso no pase, un job con `playlist_id` contra esa cuenta sigue
+subiendo el video normalmente, pero `playlist_error` siempre va a traer un
+error de scope insuficiente.
+
+**Dashboard** (`dashboard/`, no `app/`): en la pestaña "New Job", cuando
+`platform=youtube` aparecen tres campos opcionales — privacy
+(private/unlisted/public, default private), checkbox "Shorts", e input de
+texto para el playlist ID. `dashboard/api.py::create_job` los pasa tal
+cual al payload del job; toda la validación real vive en `youtube.py`,
+igual que el resto de los campos específicos por plataforma.
 
 ## Media y threads de X (Fase 17)
 
