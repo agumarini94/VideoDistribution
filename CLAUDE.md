@@ -627,6 +627,30 @@ unit-tested without Redis or a worker running.
     header — handled by `CORSMiddleware` before they'd otherwise hit the
     auth check and get rejected.
 
+### Phase 12 (current)
+- **First automated test suite** (`tests/`, pytest) — tests only, no
+  behavior changes to existing code. Covers, in priority order:
+  `app/webhooks/tiktok.py` (signature verification, envelope parsing, event
+  classification), error classification in `app/publishers/tiktok.py` and
+  `app/publishers/twitter.py` (HTTP 429/500/400/401 and TikTok's
+  200-with-nested-error-code shape, plus a happy-path chunked upload), PKCE
+  pair generation in `scripts/authorize_tiktok.py`, and
+  `app/tasks.py::handle_tiktok_webhook_event`'s matching/idempotency logic.
+  No network calls (HTTP mocked with `responses` or monkeypatch) and no
+  Celery worker (task functions are called directly). `tests/conftest.py`
+  points `DATABASE_URL` at a throwaway SQLite file *before* any `app/`
+  module is imported (`app/config.py` reads it into a frozen `Settings` at
+  import time), so the suite never touches the real Neon database, and
+  resets all tables after every test since tasks under test open their own
+  `SessionLocal()` sessions (a rollback-only fixture wouldn't undo those
+  commits). `pytest` and `responses` live in `requirements-dev.txt`
+  (`-r requirements.txt` plus the two), kept out of `requirements.txt` so
+  the production image doesn't carry test-only dependencies. Not yet
+  covered: `dashboard/api.py` (the FastAPI routes themselves, incl. the
+  `/webhooks/tiktok` endpoint and HTTP Basic auth), `youtube.py`, `fake.py`,
+  time-slot scheduling, and the retry/backoff/DLQ logic in
+  `publish_job` — natural next candidates when the suite grows.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

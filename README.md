@@ -477,6 +477,25 @@ exista la cuenta:
    --account NAME`) antes de correr en Fly.io.
 4. `fly deploy`.
 
+## Tests
+
+Suite de pytest (`tests/`) sobre las piezas más críticas de lógica pura y de
+orquestación: verificación de firma/parseo/clasificación del webhook de
+TikTok (`app/webhooks/tiktok.py`), clasificación de errores de los
+publishers de TikTok y Twitter/X (`app/publishers/tiktok.py`,
+`app/publishers/twitter.py`, incluida una subida chunked completa contra
+HTTP mockeado), generación del par PKCE (`scripts/authorize_tiktok.py`), y
+la task `handle_tiktok_webhook_event` (`app/tasks.py`) contra una base
+SQLite descartable. No hace falta Redis, un worker de Celery corriendo, ni
+la `DATABASE_URL` real de Neon: todo el HTTP está mockeado (`responses` /
+monkeypatch) y `tests/conftest.py` apunta `DATABASE_URL` a un SQLite
+temporal antes de importar cualquier módulo de `app/`.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## Qué falta (a propósito, fuera de alcance de esta etapa)
 
 - Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
