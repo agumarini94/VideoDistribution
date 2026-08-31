@@ -9,7 +9,8 @@ never the business logic.
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -83,13 +84,43 @@ class Settings:
 settings = Settings()
 
 
-# --- Time-slot scheduling (Phase 5) -----------------------------------------
+# --- Time-slot scheduling (Phase 5, timezone-aware since Phase 20) ---------
 #
-# NOTE ON TIMEZONES: slot times and next_slot_for()'s `now` are naive local
-# time (whatever timezone the server/process runs in). There is no
-# per-platform or per-account timezone support yet, which is fine for a
-# single-region deployment but will need real timezone handling before this
-# runs somewhere with users/accounts across multiple timezones.
+# NOTE ON TIMEZONES: PLATFORM_TIME_SLOTS times ("09:00", etc.) are the
+# business's wall-clock intent, interpreted in SCHEDULER_TIMEZONE — not the
+# timezone the server process happens to run in (which is UTC on Fly, but
+# was silently "whatever the Mac's local timezone was" before this phase,
+# a bug that only didn't bite because nothing had been deployed yet). All
+# storage and comparisons stay in UTC: next_slot_for() converts the
+# computed slot to aware UTC before returning it, so callers/DB columns
+# never see SCHEDULER_TIMEZONE-local values.
+#
+# DST note: SCHEDULER_TIMEZONE transitions can shift or skip a wall-clock
+# slot by an hour on the transition day, same as any other wall-clock
+# schedule (e.g. a slot at a nonexistent or ambiguous local time on the
+# transition day resolves per Python's normal zoneinfo fold/gap rules) —
+# this is accepted, not specially handled.
+
+_SCHEDULER_TIMEZONE_NAME = os.getenv("SCHEDULER_TIMEZONE", "UTC").strip() or "UTC"
+
+try:
+    SCHEDULER_TIMEZONE: ZoneInfo = ZoneInfo(_SCHEDULER_TIMEZONE_NAME)
+except ZoneInfoNotFoundError as exc:
+    raise RuntimeError(
+        f"Invalid SCHEDULER_TIMEZONE {_SCHEDULER_TIMEZONE_NAME!r}: not a recognized IANA "
+        "timezone name (e.g. 'UTC' or 'America/Argentina/Buenos_Aires')."
+    ) from exc
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    """
+    Normalizes a datetime to timezone-aware UTC, treating a naive value as
+    already-UTC — same convention (and reason: Postgres round-trips aware,
+    SQLite round-trips naive) as app/tasks.py::_ensure_utc. Duplicated here
+    rather than imported to avoid a config <-> tasks import cycle.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
 
 _DEFAULT_PLATFORM_TIME_SLOTS: dict[str, list[str]] = {
     "twitter": ["09:00", "13:00", "18:00"],
@@ -142,18 +173,24 @@ PLATFORM_TIME_SLOTS: dict[str, list[str]] = _build_platform_time_slots()
 
 def next_slot_for(platform: str, now: datetime) -> datetime:
     """
-    Returns the next datetime (naive, local time) at which `platform` has a
+    Returns the next aware UTC datetime at which `platform` has a
     configured time slot, starting strictly after `now`: today's next slot
-    if one hasn't passed yet, otherwise tomorrow's earliest slot.
+    (in SCHEDULER_TIMEZONE wall-clock terms) if one hasn't passed yet,
+    otherwise tomorrow's earliest slot. `now` may be naive (assumed UTC,
+    same convention as the rest of the app) or aware in any timezone.
     """
+    now_local = _ensure_utc(now).astimezone(SCHEDULER_TIMEZONE)
+
     times = PLATFORM_TIME_SLOTS.get(platform.lower(), PLATFORM_TIME_SLOTS["default"])
     slot_times = sorted(datetime.strptime(t, "%H:%M").time() for t in times)
 
     for slot_time in slot_times:
-        candidate = datetime.combine(now.date(), slot_time)
-        if candidate > now:
-            return candidate
+        candidate_local = datetime.combine(now_local.date(), slot_time, tzinfo=SCHEDULER_TIMEZONE)
+        if candidate_local > now_local:
+            return candidate_local.astimezone(timezone.utc)
 
-    # Every slot today has already passed: tomorrow's first one.
-    tomorrow = now.date() + timedelta(days=1)
-    return datetime.combine(tomorrow, slot_times[0])
+    # Every slot today has already passed (in SCHEDULER_TIMEZONE): tomorrow's
+    # first one.
+    tomorrow_local = now_local.date() + timedelta(days=1)
+    candidate_local = datetime.combine(tomorrow_local, slot_times[0], tzinfo=SCHEDULER_TIMEZONE)
+    return candidate_local.astimezone(timezone.utc)

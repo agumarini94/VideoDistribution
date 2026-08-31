@@ -17,7 +17,7 @@ extracting a helper before a second caller exists would be premature.
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.celery_app import PRIORITY_QUEUE_NAME
 from app.config import next_slot_for
@@ -58,7 +58,10 @@ def main() -> None:
     # Idempotent: does nothing if the tables already exist.
     init_db()
 
-    now = datetime.now()
+    # Aware UTC: next_slot_for (app/config.py, Phase 20) treats a naive
+    # `now` as already-UTC, so passing local naive time here would silently
+    # shift every computed slot by the machine's UTC offset.
+    now = datetime.now(timezone.utc)
 
     db = SessionLocal()
     try:

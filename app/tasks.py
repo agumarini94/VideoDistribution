@@ -246,7 +246,12 @@ def dispatch_due_jobs() -> None:
     """
     db = SessionLocal()
     try:
-        now = datetime.now()
+        # Aware UTC, matching how scheduled_at is written (see
+        # app/config.py::next_slot_for, Phase 20) and how Job.updated_at /
+        # created_at are written (models.py::_utcnow) — comparing against a
+        # naive local-time `now` here would silently misfire the moment
+        # this runs somewhere other than UTC (e.g. Fly).
+        now = datetime.now(timezone.utc)
         claim = (
             update(Job)
             .where(Job.status == JobStatus.SCHEDULED, Job.scheduled_at <= now)

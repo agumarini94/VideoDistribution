@@ -171,9 +171,11 @@ unit-tested without Redis or a worker running.
   twitter 09:00/13:00/18:00, tiktok 12:00/19:00, youtube 15:00, everything
   else 12:00), overridable via `TIME_SLOTS`
   (`"twitter=09:00,13:00,18:00;tiktok=12:00,19:00"`). `next_slot_for(platform,
-  now)` returns the next due datetime. Naive local time only — no
-  per-account/platform timezone support yet, documented as a known
-  limitation right in the code.
+  now)` returns the next due datetime. Originally naive local time; made
+  timezone-aware in Phase 20 (below) — slot times are now interpreted in
+  `SCHEDULER_TIMEZONE` and the function returns aware UTC. Still no
+  per-account/platform timezone support (one timezone applies to every
+  slot), documented as a known limitation right in the code.
 - **`JobStatus.SCHEDULED`** — jobs created with a time slot start here
   (`scheduled_at` set via `next_slot_for`) instead of `queued`.
 - **`dispatch_due_jobs`** (`app/tasks.py`) — Celery Beat task, every 60s
@@ -843,6 +845,73 @@ unit-tested without Redis or a worker running.
     `in_reply_to_tweet_id` chaining in each request body; an over-280-char
     tweet anywhere in a thread posts nothing; mid-thread failure reports
     the posted count and last tweet id.
+
+### Phase 20 (current)
+- **Timezone-aware scheduling** (`app/config.py`) — fixes Phase 5's
+  time-slot scheduling, which interpreted `PLATFORM_TIME_SLOTS`/`TIME_SLOTS`
+  times in whatever timezone the server process happened to run in
+  (harmless on a developer's Mac, silently wrong the moment this runs on
+  Fly, which is UTC).
+  - **`SCHEDULER_TIMEZONE`** (env var, IANA name e.g.
+    `"America/Argentina/Buenos_Aires"`, default `"UTC"`) — parsed with
+    `zoneinfo.ZoneInfo` at import time into the module-level
+    `SCHEDULER_TIMEZONE` constant. An invalid name raises `RuntimeError`
+    immediately at startup (same fail-fast pattern as `Settings.__post_init__`
+    for a missing `DATABASE_URL`), rather than failing later, confusingly,
+    the first time a job gets scheduled.
+  - **Slot semantics**: `PLATFORM_TIME_SLOTS`/`TIME_SLOTS` times (e.g.
+    `"09:00"`) are the business's wall-clock intent and are now interpreted
+    in `SCHEDULER_TIMEZONE`, not the server's local timezone. `next_slot_for`
+    converts `now` to `SCHEDULER_TIMEZONE` to decide which slot is next
+    (including which local *date* "today" is — important right around UTC
+    midnight, see the crossing-midnight test below), then converts the
+    chosen slot back to aware UTC before returning it. Everything stored
+    and compared elsewhere (the `scheduled_at` column, `dispatch_due_jobs`)
+    stays in UTC — `SCHEDULER_TIMEZONE` only affects how slot times are
+    *interpreted*, never what's persisted.
+  - **DST**: handled by `zoneinfo` (construct the aware local datetime
+    directly via `datetime.combine(..., tzinfo=SCHEDULER_TIMEZONE)`, then
+    `.astimezone(timezone.utc)`) — not specially guarded. During a DST
+    transition in `SCHEDULER_TIMEZONE`, a slot can shift by an hour or,
+    for a slot time that falls in a skipped/repeated local hour, resolve
+    per Python's normal PEP 495 fold/gap rules — the same way any other
+    wall-clock-based schedule behaves across a DST boundary. Accepted, not
+    worked around.
+  - **`dispatch_due_jobs`** (`app/tasks.py`) now compares against
+    `datetime.now(timezone.utc)` instead of naive `datetime.now()` — the
+    bug this phase actually fixes for the Beat task, since comparing a
+    naive-local `now` against an aware-UTC `scheduled_at` was silently
+    wrong on any server not in UTC (i.e., would have been wrong on Fly from
+    day one). `scripts/enqueue_demo.py --schedule` was calling
+    `next_slot_for` with naive local `datetime.now()` too; also switched to
+    aware `datetime.now(timezone.utc)`.
+  - **Backwards compatible, no schema change**: `scheduled_at` was already
+    `DateTime(timezone=True)` (Phase 5) and existing rows are already
+    UTC-ish. Comparisons/reads that need Python-side tzinfo normalize a
+    naive value as already-UTC via `_ensure_utc` — duplicated in
+    `app/config.py` (rather than imported from `app/tasks.py`) to avoid a
+    config <-> tasks import cycle, same normalization already used by
+    `app/tasks.py::_ensure_utc` and
+    `app/publishers/youtube.py::token_expires_within`. SQLite (the test
+    suite's DB) round-trips *every* datetime as naive regardless of what
+    was written, ignoring tzinfo entirely on both read and write — verified
+    directly against `sqlalchemy.dialects.sqlite.base.DATETIME`'s bind
+    processor — which is exactly why `dispatch_due_jobs`'s SQL-side
+    `scheduled_at <= now` filter works correctly against a mix of aware and
+    naive stored values as long as every value's raw field numbers already
+    represent the same UTC instant (Postgres, the real target, normalizes
+    properly regardless via `TIMESTAMPTZ`).
+  - Covered by `tests/test_config_scheduler_timezone.py` (slot conversion
+    for a non-UTC `SCHEDULER_TIMEZONE`, including a case where `now`'s UTC
+    date and its local date disagree, asserting the local date is what's
+    used; default-UTC behavior unchanged; naive `now` treated as UTC; an
+    invalid timezone name fails at import via a subprocess, since the
+    failure happens at module import time and the main test process
+    already has `app.config` loaded) and
+    `tests/test_tasks_dispatch_due_jobs.py` (`dispatch_due_jobs` picks up a
+    due job whether `scheduled_at` is aware or naive, and correctly leaves
+    a future-dated job alone), `publish_job.delay` monkeypatched so no
+    Celery broker is needed.
 
 ## Monitoring dashboard (extra, not in the spec)
 

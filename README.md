@@ -110,6 +110,7 @@ Ver `app/config.py` / `.env.example`:
 | `R2_SECRET_ACCESS_KEY` | *(vacío, opcional)* | Secret key del mismo API token de R2 |
 | `R2_BUCKET_NAME` | *(vacío, opcional)* | Nombre del bucket de R2 |
 | `TIME_SLOTS` | *(vacío, usa los defaults)* | Override de horarios por plataforma, formato `twitter=09:00,13:00,18:00;tiktok=12:00,19:00` |
+| `SCHEDULER_TIMEZONE` | `UTC` | Timezone IANA (ej. `America/Argentina/Buenos_Aires`) en la que se interpretan los horarios de `TIME_SLOTS`/`PLATFORM_TIME_SLOTS`; nombre inválido falla al arrancar (Fase 20) |
 | `X_API_KEY` | *(vacío, opcional)* | Consumer key de la app de X (Twitter), nivel app, no por cuenta |
 | `X_API_SECRET` | *(vacío, opcional)* | Consumer secret de la app de X, nivel app |
 | `X_ACCESS_TOKEN` | *(vacío, opcional)* | Access token de fallback para jobs sin `account_id` (modo single-account) |
@@ -125,8 +126,15 @@ Ver `app/config.py` / `.env.example`:
 
 Defaults de `TIME_SLOTS` (ver `PLATFORM_TIME_SLOTS` en `app/config.py`): twitter
 09:00/13:00/18:00, tiktok 12:00/19:00, youtube 15:00, cualquier otra plataforma 12:00.
-Son horarios naive en la hora local del proceso, sin soporte de timezone por
-cuenta/plataforma todavía (ver el comentario en `app/config.py`).
+
+Esos horarios se interpretan en `SCHEDULER_TIMEZONE` (Fase 20; default `UTC`
+si no está seteada), no en la timezone del servidor — importante porque en
+producción (Fly) el proceso corre en UTC, no en la hora del cliente. Todo lo
+que se guarda en la base y se compara internamente sigue siendo UTC aware;
+`SCHEDULER_TIMEZONE` solo cambia cómo se interpreta "09:00", etc. Un nombre
+de timezone inválido hace fallar el arranque de la app con un error claro.
+No hay soporte de timezone por cuenta/plataforma individual todavía, un
+único `SCHEDULER_TIMEZONE` aplica a todos los horarios.
 
 `app/storage.py` (subida, URL firmada y borrado de media en R2) todavía no está conectado
 a ningún publisher; probalo de forma aislada con `python -m scripts.test_storage` una vez
@@ -634,7 +642,7 @@ que todo esto está probado con HTTP completamente mockeado
 - Migraciones reales con Alembic (hoy `init_db()` usa `create_all`, alcanza mientras el esquema es chico).
 - Deploy real en Fly.io (el `fly.toml` y el Dockerfile están listos, pero nadie corrió `fly deploy` — falta la cuenta del cliente).
 - Conectar `app/storage.py` (R2) a los publishers cuando exista un flujo real de media (incluido X: hoy `media_paths` son rutas locales).
-- Timezone real por cuenta/plataforma para el scheduling (hoy es naive local time, ver `app/config.py`).
+- Timezone por cuenta/plataforma individual para el scheduling — desde la Fase 20 hay un único `SCHEDULER_TIMEZONE` global (ya no naive local time), pero no una timezone distinta por cuenta o plataforma.
 - TikTok Direct Post (`video.publish`, pendiente de la revisión de la app).
 - Registrar la callback URL real del webhook de TikTok en el Developer Portal (bloqueado por el mismo motivo que el resto del setup de Sandbox — ver Fase 10b) y confirmar los nombres de evento reales contra un payload real la primera vez que llegue uno.
 - Credenciales reales de X (Developer Portal): la Fase 17 (media + threads) sigue sin poder probarse contra la API real hasta que el cliente las provea.
