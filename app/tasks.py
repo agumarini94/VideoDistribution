@@ -23,7 +23,7 @@ from sqlalchemy import update
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import SessionLocal
-from app.exceptions import PermanentError, TransientError
+from app.exceptions import PermanentError, TokenExpiredError, TransientError
 from app.models import Account, Job, JobStatus, WebhookEvent
 from app.notifications import send_alert
 from app.publishers import fake as fake_publisher
@@ -46,24 +46,40 @@ _PUBLISHERS_BY_PLATFORM = {
 
 # Platforms whose publisher module exposes the proactive-refresh helpers
 # (token_expires_within / refresh_stored_credentials), used by
-# refresh_expiring_tokens (Phase 8). Twitter's OAuth 1.0a tokens don't
-# expire, so it's absent here — only platforms with expiring OAuth2 tokens
-# need an entry.
+# refresh_expiring_tokens (Phase 8) AND (Phase 21, twitter only so far) the
+# reactive TokenExpiredError -> refresh -> retry path in publish_job below.
 _TOKEN_REFRESH_MODULES_BY_PLATFORM = {
     "youtube": youtube_publisher,
     "tiktok": tiktok_publisher,
+    "twitter": twitter_publisher,
 }
 
-# Interactive re-authorization script for each platform in the map above,
-# named in the re-authorization alert below.
-_REAUTHORIZE_SCRIPT_BY_PLATFORM = {
-    "youtube": "scripts.authorize_youtube",
-    "tiktok": "scripts.authorize_tiktok",
+# Human-readable re-authorization instructions per platform, named in the
+# re-authorization alert (_deactivate_and_alert_for_reauth below) when a
+# stored refresh token turns out to be permanently invalid/revoked.
+# {name} is filled in with the Account's name. Twitter (Phase 21) has no
+# interactive authorize script yet (unlike youtube/tiktok's
+# scripts/authorize_*.py) — re-authorization means running X's OAuth 2.0
+# PKCE flow by hand and registering the result via scripts/add_account.py.
+_REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM = {
+    "youtube": 'python -m scripts.authorize_youtube --account "{name}"',
+    "tiktok": 'python -m scripts.authorize_tiktok --account "{name}"',
+    "twitter": (
+        "obtain a fresh authorization code via X's OAuth 2.0 PKCE flow, then "
+        'python -m scripts.add_account --platform twitter --name "{name}" '
+        "client_id=... client_secret=... access_token=... refresh_token=... expires_at=..."
+    ),
 }
 
 # How far ahead of actual expiry refresh_expiring_tokens proactively
-# refreshes a token (spec section 4, "Automated Token Refresh").
+# refreshes a token (spec section 4, "Automated Token Refresh"). Platform-
+# specific because token lifetimes differ wildly (X's OAuth2 access tokens
+# live ~2h, so they need a tighter window than a token that lives for a day
+# or more) — entries not listed here fall back to the 45-minute default.
 _TOKEN_REFRESH_WINDOW_SECONDS = 45 * 60
+_TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM = {
+    "twitter": 40 * 60,
+}
 
 
 def _get_publisher(platform: str):
@@ -171,7 +187,15 @@ def publish_job(self, job_id: int) -> None:
         publisher = _get_publisher(job.platform)
         try:
             account_credentials = _resolve_account_credentials(db, job)
-            result = publisher(job.platform, job.payload, account_credentials)
+            try:
+                result = publisher(job.platform, job.payload, account_credentials)
+            except TokenExpiredError as exc:
+                # Refresh once and retry inline (not a Celery retry — this
+                # doesn't consume one of self.max_retries). Whatever the
+                # retried call raises (including PermanentError from a dead
+                # refresh token, or another TransientError) is handled by
+                # the same except clauses below, same as a first attempt.
+                result = _handle_token_expired(db, job, publisher, exc)
         except TransientError as exc:
             job.error_message = str(exc)
             db.commit()
@@ -297,32 +321,96 @@ def refresh_expiring_tokens() -> None:
         db.close()
 
 
+def _deactivate_and_alert_for_reauth(db, account: Account, exc: Exception) -> None:
+    """
+    Shared outcome for "this account's refresh token is permanently
+    invalid/revoked" — used by both the proactive Beat refresh
+    (_refresh_account_if_needed) and the reactive refresh-on-401 path
+    (_handle_token_expired). No amount of retrying fixes this: deactivate
+    so publish_job stops dispatching jobs against it
+    (_resolve_account_credentials) and alert a human, since reviving it
+    requires a fresh out-of-band authorization.
+    """
+    account.is_active = False
+    db.commit()
+    instructions = _REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM[account.platform].format(name=account.name)
+    send_alert(
+        f"Account #{account.id} ({account.platform}/{account.name}) needs re-authorization\n"
+        f"Reason: {exc}\n"
+        f"Run: {instructions} to reactivate it."
+    )
+
+
 def _refresh_account_if_needed(db, account: Account) -> None:
     module = _TOKEN_REFRESH_MODULES_BY_PLATFORM[account.platform]
-    if not module.token_expires_within(account.credentials, _TOKEN_REFRESH_WINDOW_SECONDS):
+    window = _TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM.get(account.platform, _TOKEN_REFRESH_WINDOW_SECONDS)
+    if not module.token_expires_within(account.credentials, window):
         return
 
     try:
         account.credentials = module.refresh_stored_credentials(account.credentials)
         db.commit()
     except PermanentError as exc:
-        # Refresh token is invalid/revoked: no amount of retrying fixes
-        # this. Deactivate so publish_job stops dispatching jobs against it
-        # (see _resolve_account_credentials) and alert a human — reviving
-        # it requires a fresh interactive authorization.
-        account.is_active = False
-        db.commit()
-        script = _REAUTHORIZE_SCRIPT_BY_PLATFORM[account.platform]
-        send_alert(
-            f"Account #{account.id} ({account.platform}/{account.name}) needs re-authorization\n"
-            f"Reason: {exc}\n"
-            f'Run: python -m {script} --account "{account.name}" to reactivate it.'
-        )
+        _deactivate_and_alert_for_reauth(db, account, exc)
     except TransientError as exc:
         # Network blip or a transient error from the provider's token
         # endpoint: leave the account active, log, and let the next
         # scheduled run (30 min later) retry.
         logger.warning("Transient error refreshing account #%s (%s): %s", account.id, account.name, exc)
+
+
+def _handle_token_expired(db, job: Job, publisher, exc: TokenExpiredError):
+    """
+    Reactive counterpart to _refresh_account_if_needed (Phase 21): the
+    publisher itself just reported the access token it was given is
+    expired/invalid (TokenExpiredError, see app/exceptions.py and
+    app/publishers/twitter.py). Refreshes the Account's stored credentials,
+    persists the rotated tokens, and retries the publish call once with the
+    fresh credentials — a plain TransientError retry would just hit the
+    same expired token again. Any exception the retried publish() call
+    raises (including another TokenExpiredError) propagates to the caller
+    (publish_job) and is handled exactly like a first-attempt failure.
+
+    A job with no account_id can't be refreshed here: there's nowhere to
+    persist a rotated refresh_token (see the "single-account mode" caveat
+    in app/publishers/twitter.py's module docstring), so this re-raises the
+    original error to fall through to normal transient backoff instead of
+    silently doing nothing.
+    """
+    module = _TOKEN_REFRESH_MODULES_BY_PLATFORM.get(job.platform)
+    if job.account_id is None or module is None or not hasattr(module, "refresh_stored_credentials"):
+        logger.warning(
+            "Job %s got a TokenExpiredError with no refreshable account (account_id=%s, platform=%s); "
+            "treating as a normal transient error.",
+            job.id, job.account_id, job.platform,
+        )
+        raise exc
+
+    account = db.get(Account, job.account_id)
+    if account is None:
+        raise exc
+
+    try:
+        new_credentials = module.refresh_stored_credentials(account.credentials)
+    except PermanentError as refresh_exc:
+        _deactivate_and_alert_for_reauth(db, account, refresh_exc)
+        raise PermanentError(
+            f"Job {job.id}: access token expired and refreshing it failed, account deactivated: {refresh_exc}"
+        ) from refresh_exc
+    except TransientError:
+        # Network blip refreshing: let the ORIGINAL TokenExpiredError drive
+        # the normal transient/backoff path below, not the refresh attempt's
+        # own (less informative) error.
+        raise exc
+
+    # Rotation (Phase 21): persist BOTH the new access token and the new
+    # refresh token before using the access token for anything — losing the
+    # rotated refresh_token here strands the account exactly as surely as
+    # never refreshing at all.
+    account.credentials = new_credentials
+    db.commit()
+
+    return publisher(job.platform, job.payload, new_credentials)
 
 
 @celery_app.task

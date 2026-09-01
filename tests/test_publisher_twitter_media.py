@@ -1,12 +1,14 @@
 """
-Tests for Phase 17's additions to app/publishers/twitter.py: chunked media
-upload (v1.1 upload.twitter.com, INIT -> APPEND -> FINALIZE -> STATUS),
-media-cap pre-flight validation, and thread posting (sequential replies,
-whole-thread pre-flight validation, partial-thread failure reporting). All
-HTTP is mocked with `responses` — nothing here talks to the real X API.
+Tests for app/publishers/twitter.py's chunked media upload (Phase 21: X API
+v2, single endpoint https://api.x.com/2/media/upload, INIT -> APPEND ->
+FINALIZE -> STATUS, Bearer auth), media-cap pre-flight validation, and
+thread posting (sequential replies, whole-thread pre-flight validation,
+partial-thread failure reporting). All HTTP is mocked with `responses` —
+nothing here talks to the real X API.
 
-See tests/test_publisher_twitter.py for the pre-existing single-tweet /
-credential-resolution / 280-char-guard coverage, unchanged by this phase.
+See tests/test_publisher_twitter.py for credential resolution, the 280-char
+guard, tweet-creation error classification (incl. TokenExpiredError), and
+token-refresh coverage, unchanged in spirit by this phase.
 """
 
 import pytest
@@ -16,17 +18,20 @@ from app.exceptions import PermanentError, TransientError
 from app.publishers import twitter as twitter_publisher
 
 _TWEETS_URL = "https://api.twitter.com/2/tweets"
-_MEDIA_URL = "https://upload.twitter.com/1.1/media/upload.json"
+_MEDIA_URL = "https://api.x.com/2/media/upload"
 
-ACCOUNT_CREDENTIALS = {"access_token": "acc-token", "access_token_secret": "acc-secret"}
+ACCOUNT_CREDENTIALS = {
+    "client_id": "client-id",
+    "client_secret": "client-secret",
+    "access_token": "acc-token",
+    "refresh_token": "refresh-token",
+}
 
 
 @pytest.fixture(autouse=True)
-def _app_credentials(monkeypatch):
-    monkeypatch.setenv("X_API_KEY", "app-key")
-    monkeypatch.setenv("X_API_SECRET", "app-secret")
-    monkeypatch.delenv("X_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("X_ACCESS_TOKEN_SECRET", raising=False)
+def _no_env_credentials(monkeypatch):
+    for var in ("TWITTER_CLIENT_ID", "TWITTER_CLIENT_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_REFRESH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -60,22 +65,23 @@ def _mock_tweet(tweet_id="1"):
 
 def _mock_media_upload(media_id="111", append_calls=1, processing_states=None):
     """
-    Registers INIT -> APPEND (x append_calls) -> FINALIZE -> optional STATUS
-    poll(s), all against the same upload.twitter.com endpoint (tweepy.API
-    distinguishes them by the "command" field, `responses` just replays
-    registrations in order per method+URL).
+    Registers INIT -> APPEND (x append_calls) -> FINALIZE (all POST) and
+    optional STATUS poll(s) (GET), all against the same
+    api.x.com/2/media/upload endpoint — `responses` replays registrations
+    in order per method+URL, so registration order here must match the
+    publisher's actual call order.
     """
-    responses.add(responses.POST, _MEDIA_URL, json={"media_id": media_id}, status=202)  # INIT
+    responses.add(responses.POST, _MEDIA_URL, json={"data": {"id": media_id}}, status=200)  # INIT
     for _ in range(append_calls):
         responses.add(responses.POST, _MEDIA_URL, status=204)  # APPEND (empty body)
 
-    finalize_body = {"media_id": media_id}
+    finalize_data = {"id": media_id}
     if processing_states:
-        finalize_body["processing_info"] = processing_states[0]
-    responses.add(responses.POST, _MEDIA_URL, json=finalize_body, status=201)  # FINALIZE
+        finalize_data["processing_info"] = processing_states[0]
+    responses.add(responses.POST, _MEDIA_URL, json={"data": finalize_data}, status=201)  # FINALIZE
 
     for state in (processing_states or [])[1:]:
-        responses.add(responses.GET, _MEDIA_URL, json={"media_id": media_id, "processing_info": state}, status=200)
+        responses.add(responses.GET, _MEDIA_URL, json={"data": {"id": media_id, "processing_info": state}}, status=200)
 
 
 def _media_calls():
@@ -156,9 +162,21 @@ class TestChunkedMediaUpload:
         assert '"media_ids": ["222"]' in tweet_call.request.body.decode()
 
     @responses.activate
+    def test_all_media_calls_carry_bearer_auth(self, image_file):
+        _mock_media_upload(media_id="777", append_calls=1, processing_states=None)
+        _mock_tweet("1")
+
+        twitter_publisher.publish(
+            "twitter", {"text": "a photo", "media_paths": [str(image_file)]}, ACCOUNT_CREDENTIALS
+        )
+
+        for call in _media_calls():
+            assert call.request.headers["Authorization"] == "Bearer acc-token"
+
+    @responses.activate
     def test_image_happy_path_skips_status_polling(self, image_file):
         # Static images finalize synchronously (no processing_info), so no
-        # GET .../media/upload.json?command=STATUS call should ever happen.
+        # GET .../2/media/upload?command=STATUS call should ever happen.
         _mock_media_upload(media_id="333", append_calls=1, processing_states=None)
         _mock_tweet("1")
 

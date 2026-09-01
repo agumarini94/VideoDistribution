@@ -3,12 +3,23 @@ CLI to insert or update an Account row (per-account credentials for a
 platform's publisher — see app/models.py Account and CLAUDE.md Phase 6).
 
 Run it from the project root with:
+    python -m scripts.add_account --platform tiktok --name "Main account" \\
+        access_token=xxx refresh_token=yyy
+
+    # Twitter/X (Phase 21, OAuth 2.0 + API v2 — see app/publishers/twitter.py):
     python -m scripts.add_account --platform twitter --name "Main account" \\
-        access_token=xxx access_token_secret=yyy
+        client_id=xxx client_secret=yyy access_token=zzz refresh_token=www \\
+        expires_at=2026-09-01T14:00:00+00:00
 
 Credentials are given as any number of key=value pairs; which keys are
 expected depends on the platform's publisher (e.g. app/publishers/twitter.py
-expects access_token / access_token_secret).
+expects client_id / client_secret / access_token / refresh_token, plus an
+optional expires_at ISO datetime used by the proactive token-refresh Beat
+job — see token_expires_within/refresh_stored_credentials there). X's
+refresh tokens are single-use and rotate on every refresh, so re-running
+this script to hand-set a refresh_token should only ever be needed for the
+very first registration or a full re-authorization — normal rotation is
+handled automatically by app/tasks.py.
 
 If an Account with the same platform+name already exists, its credentials
 (and is_active) are updated in place instead of creating a duplicate — so

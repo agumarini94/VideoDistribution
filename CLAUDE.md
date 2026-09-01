@@ -34,21 +34,25 @@ transient errors and a dead-letter queue for permanent ones.
     `TransientError`; other 4xx -> `PermanentError`. Ignores
     `account_credentials` for now (see Phase 6 — natural next candidate to
     migrate to per-account credentials).
-  - `twitter.py` (Phase 6, extended Phase 17) — real X API v2 publisher
-    (`POST /2/tweets` via tweepy, OAuth 1.0a user context). App-level
-    `consumer_key`/`secret` always come from `X_API_KEY`/`X_API_SECRET`;
-    the access token comes from `account_credentials`
-    (`access_token`/`access_token_secret`) when the job has an account,
-    otherwise falls back to `X_ACCESS_TOKEN`/`X_ACCESS_TOKEN_SECRET`.
-    Classifies tweepy `HTTPException`s by status code the same way
-    `youtube.py` does: 429/5xx -> `TransientError`; 401/403/other 4xx ->
-    `PermanentError`. Missing app-level or access-token credentials ->
-    `PermanentError` naming exactly what's missing. Payload (Phase 17):
-    `{"text": str}` for a single tweet, optionally with `"media_paths"`
-    (local file paths); or `{"thread": [{"text", "media_paths"?}, ...]}`
-    for a thread — `"text"` and `"thread"` are mutually exclusive. Media
-    still comes from local disk, not yet from `app/storage.py`. See Phase
-    17 below for the media-upload and threading details.
+  - `twitter.py` (Phase 6, extended Phase 17, migrated to OAuth 2.0 + v2
+    media upload in Phase 21) — real X API v2 publisher (`POST /2/tweets`
+    via tweepy, OAuth 2.0 user-context Bearer auth). `account_credentials`
+    (or the `TWITTER_*` env fallback) carries all four fields a
+    confidential OAuth 2.0 client needs: `client_id`, `client_secret`,
+    `access_token`, `refresh_token`. Classifies errors by HTTP status the
+    same way `youtube.py` does — 429/5xx -> `TransientError`; other 4xx ->
+    `PermanentError` — with one addition: a 401 flagged by X as an
+    expired/invalid Bearer token raises `TokenExpiredError` (a
+    `TransientError` subclass, see `app/exceptions.py`) instead of a plain
+    `PermanentError`, so `app/tasks.py` can refresh and retry instead of
+    dead-lettering a job over a token that just needed rotating. Payload
+    (Phase 17): `{"text": str}` for a single tweet, optionally with
+    `"media_paths"` (local file paths); or
+    `{"thread": [{"text", "media_paths"?}, ...]}` for a thread — `"text"`
+    and `"thread"` are mutually exclusive. Media still comes from local
+    disk, not yet from `app/storage.py`. See Phase 17 below for the
+    media-upload/threading details and Phase 21 for the OAuth 2.0
+    migration and token-refresh flow.
   - `tiktok.py` (Phase 10) — real TikTok Content Posting API publisher,
     Sandbox mode: inbox-upload flow only (`POST
     /v2/post/publish/inbox/video/init/` then chunked `PUT` to the returned
@@ -912,6 +916,131 @@ unit-tested without Redis or a worker running.
     due job whether `scheduled_at` is aware or naive, and correctly leaves
     a future-dated job alone), `publish_job.delay` monkeypatched so no
     Celery broker is needed.
+
+### Phase 21 (current)
+- **Twitter/X migrated to OAuth 2.0 + API v2 media upload** — X's developer
+  console now only issues OAuth 2.0 user tokens (scopes: `tweet.read`,
+  `tweet.write`, `users.read`, `offline.access`), replacing Phase 6/17's
+  OAuth 1.0a + v1.1 media upload entirely. No real X credentials existed
+  when Phase 6/17 were built either, so — same as every publisher in this
+  project before real credentials arrive — this is unit-tested against
+  fully mocked HTTP only (`tests/test_publisher_twitter.py`,
+  `tests/test_publisher_twitter_media.py`,
+  `tests/test_tasks_twitter_token_refresh.py`), not yet verified against a
+  live account.
+  - **Auth**: every API call is now a plain `Authorization: Bearer
+    <access_token>` request — no per-request signing like OAuth 1.0a.
+    `tweepy.Client(bearer_token=...)` handles tweet creation, but tweepy's
+    write methods default to `user_auth=True` (OAuth 1.0a) regardless of
+    whether a `bearer_token` was given, so `_post_tweet` explicitly passes
+    `user_auth=False` to actually route through it — an easy trap, called
+    out inline in the code.
+  - **Credentials, all four now per-account**: `account_credentials` (or
+    the env fallback) carries `client_id`, `client_secret`, `access_token`,
+    `refresh_token` — a change from Phase 6's split (app-level env vars +
+    per-account token), because a confidential client's refresh flow needs
+    the client id/secret alongside whichever refresh_token they're paired
+    with. Env fallback (single-account mode, no `account_id`):
+    `TWITTER_CLIENT_ID` / `TWITTER_CLIENT_SECRET` / `TWITTER_ACCESS_TOKEN` /
+    `TWITTER_REFRESH_TOKEN`. **Single-account mode can't persist a rotated
+    refresh_token anywhere** (see rotation below) — it survives exactly one
+    reactive refresh before the env var goes stale, so real accounts should
+    get an `Account` row via `scripts/add_account.py` rather than relying
+    on env vars long-term.
+  - **Media upload migrated to X API v2**: single endpoint
+    `https://api.x.com/2/media/upload` (a different host than tweet
+    creation, which stays on `api.twitter.com`), multipart/form-data,
+    Bearer auth, `command=INIT|APPEND|FINALIZE` + a `GET
+    ...?command=STATUS` poll — conceptually the same INIT/APPEND/FINALIZE/
+    STATUS shape as Phase 17's v1.1 flow, different host/encoding.
+    Implemented directly with `requests` rather than tweepy (tweepy predates
+    this v2 endpoint). `media_category` values (`tweet_image`/`tweet_gif`/
+    `tweet_video`), the 4-images-or-1-video-never-mixed pre-flight cap, and
+    attaching the uploaded `media_id` to a tweet via
+    `create_tweet(media_ids=[...])` are all unchanged from Phase 17 — X's v2
+    tweet body nests this as `{"media": {"media_ids": [...]}}`, which is
+    what tweepy already sent regardless of auth scheme.
+  - **`TokenExpiredError`** (`app/exceptions.py`) — a new `TransientError`
+    subclass. `twitter.py` raises it instead of a plain `PermanentError`
+    when X answers 401 with `WWW-Authenticate: Bearer error="invalid_token"`
+    (RFC 6750) — this specific signal, not yet verified against a live
+    response, is what distinguishes "token needs a refresh" from "these
+    credentials are just wrong." Being a `TransientError` subclass means
+    any code path that doesn't specifically check for it still treats it as
+    an ordinary retryable error.
+  - **Token refresh, modeled on `youtube.py`/`tiktok.py`'s pattern but with
+    rotation**: `token_expires_within(credentials, seconds)` and
+    `refresh_stored_credentials(credentials)` in `twitter.py` mirror the
+    other publishers' contract (same `"expires_at"` key/ISO-string
+    convention as `tiktok.py`). The refresh call is
+    `POST https://api.twitter.com/2/oauth2/token` (`grant_type=refresh_token`),
+    authenticated as the confidential client via HTTP Basic auth
+    (`client_id:client_secret`) — this exact token endpoint URL, unlike the
+    v2 media upload endpoint above, was not pasted from docs.x.com and is
+    flagged in-code as unverified. **X's refresh tokens are single-use and
+    ROTATE**: every refresh returns a new `access_token` AND a new
+    `refresh_token`, invalidating the old `refresh_token` — a response
+    missing the new `refresh_token` is treated as a `TransientError` rather
+    than silently reusing the now-invalid old one.
+  - **Registered in `app/tasks.py::_TOKEN_REFRESH_MODULES_BY_PLATFORM`**
+    (alongside youtube/tiktok), so the existing `refresh_expiring_tokens`
+    Beat task (every 30 min, Phase 8) now also proactively refreshes
+    Twitter accounts. Refresh window is **platform-specific**
+    (`_TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM`): 40 minutes for twitter
+    (access tokens live ~2h) vs. the 45-minute default for youtube/tiktok.
+  - **Reactive refresh-and-retry-once in `publish_job`**
+    (`app/tasks.py::_handle_token_expired`): when a publisher raises
+    `TokenExpiredError`, `publish_job` refreshes the account's stored
+    credentials, **persists the rotated access+refresh tokens to the
+    `Account` row before reusing them** (losing a rotated refresh_token
+    here would strand the account exactly like never refreshing at all),
+    then retries the publish call once with the fresh credentials — inline,
+    not via `self.retry()`, so it doesn't consume one of `max_retries`.
+    Whatever that retry raises (success, another `TokenExpiredError`, a
+    plain `TransientError`, or `PermanentError`) is handled exactly like a
+    first attempt by the surrounding retry/DLQ logic. A job with no
+    `account_id` can't be refreshed (nowhere to persist a rotated
+    refresh_token) — it falls through to the original `TokenExpiredError`
+    being retried as an ordinary transient error instead.
+  - **Deactivation + alert on a permanently invalid refresh token**: shared
+    between the proactive Beat path and the reactive retry path via
+    `_deactivate_and_alert_for_reauth` — sets the `Account` `is_active =
+    False` (so `_resolve_account_credentials` stops routing jobs to it) and
+    alerts with platform-specific re-authorization instructions
+    (`_REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM`). Twitter has no interactive
+    authorize script yet (unlike `scripts/authorize_youtube.py`/
+    `authorize_tiktok.py`) — the alert points at obtaining a fresh
+    authorization code via X's OAuth 2.0 PKCE flow by hand and registering
+    it with `scripts/add_account.py`.
+- `scripts/add_account.py` — unchanged mechanically (still generic
+  key=value pairs), docstring updated with a Twitter OAuth 2.0 example:
+  `client_id=... client_secret=... access_token=... refresh_token=...
+  expires_at=...`.
+- `scripts/enqueue_twitter_test.py` (new, modeled on
+  `enqueue_youtube_test.py`) — `--mode text|image|video|thread` builds the
+  matching payload shape (thread mode posts 3 generated tweets, with
+  `--file` attaching to the first one if given), `--file` for image/video
+  modes, `--account NAME` to link an `Account` row (omit for the env-var
+  single-account fallback). Dispatches immediately via the normal queue,
+  same as the youtube script.
+- **Dashboard NEW JOB form: no changes needed.** Twitter was never in
+  `dashboard/api.py`'s `_SUPPORTED_UPLOAD_PLATFORMS` (youtube/tiktok
+  only, both video-upload flows) — a single tweet/thread doesn't fit that
+  upload-a-file UI shape, and Phase 21 doesn't change that.
+
+  **When real X OAuth 2.0 credentials arrive**, replacing the old OAuth
+  1.0a `X_API_KEY`/`X_API_SECRET`/`X_ACCESS_TOKEN`/`X_ACCESS_TOKEN_SECRET`
+  vars entirely:
+  1. Set `TWITTER_CLIENT_ID`/`TWITTER_CLIENT_SECRET` in `.env` for
+     single-account use, plus `TWITTER_ACCESS_TOKEN`/`TWITTER_REFRESH_TOKEN`
+     from the initial OAuth 2.0 PKCE authorization — or register an
+     `Account` row via `scripts/add_account.py` (recommended: only an
+     `Account` row survives refresh-token rotation).
+  2. Test with `python -m scripts.enqueue_twitter_test --mode text
+     [--account NAME]`, then image/video/thread modes once that works.
+  3. Watch the first proactive refresh (`refresh_expiring_tokens`, every
+     30 min) or trigger one manually to confirm rotation persists
+     correctly onto the `Account` row (`scripts/show_accounts.py`).
 
 ## Monitoring dashboard (extra, not in the spec)
 

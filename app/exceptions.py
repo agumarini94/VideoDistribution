@@ -37,6 +37,21 @@ class PermanentError(PublishError):
     """
 
 
+class TokenExpiredError(TransientError):
+    """
+    The provider rejected a request because the OAuth 2.0 access token used
+    is expired or otherwise invalid (Phase 21: app/publishers/twitter.py,
+    RFC 6750 `WWW-Authenticate: Bearer error="invalid_token"`).
+
+    A subclass of TransientError, not a separate branch: on any path that
+    doesn't specifically check for it, it's still treated as a normal
+    transient error (retried with backoff). app/tasks.py::publish_job
+    catches it specifically first to refresh the account's token and retry
+    the publish once before falling back to normal backoff — a plain
+    TransientError retry would just hit the same expired token again.
+    """
+
+
 class StorageNotConfiguredError(Exception):
     """
     Raised by app/storage.py when used without R2 credentials configured

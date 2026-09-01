@@ -26,6 +26,17 @@ if _TEST_DB_PATH.exists():
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 os.environ.setdefault("ALERT_WEBHOOK_URL", "")
 os.environ.setdefault("TIKTOK_WEBHOOK_SKIP_SIGNATURE", "")
+# A real .env can set SCHEDULER_TIMEZONE (e.g. for local/prod scheduling).
+# app/config.py's load_dotenv() call defaults to override=False, meaning it
+# only fills in variables NOT ALREADY in os.environ — so popping this
+# wouldn't help (dotenv would just refill it from .env on import); setting
+# it explicitly here, before the first `from app...` import anywhere in the
+# suite (including this file's own, below), is what actually pins it to the
+# documented UTC default. Same pattern as ALERT_WEBHOOK_URL/
+# TIKTOK_WEBHOOK_SKIP_SIGNATURE below, just an explicit set instead of
+# setdefault since we want to unconditionally win over any real .env value,
+# not just fill in a gap.
+os.environ["SCHEDULER_TIMEZONE"] = "UTC"
 
 import pytest  # noqa: E402
 
