@@ -60,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from app.exceptions import PermanentError, TransientError
+from app.exceptions import PermanentError, PublishError, TransientError
 
 GRAPH_API_VERSION = "v26.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -99,7 +99,9 @@ def _app_credentials() -> tuple[str, str]:
     return app_id, app_secret
 
 
-def _raise_for_graph_error(response: requests.Response, context: str) -> dict:
+def raise_for_graph_error(
+    response: requests.Response, context: str, token_invalid_error_class: type[PublishError] = PermanentError
+) -> dict:
     """
     Classifies a Graph API response. Meta reports errors as a top-level
     {"error": {"message", "type", "code", "error_subcode", "fbtrace_id"}}
@@ -107,6 +109,18 @@ def _raise_for_graph_error(response: requests.Response, context: str) -> dict:
     which sometimes reports errors as HTTP 200 with a nested code — Graph
     API doesn't do that, so the HTTP status alone is enough to know
     something failed).
+
+    Shared across app/publishers/meta.py and app/publishers/facebook.py
+    (Phase 24) — not underscore-prefixed, since it's a cross-module contract
+    now, not module-private. token_invalid_error_class lets a caller swap
+    what a code=190 (OAuthException: invalid/expired/revoked token) error
+    raises: meta.py's own OAuth-chain calls (including
+    refresh_stored_credentials below) keep the default PermanentError, since
+    that's what tells app/tasks.py's proactive refresh path to deactivate
+    the account. app/publishers/facebook.py's actual publish-time Graph
+    calls pass TokenExpiredError instead, so a token that expired mid-use is
+    refreshed and retried once (app/tasks.py::_handle_token_expired) rather
+    than dead-lettering the job outright.
     """
     status = response.status_code
     try:
@@ -124,6 +138,8 @@ def _raise_for_graph_error(response: requests.Response, context: str) -> dict:
     message = error.get("message", "")
     if status == 429 or status >= 500 or code in _TRANSIENT_GRAPH_ERROR_CODES:
         raise TransientError(f"Graph API transient error {context} (code={code}): {message}")
+    if code == _TOKEN_INVALID_GRAPH_ERROR_CODE:
+        raise token_invalid_error_class(f"Graph API rejected the request {context} (code={code}): {message}")
     raise PermanentError(f"Graph API rejected the request {context} (code={code}): {message}")
 
 
@@ -150,7 +166,7 @@ def exchange_code_for_user_token(code: str, redirect_uri: str) -> dict:
         params={"client_id": app_id, "client_secret": app_secret, "redirect_uri": redirect_uri, "code": code},
         timeout=30,
     )
-    body = _raise_for_graph_error(response, "exchanging the authorization code")
+    body = raise_for_graph_error(response, "exchanging the authorization code")
     return {"access_token": body["access_token"], "expires_in": body.get("expires_in")}
 
 
@@ -179,7 +195,7 @@ def exchange_long_lived_token(short_lived_token: str) -> dict:
         },
         timeout=30,
     )
-    body = _raise_for_graph_error(response, "exchanging for a long-lived token")
+    body = raise_for_graph_error(response, "exchanging for a long-lived token")
     return {"access_token": body["access_token"], "expires_at": _compute_expiry(body.get("expires_in"))}
 
 
@@ -191,7 +207,7 @@ def list_pages(user_token: str) -> list[dict]:
     for each.
     """
     response = requests.get(f"{GRAPH_API_BASE}/me/accounts", params={"access_token": user_token}, timeout=30)
-    body = _raise_for_graph_error(response, "listing Pages")
+    body = raise_for_graph_error(response, "listing Pages")
     return body.get("data", [])
 
 
@@ -210,7 +226,7 @@ def get_instagram_business_account(page_id: str, page_token: str) -> str | None:
         params={"fields": "instagram_business_account", "access_token": page_token},
         timeout=30,
     )
-    body = _raise_for_graph_error(response, "looking up the linked Instagram Business account")
+    body = raise_for_graph_error(response, "looking up the linked Instagram Business account")
     ig_account = body.get("instagram_business_account")
     return ig_account.get("id") if ig_account else None
 

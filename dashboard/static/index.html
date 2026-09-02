@@ -357,6 +357,7 @@
           <option value="youtube">YouTube</option>
           <option value="tiktok">TikTok</option>
           <option value="twitter">Twitter/X</option>
+          <option value="facebook">Facebook</option>
         </select>
       </div>
 
@@ -409,6 +410,18 @@
         <div class="field">
           <label for="job-media-files">Media (optional — up to 4 images, or 1 video)</label>
           <input type="file" id="job-media-files" accept="image/*,video/*" multiple>
+        </div>
+      </div>
+
+      <div id="job-facebook-fields" style="display:none;">
+        <div class="field">
+          <label for="job-fb-text">Post text (optional if a media file is attached)</label>
+          <input type="text" id="job-fb-text" placeholder="What's on your mind?">
+        </div>
+
+        <div class="field">
+          <label for="job-fb-media-file">Media (optional — 1 photo or video)</label>
+          <input type="file" id="job-fb-media-file" accept="image/*,video/*">
         </div>
       </div>
 
@@ -665,8 +678,12 @@ const jobPlaylistIdInput = document.getElementById("job-playlist-id");
 const jobTwitterFields = document.getElementById("job-twitter-fields");
 const jobTextInput = document.getElementById("job-text");
 const jobMediaFilesInput = document.getElementById("job-media-files");
+const jobFacebookFields = document.getElementById("job-facebook-fields");
+const jobFbTextInput = document.getElementById("job-fb-text");
+const jobFbMediaFileInput = document.getElementById("job-fb-media-file");
 
 const VIDEO_UPLOAD_PLATFORMS = new Set(["youtube", "tiktok"]);
+const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook"]);
 
 function togglePlatformFields(platform) {
   const isVideo = VIDEO_UPLOAD_PLATFORMS.has(platform);
@@ -674,6 +691,7 @@ function togglePlatformFields(platform) {
   jobTitleField.style.display = isVideo ? "flex" : "none";
   jobYoutubeFields.style.display = platform === "youtube" ? "block" : "none";
   jobTwitterFields.style.display = platform === "twitter" ? "block" : "none";
+  jobFacebookFields.style.display = platform === "facebook" ? "block" : "none";
 }
 
 function resultBox(ok, msg) {
@@ -693,7 +711,9 @@ async function loadAccountOptions(platform) {
     jobAccountSelect.innerHTML = "";
     const placeholder = document.createElement("option");
     placeholder.value = "";
-    placeholder.textContent = platform === "tiktok" ? "Select an account…" : "No account (single-account fallback)";
+    placeholder.textContent = ACCOUNT_REQUIRED_PLATFORMS.has(platform)
+      ? "Select an account…"
+      : "No account (single-account fallback)";
     jobAccountSelect.appendChild(placeholder);
     accounts.filter(a => a.is_active).forEach(a => {
       const opt = document.createElement("option");
@@ -732,8 +752,14 @@ jobForm.addEventListener("submit", async (e) => {
     jobResult.innerHTML = resultBox(false, "Enter the tweet text.");
     return;
   }
-  if (platform === "tiktok" && !jobAccountSelect.value) {
-    jobResult.innerHTML = resultBox(false, "TikTok jobs require an account.");
+  const fbText = jobFbTextInput.value.trim();
+  const fbFile = jobFbMediaFileInput.files[0];
+  if (platform === "facebook" && !fbText && !fbFile) {
+    jobResult.innerHTML = resultBox(false, "Enter text and/or attach a media file.");
+    return;
+  }
+  if (ACCOUNT_REQUIRED_PLATFORMS.has(platform) && !jobAccountSelect.value) {
+    jobResult.innerHTML = resultBox(false, `${platform} jobs require an account.`);
     return;
   }
 
@@ -749,6 +775,9 @@ jobForm.addEventListener("submit", async (e) => {
       if (jobShortsCheckbox.checked) formData.append("shorts", "true");
       if (jobPlaylistIdInput.value.trim()) formData.append("playlist_id", jobPlaylistIdInput.value.trim());
     }
+  } else if (platform === "facebook") {
+    if (fbText) formData.append("text", fbText);
+    if (fbFile) formData.append("media_files", fbFile);
   } else {
     formData.append("text", text);
     Array.from(jobMediaFilesInput.files).forEach(f => formData.append("media_files", f));

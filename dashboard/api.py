@@ -145,13 +145,18 @@ _UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 
 # Only platforms scripts/enqueue_*_test.py already know how to build a
 # payload for. Other platforms (fake, ...) aren't offered through this flow.
-_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter"}
+_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter", "facebook"}
 
 # Platforms whose job payload is built from a single required video file
-# upload (video_path). Twitter (Phase 21 form support) isn't one of these:
-# its payload is text-first with optional media attachments — see
-# create_job below.
+# upload (video_path). Twitter (Phase 21) and Facebook (Phase 24) aren't
+# among these: their payloads are text-first with optional media
+# attachments — see create_job below.
 _VIDEO_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
+
+# Platforms with no single-account/env-var fallback (app/publishers/*.py
+# owns this rule; duplicated here only enough to give a friendlier 400
+# instead of letting the job get created and fail later in the worker).
+_ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook"}
 
 
 class JobOut(BaseModel):
@@ -313,7 +318,7 @@ async def create_job(
     thin HTTP front end over that same pattern, not a new way of
     constructing jobs.
 
-    Two payload shapes, by platform (_VIDEO_UPLOAD_PLATFORMS above):
+    Three payload shapes, by platform (_VIDEO_UPLOAD_PLATFORMS above):
       - youtube/tiktok: a single required video `file`. privacy/shorts/
         playlist_id (Phase 15) are youtube-only and passed straight through
         into the payload — app/publishers/youtube.py owns all the actual
@@ -325,6 +330,13 @@ async def create_job(
         as every other platform here. No file is required; threads aren't
         exposed through this form (script-only, see
         scripts/enqueue_twitter_test.py --mode thread).
+      - facebook (Phase 24): `text` and/or a single `media_files` entry —
+        unlike twitter, neither is independently required, only "at least
+        one of the two" (a media-only post with no caption is valid).
+        app/publishers/facebook.py auto-detects photo vs. video from the
+        file's type and owns all further validation; this route only
+        enforces the "at most one" cap up front so a bad multi-file upload
+        fails fast instead of saving files nobody will use.
     """
     if platform not in _SUPPORTED_PLATFORMS:
         raise HTTPException(
@@ -332,12 +344,19 @@ async def create_job(
             detail=f"Unsupported platform {platform!r}; must be one of {sorted(_SUPPORTED_PLATFORMS)}",
         )
 
+    uploaded_media_files = [mf for mf in media_files if mf.filename]
+
     if platform in _VIDEO_UPLOAD_PLATFORMS:
         if file is None or not file.filename:
             raise HTTPException(status_code=400, detail="No file uploaded")
-    else:  # twitter
+    elif platform == "twitter":
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="Missing required field: text")
+    else:  # facebook
+        if not (text and text.strip()) and not uploaded_media_files:
+            raise HTTPException(status_code=400, detail="Facebook posts need 'text' and/or a media file")
+        if len(uploaded_media_files) > 1:
+            raise HTTPException(status_code=400, detail="Facebook posts support at most one media file")
 
     account = None
     if account_id is not None:
@@ -351,11 +370,12 @@ async def create_job(
             )
         if not account.is_active:
             raise HTTPException(status_code=400, detail=f"Account {account_id} is inactive")
-    elif platform == "tiktok":
-        # Same rule app/publishers/tiktok.py enforces: no single-account
-        # fallback (see scripts/enqueue_tiktok_test.py --account being
-        # required, unlike YouTube's/Twitter's).
-        raise HTTPException(status_code=400, detail="TikTok jobs require an account (no single-account fallback)")
+    elif platform in _ACCOUNT_REQUIRED_PLATFORMS:
+        # Same rule the publisher itself enforces (app/publishers/tiktok.py,
+        # app/publishers/facebook.py): no single-account/env-var fallback —
+        # give a friendlier 400 here instead of letting the job get created
+        # and fail later in the worker.
+        raise HTTPException(status_code=400, detail=f"{platform} jobs require an account (no single-account fallback)")
 
     if platform in _VIDEO_UPLOAD_PLATFORMS:
         dest_path = await _save_upload(file)
@@ -375,14 +395,17 @@ async def create_job(
                 payload["shorts"] = True
             if playlist_id and playlist_id.strip():
                 payload["playlist_id"] = playlist_id.strip()
-    else:  # twitter
+    elif platform == "twitter":
         payload = {"text": text.strip()}
-        media_paths = []
-        for media_file in media_files:
-            if media_file.filename:
-                media_paths.append(str(await _save_upload(media_file)))
+        media_paths = [str(await _save_upload(mf)) for mf in uploaded_media_files]
         if media_paths:
             payload["media_paths"] = media_paths
+    else:  # facebook
+        payload = {}
+        if text and text.strip():
+            payload["text"] = text.strip()
+        if uploaded_media_files:
+            payload["media_paths"] = [str(await _save_upload(uploaded_media_files[0]))]
 
     job = Job(
         platform=platform,

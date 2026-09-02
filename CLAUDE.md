@@ -1193,6 +1193,124 @@ unit-tested without Redis or a worker running.
   6. Building the actual publish flow (photo/video upload, IG container/
      publish) is the natural next phase — not built yet, see "Scope" above.
 
+### Phase 24 (current)
+- **Facebook Pages publisher** (`app/publishers/facebook.py`) — the first
+  real `publish()` built on Phase 23's Meta OAuth foundation, built "ready
+  waiting for credentials" the same way (no real Meta App exists yet, so
+  everything is exercised only against fully mocked HTTP —
+  `tests/test_publisher_facebook.py`,
+  `tests/test_tasks_facebook_token_refresh.py`). Wired into
+  `app/tasks.py::_PUBLISHERS_BY_PLATFORM["facebook"]`; `graph-video.facebook.com`
+  is deprecated (per current developers.facebook.com docs) — every call goes
+  through `graph.facebook.com` (`meta.py`'s existing `GRAPH_API_BASE`,
+  v26.0).
+  - **No env-var single-account fallback**, per Phase 23's decision:
+    `_resolve_credentials` requires `account_credentials` (an `Account` row,
+    `page_id` + `page_token`, the shape `scripts/authorize_meta.py`
+    creates) and raises `PermanentError` if the job has no `account_id`.
+  - **Three payload shapes, auto-detected**: `{"text"}` alone posts to
+    `POST /<page_id>/feed`. `{"text"?, "media_paths": [one path]}` posts a
+    photo (`POST /<page_id>/photos`, multipart `source`) or a video
+    (resumable upload, below) depending on the single file's guessed MIME
+    type — no separate "kind" flag, same spirit as
+    `twitter.py`'s `_media_kind`. `text` is the caption for a photo, the
+    description for a video; both are optional when media is attached
+    (unlike Twitter, a caption-less media post is valid) — enforced by
+    `_validate_top_level_payload` (at least one of `text`/`media_paths`
+    required) rather than requiring `text` unconditionally.
+  - **Resumable video upload** (3 Graph API calls, endpoint shapes given
+    directly in the phase brief, not guessed):
+    1. `_start_upload_session`: `POST /<APP_ID>/uploads?file_name&
+       file_length&file_type&access_token=<PAGE_TOKEN>` ->
+       `{"id": "upload:<SESSION_ID>"}`. `APP_ID` comes from env
+       `META_APP_ID` (app-level, not per-account) — the only place this
+       module reads an env var directly, mirroring `meta.py`'s
+       `_app_credentials()`.
+    2. `_upload_video_binary`: `POST /upload:<SESSION_ID>`, header
+       `Authorization: OAuth <PAGE_TOKEN>` + `file_offset: <n>`, raw binary
+       body -> `{"h": "<FILE_HANDLE>"}`. **Interruption/resume**: if this
+       fails partway (a network error, or a transient Graph error),
+       `_get_upload_offset` (`GET /upload:<SESSION_ID>`, same `OAuth`
+       header) asks how many bytes the server actually received, and the
+       POST is retried starting from that byte instead of restarting the
+       whole file, up to `_MAX_UPLOAD_ATTEMPTS` (3) attempts total.
+       **`TokenExpiredError` is deliberately excluded from this retry
+       loop** (it's a `TransientError` subclass, so it would otherwise be
+       caught by the same `except` clause as an ordinary network blip) — it
+       must propagate to `app/tasks.py` unrelabeled so the reactive-refresh
+       path below actually runs, not get repackaged as a generic
+       `TransientError` after exhausting upload retries.
+    3. `_publish_video`: `POST /<page_id>/videos`,
+       `fbuploader_video_file_chunk=<FILE_HANDLE>` + `title`/`description`
+       + `access_token=<PAGE_TOKEN>` -> `{"id": "<video_id>"}` — the video
+       only actually goes live at this step; steps 1-2 alone publish
+       nothing.
+    Access token for all three steps and both photo/text calls is uniformly
+    the Page token (`page_token`) — the brief left this token choice open
+    ("if any detail conflicts with what you know, ask me instead of
+    silently choosing"); using the one credential this module already has
+    for every Page-scoped call is consistent and doesn't conflict with the
+    documented shapes, so it wasn't treated as a case needing to ask.
+  - **Error classification, extended from `meta.py` rather than
+    duplicated**: `app/publishers/meta.py`'s `_raise_for_graph_error` was
+    renamed to `raise_for_graph_error` (no longer module-private — it's a
+    cross-module contract now) and gained a `token_invalid_error_class`
+    parameter (default `PermanentError`, unchanged behavior for every
+    existing call site in `meta.py`, including `refresh_stored_credentials`
+    — its own tests were untouched by this). `facebook.py` calls it with
+    `token_invalid_error_class=TokenExpiredError` on every publish-time
+    Graph call, so a `code=190` (`OAuthException`) error raised while
+    actually posting content becomes `TokenExpiredError` instead of a plain
+    `PermanentError` — everything else (429/5xx/rate-limit-code ->
+    `TransientError`, other 4xx -> `PermanentError`) is unchanged from
+    `meta.py`'s existing table.
+  - **Reactive token refresh wired for free**: `app/tasks.py`'s
+    `_TOKEN_REFRESH_MODULES_BY_PLATFORM["facebook"]` already pointed at
+    `meta.py` (Phase 23, for the proactive Beat refresh) — since
+    `_handle_token_expired` (Phase 21) is already generic over any platform
+    whose module exposes `refresh_stored_credentials`, wiring
+    `facebook.py` to raise `TokenExpiredError` was the *only* change needed
+    to get the same refresh-persist-retry-once behavior Twitter has; no
+    edits to `app/tasks.py`'s refresh logic itself were required. Confirmed
+    end-to-end (refresh succeeds and retries; refresh token permanently
+    invalid deactivates the account and alerts; a transient refresh error
+    or no `account_id` falls back to normal backoff) by
+    `tests/test_tasks_facebook_token_refresh.py`, modeled directly on
+    `tests/test_tasks_twitter_token_refresh.py`.
+- **Dashboard NEW JOB form**: `facebook` added to `_SUPPORTED_PLATFORMS`
+  and to `_ACCOUNT_REQUIRED_PLATFORMS` (`dashboard/api.py`, alongside
+  `tiktok` — both have no single-account fallback, so the route now gives a
+  friendly 400 instead of letting the job get created and fail later in the
+  worker). Facebook's fields mirror Twitter's shape (`text` +
+  optional media) but with different requirements: at least one of `text`/a
+  single media file must be present (neither is independently required),
+  and at most one media file is accepted (checked before upload, so a
+  bad multi-file selection fails fast instead of writing files nobody will
+  use) — `app/publishers/facebook.py` still owns the actual photo-vs-video
+  detection and every further validation. `dashboard/static/index.html`
+  gained a matching `#job-facebook-fields` block (text input + single-file
+  input, shown only when `platform=facebook`) and reuses the same
+  "select an account" placeholder Twitter/TikTok already had, generalized
+  into `ACCOUNT_REQUIRED_PLATFORMS` on the frontend to match the backend.
+- `scripts/enqueue_facebook_test.py` (new, modeled on
+  `enqueue_twitter_test.py`) — `--mode text|photo|video`, `--file` for
+  photo/video, `--account NAME` **required** (no single-account fallback,
+  unlike Twitter's/YouTube's equivalent scripts). Dispatches immediately
+  via the normal queue.
+
+  **When a real Meta App and credentials arrive** (same checklist as Phase
+  23, now actually exercisable end-to-end):
+  1. Complete Phase 23's checklist (`scripts/authorize_meta.py`) to get a
+     `facebook` Account row with a real `page_id`/`page_token`.
+  2. Set `META_APP_ID` in `.env` if not already set (needed for the
+     resumable video upload session, step 1 above).
+  3. Test with `python -m scripts.enqueue_facebook_test --mode text
+     --account "Main Page"`, then photo/video modes once that works.
+  4. Watch a reactive refresh happen naturally the first time the stored
+     Page token is rejected mid-publish (or force one by trying an
+     intentionally stale token), and confirm rotation persists correctly
+     onto the `Account` row (`scripts/show_accounts.py`).
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)
