@@ -356,6 +356,7 @@
           <option value="">Select platform…</option>
           <option value="youtube">YouTube</option>
           <option value="tiktok">TikTok</option>
+          <option value="twitter">Twitter/X</option>
         </select>
       </div>
 
@@ -366,12 +367,12 @@
         </select>
       </div>
 
-      <div class="field">
+      <div class="field" id="job-video-field">
         <label for="job-file">Video file</label>
-        <input type="file" id="job-file" accept="video/*" required>
+        <input type="file" id="job-file" accept="video/*">
       </div>
 
-      <div class="field">
+      <div class="field" id="job-title-field">
         <label for="job-title">Title (optional)</label>
         <input type="text" id="job-title" placeholder="Auto-generated if left blank">
       </div>
@@ -396,6 +397,18 @@
         <div class="field">
           <label for="job-playlist-id">Playlist ID (optional)</label>
           <input type="text" id="job-playlist-id" placeholder="e.g. PLxxxxxxxxxxxxxxxx">
+        </div>
+      </div>
+
+      <div id="job-twitter-fields" style="display:none;">
+        <div class="field">
+          <label for="job-text">Tweet text</label>
+          <input type="text" id="job-text" placeholder="What's happening?" maxlength="280">
+        </div>
+
+        <div class="field">
+          <label for="job-media-files">Media (optional — up to 4 images, or 1 video)</label>
+          <input type="file" id="job-media-files" accept="image/*,video/*" multiple>
         </div>
       </div>
 
@@ -601,7 +614,7 @@ function showTab(name) {
   if (name === "accounts") loadAccountsTab();
   if (name === "newjob") {
     loadAccountOptions(jobPlatformSelect.value);
-    toggleYoutubeFields(jobPlatformSelect.value);
+    togglePlatformFields(jobPlatformSelect.value);
   }
 }
 
@@ -638,7 +651,9 @@ async function loadAccountsTab() {
 
 const jobPlatformSelect = document.getElementById("job-platform");
 const jobAccountSelect = document.getElementById("job-account");
+const jobVideoField = document.getElementById("job-video-field");
 const jobFileInput = document.getElementById("job-file");
+const jobTitleField = document.getElementById("job-title-field");
 const jobTitleInput = document.getElementById("job-title");
 const jobForm = document.getElementById("new-job-form");
 const jobResult = document.getElementById("job-result");
@@ -647,9 +662,18 @@ const jobYoutubeFields = document.getElementById("job-youtube-fields");
 const jobPrivacySelect = document.getElementById("job-privacy");
 const jobShortsCheckbox = document.getElementById("job-shorts");
 const jobPlaylistIdInput = document.getElementById("job-playlist-id");
+const jobTwitterFields = document.getElementById("job-twitter-fields");
+const jobTextInput = document.getElementById("job-text");
+const jobMediaFilesInput = document.getElementById("job-media-files");
 
-function toggleYoutubeFields(platform) {
+const VIDEO_UPLOAD_PLATFORMS = new Set(["youtube", "tiktok"]);
+
+function togglePlatformFields(platform) {
+  const isVideo = VIDEO_UPLOAD_PLATFORMS.has(platform);
+  jobVideoField.style.display = isVideo ? "flex" : "none";
+  jobTitleField.style.display = isVideo ? "flex" : "none";
   jobYoutubeFields.style.display = platform === "youtube" ? "block" : "none";
+  jobTwitterFields.style.display = platform === "twitter" ? "block" : "none";
 }
 
 function resultBox(ok, msg) {
@@ -684,7 +708,7 @@ async function loadAccountOptions(platform) {
 
 jobPlatformSelect.addEventListener("change", () => {
   loadAccountOptions(jobPlatformSelect.value);
-  toggleYoutubeFields(jobPlatformSelect.value);
+  togglePlatformFields(jobPlatformSelect.value);
 });
 
 jobForm.addEventListener("submit", async (e) => {
@@ -692,14 +716,20 @@ jobForm.addEventListener("submit", async (e) => {
   jobResult.innerHTML = "";
 
   const platform = jobPlatformSelect.value;
+  const isVideo = VIDEO_UPLOAD_PLATFORMS.has(platform);
   const file = jobFileInput.files[0];
+  const text = jobTextInput.value.trim();
 
   if (!platform) {
     jobResult.innerHTML = resultBox(false, "Select a platform.");
     return;
   }
-  if (!file) {
+  if (isVideo && !file) {
     jobResult.innerHTML = resultBox(false, "Choose a video file.");
+    return;
+  }
+  if (platform === "twitter" && !text) {
+    jobResult.innerHTML = resultBox(false, "Enter the tweet text.");
     return;
   }
   if (platform === "tiktok" && !jobAccountSelect.value) {
@@ -709,13 +739,19 @@ jobForm.addEventListener("submit", async (e) => {
 
   const formData = new FormData();
   formData.append("platform", platform);
-  formData.append("file", file);
   if (jobAccountSelect.value) formData.append("account_id", jobAccountSelect.value);
-  if (jobTitleInput.value.trim()) formData.append("title", jobTitleInput.value.trim());
-  if (platform === "youtube") {
-    formData.append("privacy", jobPrivacySelect.value);
-    if (jobShortsCheckbox.checked) formData.append("shorts", "true");
-    if (jobPlaylistIdInput.value.trim()) formData.append("playlist_id", jobPlaylistIdInput.value.trim());
+
+  if (isVideo) {
+    formData.append("file", file);
+    if (jobTitleInput.value.trim()) formData.append("title", jobTitleInput.value.trim());
+    if (platform === "youtube") {
+      formData.append("privacy", jobPrivacySelect.value);
+      if (jobShortsCheckbox.checked) formData.append("shorts", "true");
+      if (jobPlaylistIdInput.value.trim()) formData.append("playlist_id", jobPlaylistIdInput.value.trim());
+    }
+  } else {
+    formData.append("text", text);
+    Array.from(jobMediaFilesInput.files).forEach(f => formData.append("media_files", f));
   }
 
   jobSubmitBtn.disabled = true;
@@ -725,7 +761,7 @@ jobForm.addEventListener("submit", async (e) => {
     jobResult.innerHTML = resultBox(true, `Job #${created.id} created and dispatched.`);
     jobForm.reset();
     loadAccountOptions("");
-    toggleYoutubeFields("");
+    togglePlatformFields("");
     showTab("monitor");
     refresh();
   } catch (err) {

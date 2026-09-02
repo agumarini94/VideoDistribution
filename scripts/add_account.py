@@ -11,6 +11,13 @@ Run it from the project root with:
         client_id=xxx client_secret=yyy access_token=zzz refresh_token=www \\
         expires_at=2026-09-01T14:00:00+00:00
 
+    # Meta (Phase 23 — see app/publishers/meta.py). Normally created via
+    # scripts/authorize_meta.py instead of by hand, since it needs a Page
+    # token + (for instagram) a discovered ig_user_id, not just a token pair:
+    python -m scripts.add_account --platform facebook --name "Main Page" \\
+        page_id=xxx page_token=yyy page_name="Main Page" user_token=zzz \\
+        user_token_expires_at=2026-11-01T14:00:00+00:00
+
 Credentials are given as any number of key=value pairs; which keys are
 expected depends on the platform's publisher (e.g. app/publishers/twitter.py
 expects client_id / client_secret / access_token / refresh_token, plus an

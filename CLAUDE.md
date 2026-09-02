@@ -1023,10 +1023,24 @@ unit-tested without Redis or a worker running.
   modes, `--account NAME` to link an `Account` row (omit for the env-var
   single-account fallback). Dispatches immediately via the normal queue,
   same as the youtube script.
-- **Dashboard NEW JOB form: no changes needed.** Twitter was never in
-  `dashboard/api.py`'s `_SUPPORTED_UPLOAD_PLATFORMS` (youtube/tiktok
-  only, both video-upload flows) — a single tweet/thread doesn't fit that
-  upload-a-file UI shape, and Phase 21 doesn't change that.
+- **Dashboard NEW JOB form**: initially shipped with Twitter absent (it
+  wasn't in `dashboard/api.py`'s upload-platforms set, and a single
+  tweet/thread doesn't fit a upload-a-file UI shape the way youtube/tiktok
+  do) — added afterward once it was noticed the form silently only offered
+  youtube/tiktok despite twitter accounts existing and working fine via
+  scripts. `_SUPPORTED_UPLOAD_PLATFORMS` split into `_SUPPORTED_PLATFORMS`
+  (all three) and `_VIDEO_UPLOAD_PLATFORMS` (youtube/tiktok only, the ones
+  that require a single video `file`); `create_job` now also accepts an
+  optional `text` field and an optional `media_files` list (0 or more).
+  Twitter branch builds `{"text": ..., "media_paths": [...]}` — same
+  "publisher owns validation" split as every other platform here:
+  `app/publishers/twitter.py` still owns the 4-images-or-1-video cap and
+  file-type checks, the route doesn't duplicate them. No file is required
+  for twitter; account selection reuses the existing
+  "no account (single-account fallback)" placeholder since twitter, like
+  youtube, supports the env-var fallback. Threads are intentionally **not**
+  exposed through this form — script-only
+  (`scripts/enqueue_twitter_test.py --mode thread`).
 
   **When real X OAuth 2.0 credentials arrive**, replacing the old OAuth
   1.0a `X_API_KEY`/`X_API_SECRET`/`X_ACCESS_TOKEN`/`X_ACCESS_TOKEN_SECRET`
@@ -1041,6 +1055,143 @@ unit-tested without Redis or a worker running.
   3. Watch the first proactive refresh (`refresh_expiring_tokens`, every
      30 min) or trigger one manually to confirm rotation persists
      correctly onto the `Account` row (`scripts/show_accounts.py`).
+
+### Phase 23 (current)
+- **Meta (Facebook + Instagram) OAuth foundation** — built "ready waiting for
+  credentials," same posture as the Twitter publisher before real X
+  Developer Portal credentials existed: `META_APP_ID`/`META_APP_SECRET`
+  don't exist yet, nothing reads them at import time, every code path that
+  needs them raises a clear `PermanentError` instead of crashing, and the
+  whole thing is exercised only against fully mocked HTTP
+  (`tests/test_publisher_meta.py`, `tests/test_authorize_meta.py`,
+  `tests/test_tasks_meta_token_refresh.py`).
+  - **Scope is OAuth mechanics only — no publish() yet.** `app/publishers/meta.py`
+    has no `publish()` function, and `app/tasks.py::_PUBLISHERS_BY_PLATFORM`
+    has no `"facebook"`/`"instagram"` entry — jobs on those platforms
+    currently fall back to the fake publisher, same as any platform without
+    a real integration. Building the actual content-posting flow (photo/
+    video upload to a Page, the two-step IG container/publish flow) is a
+    natural next phase once this foundation is exercised against a real
+    Meta App.
+  - **Graph API version**: `v26.0` (current at the time this was built —
+    Meta deprecates versions on a schedule; this will need bumping
+    eventually, but as a deliberate code change, not an env-configurable
+    knob). `GRAPH_API_BASE`/`AUTHORIZE_URL` constants in
+    `app/publishers/meta.py`.
+  - **OAuth chain** (`app/publishers/meta.py`, endpoint shapes given
+    directly per the phase brief, not guessed):
+    1. Browser dialog (`scripts/authorize_meta.py` opens this):
+       `GET /v26.0/dialog/oauth?client_id&redirect_uri&state&scope` ->
+       redirects back with `?code=...&state=...`.
+    2. `exchange_code_for_user_token(code, redirect_uri)` — code -> a
+       short-lived user token.
+    3. `exchange_long_lived_token(short_lived_token)` — short-lived -> a
+       long-lived (~60 day) user token. **This is also how a long-lived
+       token gets refreshed later** — Meta has no separate rotating
+       refresh_token the way Twitter does, or a distinct refresh endpoint
+       like TikTok's/YouTube's; you just re-exchange the current token
+       before it expires.
+    4. `list_pages(user_token)` — `GET /me/accounts` -> every Page the user
+       manages plus a Page-scoped access token for each. Page tokens minted
+       from a long-lived user token are documented to not expire in
+       practice — **not independently verified against a live token yet**,
+       flagged in-code rather than asserted as fact.
+    5. `get_instagram_business_account(page_id, page_token)` — `GET
+       /<page_id>?fields=instagram_business_account` -> the linked IG
+       Business account's id, or `None` (not an error) if the Page has none
+       linked.
+  - **Credential shapes** (`Account.credentials`, both created by
+    `scripts/authorize_meta.py`):
+    - platform `"facebook"`: `{page_id, page_token, page_name, user_token,
+      user_token_expires_at}`.
+    - platform `"instagram"`: `{ig_user_id, page_id, page_token, user_token,
+      user_token_expires_at}`.
+    Both carry `user_token` + `page_id`, which is all
+    `refresh_stored_credentials()` needs — it works unchanged for either
+    platform's Account row.
+  - **Graph API error classification** (`_raise_for_graph_error`): unlike
+    TikTok's Content Posting API, Graph API always pairs an
+    `{"error": {...}}` body with a non-2xx HTTP status (never reports
+    errors as HTTP 200). HTTP 429/5xx, or `error.code` in `{1, 2, 4, 17, 32,
+    613}` (Meta's documented API/rate-limit codes) -> `TransientError`;
+    `code=190` (`OAuthException` — invalid/expired/revoked token) and every
+    other 4xx -> `PermanentError`. Not independently verified against live
+    responses yet, same caveat as every other publisher's error-code table
+    in this package before real credentials exist.
+  - **Proactive token refresh, registered in `app/tasks.py`**:
+    `_TOKEN_REFRESH_MODULES_BY_PLATFORM` gets `"facebook"` and
+    `"instagram"` entries (both pointing at `app/publishers/meta.py`, same
+    module for either platform) so the existing `refresh_expiring_tokens`
+    Beat task (every 30 min, Phase 8) also manages Meta accounts. Refresh
+    window is **7 days** before expiry
+    (`_TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM["facebook"/"instagram"]`) —
+    far wider than the 45-minute default, since Meta's long-lived tokens
+    last ~60 days. On refresh, `refresh_stored_credentials` re-exchanges the
+    stored `user_token` and re-fetches the Page token for `page_id` (found
+    by matching `page_id` in a fresh `list_pages()` call); a `PermanentError`
+    (invalid token, or the Page no longer accessible) deactivates the
+    Account and alerts via the same `_deactivate_and_alert_for_reauth`
+    helper Twitter/TikTok/YouTube use, pointing at
+    `scripts.authorize_meta` in `_REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM`.
+    **No reactive refresh-on-error path** (unlike Twitter's
+    `TokenExpiredError` handling in `publish_job`) — there's no `publish()`
+    to ever raise it yet.
+  - **Meta tokens don't rotate single-use like Twitter's**: the same
+    long-lived `user_token` keeps working to mint new ones via
+    `exchange_long_lived_token`, so — unlike `twitter.py` — there's no
+    "lost the newly-rotated token, stranded the account" risk from calling
+    `refresh_stored_credentials` more than once against the same starting
+    credentials.
+- `scripts/authorize_meta.py` — interactive OAuth, modeled on
+  `scripts/authorize_tiktok.py`'s local-redirect-listener + state-check
+  shape: opens a browser for the Facebook Login dialog, waits for the
+  callback, runs the full exchange chain above, lists the user's Pages
+  (prompting the operator to choose one if there's more than one via
+  `_choose_page`), looks up the linked Instagram Business account, and
+  upserts Account row(s) via the same `upsert_account` helper as every
+  other authorize script. If the chosen Page has no linked Instagram
+  Business account, only the `facebook` Account is created and a warning is
+  printed explaining the Business-account + Page-link requirement (convert
+  to Business/Creator, link it to the Page) — nothing crashes, the flow
+  just stops one Account row short. `--account NAME` overrides the Account
+  name (default: the Page's own name) for cases where multiple client Pages
+  share a display name; re-running with the same resulting name rotates
+  that Account's credentials in place. The chain after a valid callback is
+  split into `_run_authorization(code, redirect_uri, account_name)`
+  specifically so it's testable without a real browser or local HTTP
+  server — `tests/test_authorize_meta.py` monkeypatches the four OAuth-chain
+  functions and calls it directly.
+  - **Redirect URI / localhost caveat — UNVERIFIED**: unlike TikTok's
+    Developer Portal (which rejects localhost/127.0.0.1 outright, requiring
+    the public-forwarder-page trick from Phase 10), Meta's App Dashboard is
+    *documented* to allow `http://localhost` redirect URIs for an app still
+    in Development mode. This script assumes that and binds its one-shot
+    callback server directly to `META_REDIRECT_URI`'s host:port — no
+    forwarder page. **If the real Dashboard rejects a localhost URI once
+    `META_APP_ID` exists, this needs the same forwarder-page trick as
+    TikTok** — treat that as a follow-up, not a sign the script is broken.
+
+  **When Meta credentials arrive:**
+  1. Create/select an app at developers.facebook.com/apps, add the Facebook
+     Login product, and register a redirect URI matching
+     `META_REDIRECT_URI` (see the localhost caveat above — may need the
+     TikTok-style forwarder page instead).
+  2. Request the `pages_manage_posts`, `pages_show_list`,
+     `pages_read_engagement`, `instagram_basic`, `instagram_content_publish`,
+     `business_management` permissions — most need App Review before they
+     work for anyone other than the app's own admins/developers/testers.
+  3. Set `META_APP_ID`, `META_APP_SECRET`, `META_REDIRECT_URI` in `.env`.
+  4. Run `python -m scripts.authorize_meta [--account NAME]`. For Instagram
+     publishing, make sure the target IG account is Business/Creator and
+     linked to the Facebook Page *before* running this — otherwise only the
+     `facebook` Account gets created (re-run after linking to add the
+     `instagram` one).
+  5. Confirm with `scripts/show_accounts.py`, then watch a proactive refresh
+     (`refresh_expiring_tokens`, every 30 min, 7-day window) or trigger one
+     manually to confirm re-exchange persists correctly onto the Account
+     rows.
+  6. Building the actual publish flow (photo/video upload, IG container/
+     publish) is the natural next phase — not built yet, see "Scope" above.
 
 ## Monitoring dashboard (extra, not in the spec)
 

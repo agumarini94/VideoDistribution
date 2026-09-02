@@ -144,9 +144,14 @@ def get_db():
 _UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 
 # Only platforms scripts/enqueue_*_test.py already know how to build a
-# payload for. Other platforms (fake, twitter, ...) don't take file uploads
-# through this flow.
-_SUPPORTED_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
+# payload for. Other platforms (fake, ...) aren't offered through this flow.
+_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter"}
+
+# Platforms whose job payload is built from a single required video file
+# upload (video_path). Twitter (Phase 21 form support) isn't one of these:
+# its payload is text-first with optional media attachments — see
+# create_job below.
+_VIDEO_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
 
 
 class JobOut(BaseModel):
@@ -280,38 +285,59 @@ def list_accounts(platform: str | None = None, db: Session = Depends(get_db)):
     return [AccountOut.from_account(account) for account in accounts]
 
 
+async def _save_upload(file: UploadFile) -> Path:
+    _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(file.filename).name
+    dest_path = _UPLOADS_DIR / f"{uuid.uuid4().hex}_{safe_name}"
+    dest_path.write_bytes(await file.read())
+    return dest_path
+
+
 @app.post("/api/jobs", response_model=JobCreateOut, status_code=201)
 async def create_job(
     platform: str = Form(...),
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(default=None),
+    media_files: list[UploadFile] = File(default=[]),
     account_id: int | None = Form(default=None),
     title: str | None = Form(default=None),
+    text: str | None = Form(default=None),
     privacy: str | None = Form(default=None),
     shorts: bool = Form(default=False),
     playlist_id: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     """
-    Upload-driven job creation for the dashboard's "New Job" tab. Builds the
-    same payload shape scripts/enqueue_tiktok_test.py and
-    enqueue_youtube_test.py do, then dispatches exactly like they do
-    (publish_job.delay) — this route is a thin HTTP front end over that same
-    pattern, not a new way of constructing jobs.
+    Job creation for the dashboard's "New Job" tab. Builds the same payload
+    shape the corresponding scripts/enqueue_*_test.py script does, then
+    dispatches exactly like they do (publish_job.delay) — this route is a
+    thin HTTP front end over that same pattern, not a new way of
+    constructing jobs.
 
-    privacy/shorts/playlist_id (Phase 15) are youtube-only and passed
-    straight through into the payload — app/publishers/youtube.py owns all
-    the actual validation (Shorts duration/aspect-ratio, playlist
-    assignment), this route does no validation of its own beyond what the
-    generic upload flow already does.
+    Two payload shapes, by platform (_VIDEO_UPLOAD_PLATFORMS above):
+      - youtube/tiktok: a single required video `file`. privacy/shorts/
+        playlist_id (Phase 15) are youtube-only and passed straight through
+        into the payload — app/publishers/youtube.py owns all the actual
+        validation (Shorts duration/aspect-ratio, playlist assignment).
+      - twitter (Phase 21): a required `text` field plus optional
+        `media_files` (0 or more) — app/publishers/twitter.py owns the
+        4-images-or-1-video-never-mixed cap and file-type validation, same
+        "publisher owns validation, this route doesn't duplicate it" split
+        as every other platform here. No file is required; threads aren't
+        exposed through this form (script-only, see
+        scripts/enqueue_twitter_test.py --mode thread).
     """
-    if platform not in _SUPPORTED_UPLOAD_PLATFORMS:
+    if platform not in _SUPPORTED_PLATFORMS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported platform {platform!r}; must be one of {sorted(_SUPPORTED_UPLOAD_PLATFORMS)}",
+            detail=f"Unsupported platform {platform!r}; must be one of {sorted(_SUPPORTED_PLATFORMS)}",
         )
 
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
+    if platform in _VIDEO_UPLOAD_PLATFORMS:
+        if file is None or not file.filename:
+            raise HTTPException(status_code=400, detail="No file uploaded")
+    else:  # twitter
+        if not text or not text.strip():
+            raise HTTPException(status_code=400, detail="Missing required field: text")
 
     account = None
     if account_id is not None:
@@ -328,30 +354,35 @@ async def create_job(
     elif platform == "tiktok":
         # Same rule app/publishers/tiktok.py enforces: no single-account
         # fallback (see scripts/enqueue_tiktok_test.py --account being
-        # required, unlike YouTube's).
+        # required, unlike YouTube's/Twitter's).
         raise HTTPException(status_code=400, detail="TikTok jobs require an account (no single-account fallback)")
 
-    _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(file.filename).name
-    dest_path = _UPLOADS_DIR / f"{uuid.uuid4().hex}_{safe_name}"
-    dest_path.write_bytes(await file.read())
+    if platform in _VIDEO_UPLOAD_PLATFORMS:
+        dest_path = await _save_upload(file)
+        job_title = title.strip() if title and title.strip() else (
+            f"Distribution engine upload {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+        )
 
-    job_title = title.strip() if title and title.strip() else (
-        f"Distribution engine upload {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
-    )
-
-    if platform == "tiktok":
-        payload = {"video_path": str(dest_path), "title": job_title}
-    else:
-        payload = {
-            "video_path": str(dest_path),
-            "title": job_title,
-            "privacy": privacy or "private",
-        }
-        if shorts:
-            payload["shorts"] = True
-        if playlist_id and playlist_id.strip():
-            payload["playlist_id"] = playlist_id.strip()
+        if platform == "tiktok":
+            payload = {"video_path": str(dest_path), "title": job_title}
+        else:
+            payload = {
+                "video_path": str(dest_path),
+                "title": job_title,
+                "privacy": privacy or "private",
+            }
+            if shorts:
+                payload["shorts"] = True
+            if playlist_id and playlist_id.strip():
+                payload["playlist_id"] = playlist_id.strip()
+    else:  # twitter
+        payload = {"text": text.strip()}
+        media_paths = []
+        for media_file in media_files:
+            if media_file.filename:
+                media_paths.append(str(await _save_upload(media_file)))
+        if media_paths:
+            payload["media_paths"] = media_paths
 
     job = Job(
         platform=platform,

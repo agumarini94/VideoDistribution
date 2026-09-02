@@ -27,6 +27,7 @@ from app.exceptions import PermanentError, TokenExpiredError, TransientError
 from app.models import Account, Job, JobStatus, WebhookEvent
 from app.notifications import send_alert
 from app.publishers import fake as fake_publisher
+from app.publishers import meta as meta_publisher
 from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
@@ -48,10 +49,15 @@ _PUBLISHERS_BY_PLATFORM = {
 # (token_expires_within / refresh_stored_credentials), used by
 # refresh_expiring_tokens (Phase 8) AND (Phase 21, twitter only so far) the
 # reactive TokenExpiredError -> refresh -> retry path in publish_job below.
+# facebook/instagram (Phase 23) only participate in the proactive Beat
+# refresh below — there's no publish() for them yet to ever raise
+# TokenExpiredError, since app/publishers/meta.py is OAuth-foundation only.
 _TOKEN_REFRESH_MODULES_BY_PLATFORM = {
     "youtube": youtube_publisher,
     "tiktok": tiktok_publisher,
     "twitter": twitter_publisher,
+    "facebook": meta_publisher,
+    "instagram": meta_publisher,
 }
 
 # Human-readable re-authorization instructions per platform, named in the
@@ -69,6 +75,11 @@ _REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM = {
         'python -m scripts.add_account --platform twitter --name "{name}" '
         "client_id=... client_secret=... access_token=... refresh_token=... expires_at=..."
     ),
+    "facebook": 'python -m scripts.authorize_meta --account "{name}" (re-links the Page and refreshes its user token)',
+    "instagram": (
+        'python -m scripts.authorize_meta --account "{name}" (re-authorizing the linked '
+        "Facebook Page refreshes this Instagram account's credentials too)"
+    ),
 }
 
 # How far ahead of actual expiry refresh_expiring_tokens proactively
@@ -79,6 +90,11 @@ _REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM = {
 _TOKEN_REFRESH_WINDOW_SECONDS = 45 * 60
 _TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM = {
     "twitter": 40 * 60,
+    # Meta long-lived user tokens last ~60 days — far longer than any other
+    # platform here, so they get a much wider proactive window (7 days)
+    # instead of the 45-minute default.
+    "facebook": 7 * 24 * 60 * 60,
+    "instagram": 7 * 24 * 60 * 60,
 }
 
 
