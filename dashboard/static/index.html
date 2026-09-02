@@ -358,6 +358,7 @@
           <option value="tiktok">TikTok</option>
           <option value="twitter">Twitter/X</option>
           <option value="facebook">Facebook</option>
+          <option value="instagram">Instagram</option>
         </select>
       </div>
 
@@ -422,6 +423,22 @@
         <div class="field">
           <label for="job-fb-media-file">Media (optional — 1 photo or video)</label>
           <input type="file" id="job-fb-media-file" accept="image/*,video/*">
+        </div>
+      </div>
+
+      <div id="job-instagram-fields" style="display:none;">
+        <p class="readonly-note" style="margin-top:0;">
+          Requires Cloudflare R2 configured (R2_* in .env) — Meta downloads media from a public URL, so this
+          upload must stage successfully to R2 or job creation will be rejected.
+        </p>
+        <div class="field">
+          <label for="job-ig-text">Caption (optional)</label>
+          <input type="text" id="job-ig-text" placeholder="Write a caption…">
+        </div>
+
+        <div class="field">
+          <label for="job-ig-media-file">Media (required — 1 photo or video)</label>
+          <input type="file" id="job-ig-media-file" accept="image/*,video/*">
         </div>
       </div>
 
@@ -681,9 +698,12 @@ const jobMediaFilesInput = document.getElementById("job-media-files");
 const jobFacebookFields = document.getElementById("job-facebook-fields");
 const jobFbTextInput = document.getElementById("job-fb-text");
 const jobFbMediaFileInput = document.getElementById("job-fb-media-file");
+const jobInstagramFields = document.getElementById("job-instagram-fields");
+const jobIgTextInput = document.getElementById("job-ig-text");
+const jobIgMediaFileInput = document.getElementById("job-ig-media-file");
 
 const VIDEO_UPLOAD_PLATFORMS = new Set(["youtube", "tiktok"]);
-const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook"]);
+const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram"]);
 
 function togglePlatformFields(platform) {
   const isVideo = VIDEO_UPLOAD_PLATFORMS.has(platform);
@@ -692,6 +712,7 @@ function togglePlatformFields(platform) {
   jobYoutubeFields.style.display = platform === "youtube" ? "block" : "none";
   jobTwitterFields.style.display = platform === "twitter" ? "block" : "none";
   jobFacebookFields.style.display = platform === "facebook" ? "block" : "none";
+  jobInstagramFields.style.display = platform === "instagram" ? "block" : "none";
 }
 
 function resultBox(ok, msg) {
@@ -758,6 +779,11 @@ jobForm.addEventListener("submit", async (e) => {
     jobResult.innerHTML = resultBox(false, "Enter text and/or attach a media file.");
     return;
   }
+  const igFile = jobIgMediaFileInput.files[0];
+  if (platform === "instagram" && !igFile) {
+    jobResult.innerHTML = resultBox(false, "Attach a media file (Instagram has no text-only posts).");
+    return;
+  }
   if (ACCOUNT_REQUIRED_PLATFORMS.has(platform) && !jobAccountSelect.value) {
     jobResult.innerHTML = resultBox(false, `${platform} jobs require an account.`);
     return;
@@ -778,6 +804,10 @@ jobForm.addEventListener("submit", async (e) => {
   } else if (platform === "facebook") {
     if (fbText) formData.append("text", fbText);
     if (fbFile) formData.append("media_files", fbFile);
+  } else if (platform === "instagram") {
+    const igText = jobIgTextInput.value.trim();
+    if (igText) formData.append("text", igText);
+    formData.append("media_files", igFile);
   } else {
     formData.append("text", text);
     Array.from(jobMediaFilesInput.files).forEach(f => formData.append("media_files", f));

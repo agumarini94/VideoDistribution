@@ -73,6 +73,13 @@ class Settings:
     r2_secret_access_key: str = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
     r2_bucket_name: str = os.getenv("R2_BUCKET_NAME", "").strip()
 
+    # Public base URL of the R2 bucket (its r2.dev URL, or a custom domain
+    # if one is ever attached), used by app/storage.py::upload_file to build
+    # a publicly-fetchable URL for an uploaded file (public_url = this +
+    # "/" + key). Only needed for upload_file; generate_signed_url doesn't
+    # depend on it.
+    r2_public_base_url: str = os.getenv("R2_PUBLIC_BASE_URL", "").strip()
+
     def __post_init__(self) -> None:
         if not self.database_url:
             raise RuntimeError(

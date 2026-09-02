@@ -28,6 +28,7 @@ from app.models import Account, Job, JobStatus, WebhookEvent
 from app.notifications import send_alert
 from app.publishers import facebook as facebook_publisher
 from app.publishers import fake as fake_publisher
+from app.publishers import instagram as instagram_publisher
 from app.publishers import meta as meta_publisher
 from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
@@ -45,15 +46,16 @@ _PUBLISHERS_BY_PLATFORM = {
     "twitter": twitter_publisher.publish,
     "tiktok": tiktok_publisher.publish,
     "facebook": facebook_publisher.publish,
+    "instagram": instagram_publisher.publish,
 }
 
 # Platforms whose publisher module exposes the proactive-refresh helpers
 # (token_expires_within / refresh_stored_credentials), used by
 # refresh_expiring_tokens (Phase 8) AND (Phase 21, twitter; Phase 24,
-# facebook) the reactive TokenExpiredError -> refresh -> retry path in
-# publish_job below. "instagram" only participates in the proactive Beat
-# refresh below — there's still no publish() for it, since Phase 24 only
-# built the Facebook Pages publish flow, not Instagram's.
+# facebook; Phase 25, instagram) the reactive TokenExpiredError -> refresh
+# -> retry path in publish_job below. Both facebook and instagram point at
+# the same meta.py module (Phase 23) since both platforms share the same
+# credential shape and refresh mechanics.
 _TOKEN_REFRESH_MODULES_BY_PLATFORM = {
     "youtube": youtube_publisher,
     "tiktok": tiktok_publisher,

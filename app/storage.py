@@ -3,11 +3,14 @@ Cloudflare R2 media staging (S3-compatible object storage).
 
 Same spirit as app/publishers/ and app/notifications.py: this module is
 self-contained (no Celery imports, no prints) so it can be used and tested
-independently of the job pipeline. It is NOT wired into app/tasks.py yet —
-publishers will adopt it once a real media flow exists (e.g. downloading a
-client-uploaded file before handing it to a platform API).
+independently of the job pipeline.
 
-R2 credentials aren't provided by the client yet. Every function here calls
+R2 is wired into the dashboard's NEW JOB upload flow (Phase 22,
+dashboard/api.py) as a best-effort side upload: the local file stays the
+source of truth for every publisher today, R2 just also gets a copy so its
+public_url is available for the upcoming Instagram publisher (which needs a
+public URL, not a local path) and as groundwork for the Fly deploy (where
+local disk won't be shared across processes). Every function here calls
 _require_config() first and raises a clear StorageNotConfiguredError instead
 of letting boto3 fail cryptically (e.g. on an empty endpoint_url), and
 nothing below executes at import time.
@@ -18,10 +21,48 @@ lifecycle rule on the bucket itself in the Cloudflare dashboard, not in
 application code. See CLAUDE.md's Phase 3 section for the checklist.
 """
 
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
 import boto3
 
 from app.config import settings
 from app.exceptions import StorageNotConfiguredError
+
+
+def upload_file(local_path: str) -> dict:
+    """
+    Uploads the file at `local_path` to the bucket under a collision-safe
+    key (UTC date + a random uuid segment, keeping the original extension)
+    and returns {"key": ..., "public_url": ...}.
+
+    public_url is R2_PUBLIC_BASE_URL + "/" + key — the bucket's public
+    r2.dev base URL (or a custom domain, if one is ever attached) — for
+    callers that need a plain public URL rather than a presigned one (see
+    module docstring). Raises StorageNotConfiguredError if R2_PUBLIC_BASE_URL,
+    or any of the other R2_* vars generate_signed_url/delete_media need, is
+    missing.
+    """
+    _require_config()
+    if not settings.r2_public_base_url:
+        raise StorageNotConfiguredError(
+            "Cloudflare R2 is not configured yet (missing: R2_PUBLIC_BASE_URL). "
+            "Set this in .env once the client provides the bucket's public "
+            "r2.dev base URL — see .env.example."
+        )
+
+    key = _build_key(local_path)
+    client = _get_client()
+    client.upload_file(local_path, settings.r2_bucket_name, key)
+    public_url = f"{settings.r2_public_base_url.rstrip('/')}/{key}"
+    return {"key": key, "public_url": public_url}
+
+
+def _build_key(local_path: str) -> str:
+    date_prefix = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    suffix = Path(local_path).suffix
+    return f"{date_prefix}/{uuid.uuid4().hex}{suffix}"
 
 
 def upload_media(local_path: str, key: str) -> None:

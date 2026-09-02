@@ -29,7 +29,9 @@ from pydantic import BaseModel
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
+from app import storage
 from app.db import SessionLocal
+from app.exceptions import StorageNotConfiguredError
 from app.models import Account, Job, JobStatus, WebhookEvent
 from app.tasks import handle_tiktok_webhook_event, publish_job
 from app.webhooks import tiktok as tiktok_webhooks
@@ -145,18 +147,19 @@ _UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 
 # Only platforms scripts/enqueue_*_test.py already know how to build a
 # payload for. Other platforms (fake, ...) aren't offered through this flow.
-_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter", "facebook"}
+_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter", "facebook", "instagram"}
 
 # Platforms whose job payload is built from a single required video file
-# upload (video_path). Twitter (Phase 21) and Facebook (Phase 24) aren't
-# among these: their payloads are text-first with optional media
-# attachments — see create_job below.
+# upload (video_path). Twitter (Phase 21), Facebook (Phase 24) and Instagram
+# (Phase 25) aren't among these: their payloads are text-first (twitter/
+# facebook) or media-required-but-not-local (instagram) — see create_job
+# below.
 _VIDEO_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
 
 # Platforms with no single-account/env-var fallback (app/publishers/*.py
 # owns this rule; duplicated here only enough to give a friendlier 400
 # instead of letting the job get created and fail later in the worker).
-_ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook"}
+_ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook", "instagram"}
 
 
 class JobOut(BaseModel):
@@ -298,6 +301,25 @@ async def _save_upload(file: UploadFile) -> Path:
     return dest_path
 
 
+def _stage_to_r2(local_path: Path) -> str | None:
+    """
+    Best-effort side upload of a locally-saved job file to R2 (Phase 22):
+    the local path stays every publisher's source of truth today, this
+    just also makes a public_url available for the upcoming Instagram
+    publisher (which needs a public URL, not a local path) and as
+    groundwork for the Fly deploy. Never raises — R2 being unconfigured or
+    unreachable must never break job creation, so a missing/failed upload
+    just means no public_url gets attached, same as before this phase.
+    """
+    try:
+        return storage.upload_file(str(local_path))["public_url"]
+    except StorageNotConfiguredError:
+        return None
+    except Exception:
+        logger.exception("R2 upload failed for %s; continuing without a public_url", local_path)
+        return None
+
+
 @app.post("/api/jobs", response_model=JobCreateOut, status_code=201)
 async def create_job(
     platform: str = Form(...),
@@ -337,6 +359,27 @@ async def create_job(
         file's type and owns all further validation; this route only
         enforces the "at most one" cap up front so a bad multi-file upload
         fails fast instead of saving files nobody will use.
+      - instagram (Phase 25): a single required `media_files` entry (an
+        optional `text` caption) — unlike facebook, Instagram has NO
+        text-only post type, so media is mandatory here, not optional.
+        app/publishers/instagram.py never reads a local file at all: it
+        needs a publicly-fetchable URL (Meta downloads the media at publish
+        time), so this route requires the R2 staging step below to
+        succeed and returns a 400 up front if it doesn't — unlike every
+        other platform, where a failed/unconfigured R2 upload silently
+        degrades to local-path-only, an instagram job with no public_url
+        can never actually publish, so failing fast here beats creating a
+        job that's guaranteed to dead-letter in the worker.
+
+    Phase 22: every uploaded file is also best-effort staged to R2
+    (_stage_to_r2) — the local path in the payload is unchanged and stays
+    what every publisher actually reads today (except instagram, Phase 25,
+    which reads ONLY the public_url — see above), but when staging succeeds
+    a public "media_public_url" (or "media_public_urls" for twitter's
+    per-tweet list) is attached alongside it, for the Instagram publisher
+    and as groundwork for the Fly deploy. If R2 isn't configured or the
+    upload fails, every platform but instagram still creates the job
+    exactly as before this phase — see _stage_to_r2.
     """
     if platform not in _SUPPORTED_PLATFORMS:
         raise HTTPException(
@@ -352,11 +395,16 @@ async def create_job(
     elif platform == "twitter":
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="Missing required field: text")
-    else:  # facebook
+    elif platform == "facebook":
         if not (text and text.strip()) and not uploaded_media_files:
             raise HTTPException(status_code=400, detail="Facebook posts need 'text' and/or a media file")
         if len(uploaded_media_files) > 1:
             raise HTTPException(status_code=400, detail="Facebook posts support at most one media file")
+    else:  # instagram
+        if not uploaded_media_files:
+            raise HTTPException(status_code=400, detail="Instagram posts require a media file (no text-only posts)")
+        if len(uploaded_media_files) > 1:
+            raise HTTPException(status_code=400, detail="Instagram posts support at most one media file")
 
     account = None
     if account_id is not None:
@@ -379,6 +427,7 @@ async def create_job(
 
     if platform in _VIDEO_UPLOAD_PLATFORMS:
         dest_path = await _save_upload(file)
+        public_url = _stage_to_r2(dest_path)
         job_title = title.strip() if title and title.strip() else (
             f"Distribution engine upload {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
         )
@@ -395,17 +444,44 @@ async def create_job(
                 payload["shorts"] = True
             if playlist_id and playlist_id.strip():
                 payload["playlist_id"] = playlist_id.strip()
+        if public_url:
+            payload["media_public_url"] = public_url
     elif platform == "twitter":
         payload = {"text": text.strip()}
         media_paths = [str(await _save_upload(mf)) for mf in uploaded_media_files]
         if media_paths:
             payload["media_paths"] = media_paths
-    else:  # facebook
+            # Only attached if every file staged successfully — a partial
+            # list wouldn't reliably line up with media_paths for a future
+            # consumer, and R2 being down must never block job creation.
+            public_urls = [_stage_to_r2(Path(p)) for p in media_paths]
+            if all(public_urls):
+                payload["media_public_urls"] = public_urls
+    elif platform == "facebook":
         payload = {}
         if text and text.strip():
             payload["text"] = text.strip()
         if uploaded_media_files:
-            payload["media_paths"] = [str(await _save_upload(uploaded_media_files[0]))]
+            dest_path = await _save_upload(uploaded_media_files[0])
+            payload["media_paths"] = [str(dest_path)]
+            public_url = _stage_to_r2(dest_path)
+            if public_url:
+                payload["media_public_url"] = public_url
+    else:  # instagram
+        dest_path = await _save_upload(uploaded_media_files[0])
+        public_url = _stage_to_r2(dest_path)
+        if not public_url:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not stage media to Cloudflare R2 — Instagram requires a publicly-accessible media "
+                    "URL (Meta downloads it at publish time). Set R2_ENDPOINT_URL/R2_ACCESS_KEY_ID/"
+                    "R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME/R2_PUBLIC_BASE_URL in .env — see .env.example."
+                ),
+            )
+        payload = {"media_public_url": public_url}
+        if text and text.strip():
+            payload["text"] = text.strip()
 
     job = Job(
         platform=platform,

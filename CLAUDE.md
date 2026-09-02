@@ -1056,6 +1056,76 @@ unit-tested without Redis or a worker running.
      30 min) or trigger one manually to confirm rotation persists
      correctly onto the `Account` row (`scripts/show_accounts.py`).
 
+### Phase 22 (current)
+- **R2 wired to a real bucket** (`app/storage.py`) — bucket
+  `arscor-distribution-media` now exists. New `upload_file(local_path) ->
+  {"key": ..., "public_url": ...}` alongside the existing
+  `upload_media`/`generate_signed_url`/`delete_media` (unchanged): the key
+  is namespaced by UTC date + a random uuid segment
+  (`YYYY/MM/DD/<uuid>.<ext>`, `_build_key`) to avoid collisions, and
+  `public_url` is `R2_PUBLIC_BASE_URL + "/" + key` — a plain public URL
+  (not presigned), for callers that need the bucket's own public r2.dev
+  address rather than a time-limited signed GET. New setting
+  `r2_public_base_url` (`app/config.py`, env `R2_PUBLIC_BASE_URL`), same
+  optional-at-the-Settings-layer treatment as the other `R2_*` vars —
+  `upload_file` raises `StorageNotConfiguredError` naming exactly which of
+  `R2_ENDPOINT_URL`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/
+  `R2_BUCKET_NAME`/`R2_PUBLIC_BASE_URL` is missing, same pattern as
+  `_require_config` already used.
+- **Wired into the dashboard's NEW JOB upload flow** (`dashboard/api.py`) —
+  every file `_save_upload` writes to local disk is now also best-effort
+  staged to R2 via a new `_stage_to_r2(local_path) -> str | None` helper,
+  called right after each `_save_upload`. **Never raises**: it catches
+  `StorageNotConfiguredError` and any other exception (logged), returning
+  `None` either way — R2 being unconfigured or unreachable must never break
+  job creation, so `create_job` degrades to exactly today's behavior (local
+  path only, no crash) whenever staging doesn't succeed. The local path in
+  the payload is unchanged and stays what every publisher actually reads;
+  when staging succeeds, a public URL is attached alongside it:
+  - youtube/tiktok (single video file): `payload["media_public_url"]`.
+  - facebook (single optional media file): `payload["media_public_url"]`.
+  - twitter (`media_files`, 0+): `payload["media_public_urls"]`, an
+    all-or-nothing list aligned index-for-index with `media_paths` — if
+    staging fails for even one file, the whole key is omitted rather than
+    attached as a partial/misaligned list a future consumer could
+    misinterpret.
+  This groundwork exists for the upcoming Instagram publisher (the
+  Instagram Content Publishing API needs a publicly-fetchable media URL,
+  not a local path — unlike every publisher built so far) and for the Fly
+  deploy (Phase 9's single-machine-mode note: once media isn't confined to
+  one process's local disk, `worker`/`beat`/`api` can split into separate
+  Fly processes/machines again). **No publisher reads `media_public_url(s)`
+  yet** — it's stored on the job payload only; wiring an actual Instagram
+  publisher to consume it is a future phase.
+- **Local dev without R2 access stays fully usable**: every `R2_*` env var
+  can be empty and nothing crashes anywhere in the pipeline — confirmed by
+  `tests/test_dashboard_media_staging.py`'s graceful-degradation tests
+  (`StorageNotConfiguredError` and an arbitrary unexpected exception both
+  result in a normally-created job with no `media_public_url(s)` key).
+- `scripts/r2_smoke_test.py` (new) — uploads a tiny generated file via
+  `upload_file`, prints its key and public URL (fetchable directly in a
+  browser to confirm the bucket is actually public), then deletes it.
+  Complements the existing `scripts/test_storage.py` (which exercises
+  `upload_media`/`generate_signed_url`/`delete_media` directly instead).
+- Covered by `tests/test_storage.py` (`upload_file` happy path, key
+  format/uniqueness, each missing `R2_*` var raising
+  `StorageNotConfiguredError` by name, `boto3.client` never called when
+  unconfigured; `upload_media`/`generate_signed_url`/`delete_media`
+  unchanged-behavior checks) and `tests/test_dashboard_media_staging.py`
+  (`_stage_to_r2`'s three outcomes in isolation; `create_job` end-to-end
+  for youtube attaching `media_public_url`, both graceful-degradation
+  paths, and twitter's all-succeed vs. partial-failure
+  `media_public_urls` behavior — `create_job` is called directly as a
+  plain async function with a real `UploadFile`, bypassing the HTTP layer,
+  same spirit as the rest of the suite calling task functions directly
+  instead of going through Celery/a live server).
+
+  **Still missing from `.env`**: `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`,
+  `R2_SECRET_ACCESS_KEY`, and `R2_PUBLIC_BASE_URL` (only `R2_BUCKET_NAME`
+  is set so far) — `python -m scripts.r2_smoke_test` reports exactly this
+  and is the fastest way to confirm the bucket end-to-end once they're
+  filled in.
+
 ### Phase 23 (current)
 - **Meta (Facebook + Instagram) OAuth foundation** — built "ready waiting for
   credentials," same posture as the Twitter publisher before real X
@@ -1310,6 +1380,126 @@ unit-tested without Redis or a worker running.
      Page token is rejected mid-publish (or force one by trying an
      intentionally stale token), and confirm rotation persists correctly
      onto the `Account` row (`scripts/show_accounts.py`).
+
+### Phase 25 (current)
+- **Instagram publisher** (`app/publishers/instagram.py`) — the
+  container/publish flow built on Phase 23's Meta OAuth foundation, built
+  "ready waiting for credentials" like Phases 21/23/24 (no real Meta App
+  yet, everything exercised only against fully mocked HTTP —
+  `tests/test_publisher_instagram.py`,
+  `tests/test_tasks_instagram_token_refresh.py`,
+  `tests/test_dashboard_media_staging.py`). Wired into
+  `app/tasks.py::_PUBLISHERS_BY_PLATFORM["instagram"]`.
+  - **No local-file upload path — the one publisher in this project that
+    doesn't have one.** Meta downloads the media from a public URL at
+    publish time ("media must be hosted on a publicly accessible server"),
+    so this publisher only ever reads `payload["media_public_url"]` — the
+    same field Phase 22's R2 staging (`app/storage.py::upload_file`)
+    attaches for youtube/tiktok/facebook's single-media-file case. A
+    missing `media_public_url` is a `PermanentError` naming exactly why
+    (Instagram has no text-only post type, and R2 must be configured for a
+    public URL to exist at all) — there is no fallback to a local
+    `media_paths` file the way every other publisher has.
+  - **Credentials**: `account_credentials` needs `ig_user_id` + `page_token`
+    (Phase 23's `instagram` Account shape; `user_token` is only used by
+    `meta.py`'s OAuth refresh flow, not by this module directly). No
+    env-var single-account fallback, same as `facebook.py` — every
+    instagram job needs an `Account` row from `scripts/authorize_meta.py`.
+  - **Three-call container flow, endpoint shapes given directly in the
+    phase brief, not guessed**:
+    1. `_create_container`: `POST /<IG_USER_ID>/media` —
+       `image_url=<url>&caption=<text>` for an image, or
+       `media_type=REELS&video_url=<url>&caption=<text>` for a video
+       (since July 2023 all single feed videos publish as Reels, so the
+       video branch always sends `media_type=REELS`) -> `{"id":
+       "<container_id>"}`. Image vs. video is auto-detected from
+       `media_public_url`'s guessed MIME type
+       (`mimetypes.guess_type`) — no separate "kind" flag, same spirit as
+       `facebook.py`'s `_media_kind`.
+    2. `_wait_for_container`: `GET /<CONTAINER_ID>?fields=status_code`,
+       polled every `_POLL_INTERVAL_SECONDS` (5s) up to
+       `_POLL_TIMEOUT_SECONDS` (300s) total. `IN_PROGRESS` -> keep polling;
+       `FINISHED` -> proceed to step 3; `ERROR`/`EXPIRED` ->
+       `PermanentError` (the only recovery is a fresh container, which is
+       exactly what happens if the job is retried, since no `container_id`
+       is persisted between attempts — publish_job would build a brand new
+       one). A poll **timeout** is a `TransientError`, not permanent: the
+       container may just need more time, and Celery's retry can pick the
+       job up again later.
+    3. `_publish_container`: `POST /<IG_USER_ID>/media_publish`,
+       `creation_id=<container_id>` -> `{"id": "<ig_media_id>"}` — the post
+       is only actually live after this step.
+  - **Error classification, extended from `meta.py` exactly like
+    `facebook.py` does**: every publish-time Graph call here passes
+    `token_invalid_error_class=TokenExpiredError` to
+    `meta.raise_for_graph_error`, so a `code=190` (`OAuthException`) error
+    becomes `TokenExpiredError` instead of `meta.py`'s default
+    `PermanentError`. `app/tasks.py`'s
+    `_TOKEN_REFRESH_MODULES_BY_PLATFORM["instagram"]` already pointed at
+    `meta.py` since Phase 23 (originally only reachable by the proactive
+    Beat refresh, since there was no `publish()` to ever raise
+    `TokenExpiredError`) — Phase 25 is what makes the **reactive**
+    refresh-and-retry-once path (`_handle_token_expired`, Phase 21)
+    actually reachable for instagram, with no changes needed in
+    `app/tasks.py` beyond registering the publisher itself. Confirmed
+    end-to-end by `tests/test_tasks_instagram_token_refresh.py`, modeled
+    directly on `tests/test_tasks_facebook_token_refresh.py`.
+  - **Not implemented**: the informational rate-limit endpoint (`GET
+    /<IG_USER_ID>/content_publishing_limit`, ~100 API-published posts/24h
+    per account) — nothing here reads it proactively; exceeding it just
+    surfaces as an ordinary classified Graph error from `_create_container`.
+  - **Not implemented, follow-up candidate**: `app/media_probe.py`'s
+    ffprobe-based pre-flight validation of Reels specs (MP4/MOV, aspect
+    ratio 0.01:1–10:1, 9:16 recommended), the same way
+    `app/publishers/youtube.py` validates Shorts (Phase 15). `media_probe.probe()`
+    operates on a local file path via an `ffprobe` subprocess, but this
+    publisher only ever has a public R2 URL, never a local path — adding
+    this would mean downloading the file back from R2 before probing it,
+    an extra network round-trip and more moving parts than fits this
+    phase. Meta's own container processing already rejects a malformed
+    video via `status_code=ERROR` (caught above), so skipping this is a
+    fail-fast/UX gap, not a correctness one. Revisit if bad-media jobs
+    start burning API-published-post quota before failing.
+- **Dashboard NEW JOB form**: `instagram` added to `_SUPPORTED_PLATFORMS`
+  and `_ACCOUNT_REQUIRED_PLATFORMS` (`dashboard/api.py`, alongside
+  `tiktok`/`facebook` — no single-account fallback). Unlike every other
+  platform, a failed/unconfigured R2 staging attempt is **not** swallowed
+  for instagram: `create_job` returns a 400 naming the missing R2 env vars
+  instead of creating a job that's guaranteed to dead-letter in the worker
+  (every other platform still degrades gracefully to local-path-only, per
+  Phase 22 — instagram has no local-path fallback to degrade to). Exactly
+  one media file is required (no text-only posts); an optional `text`
+  caption is allowed alongside it. `dashboard/static/index.html` gained a
+  matching `#job-instagram-fields` block (caption input + required
+  single-file input, plus an inline note about the R2 requirement) and
+  extends the frontend's own `ACCOUNT_REQUIRED_PLATFORMS` set to match.
+- `scripts/enqueue_instagram_test.py` (new, modeled on
+  `enqueue_facebook_test.py`) — `--mode image|video` (informational only;
+  the publisher auto-detects the real type), `--file`, `--account`
+  (**required**, no single-account fallback), optional `--caption`. Unlike
+  every other `enqueue_*_test.py` script, this one calls
+  `app/storage.py::upload_file` itself before creating the job, since
+  `instagram.py` needs `media_public_url` in the payload, not a local
+  `media_paths` entry — it fails loudly if R2 isn't configured, the same
+  way the publisher itself would.
+
+  **When a real Meta App and credentials arrive** (same checklist as Phase
+  23/24, now covering Instagram too):
+  1. Complete Phase 23's checklist (`scripts/authorize_meta.py`), making
+     sure the target IG account is Business/Creator and linked to the
+     Facebook Page *before* running it — this is what creates the
+     `instagram` Account row alongside the `facebook` one.
+  2. Confirm R2 is fully configured (`R2_ENDPOINT_URL`/`R2_ACCESS_KEY_ID`/
+     `R2_SECRET_ACCESS_KEY`/`R2_BUCKET_NAME`/`R2_PUBLIC_BASE_URL`, Phase
+     22) — instagram jobs cannot work without it.
+  3. Test with `python -m scripts.enqueue_instagram_test --mode image
+     --file photo.jpg --account "Main Page"`, then `--mode video` once
+     that works.
+  4. Watch a reactive refresh happen naturally the first time the stored
+     Page token is rejected mid-publish, and confirm rotation persists
+     correctly onto the `Account` row (`scripts/show_accounts.py`) — same
+     mechanism as Facebook's (Phase 24), since both platforms share
+     `meta.py`'s refresh logic.
 
 ## Monitoring dashboard (extra, not in the spec)
 
