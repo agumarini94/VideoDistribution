@@ -90,6 +90,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 import tweepy
@@ -112,6 +113,12 @@ _MEDIA_CATEGORY_BY_KIND = {"image": "tweet_image", "gif": "tweet_gif", "video": 
 # against a live account yet).
 _TOKEN_URL = "https://api.twitter.com/2/oauth2/token"
 _FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
+
+# X's OAuth 2.0 Authorization Code + PKCE consent screen — used only by
+# build_authorization_url() below (Phase 29b, dashboard/api.py's in-browser
+# "Connect X/Twitter" self-service flow), never by publish() itself.
+AUTHORIZE_URL = "https://twitter.com/i/oauth2/authorize"
+_OAUTH_SCOPES = "tweet.read tweet.write users.read offline.access"
 
 # error codes from the OAuth 2.0 token endpoint worth retrying (transient on
 # X's side); everything else (e.g. invalid_grant for a revoked/expired or
@@ -566,5 +573,109 @@ def refresh_stored_credentials(credentials: dict) -> dict:
         "client_secret": client_secret,
         "access_token": body["access_token"],
         "refresh_token": new_refresh_token,
+        "expires_at": _compute_expiry(body.get("expires_in")),
+    }
+
+
+def build_authorization_url(redirect_uri: str, state: str, code_challenge: str) -> str:
+    """
+    Builds X's OAuth 2.0 Authorization Code + PKCE consent-screen URL — the
+    in-browser (dashboard/api.py's "Connect X/Twitter" self-service flow,
+    Phase 29b) counterpart to Phase 21's env-var/manual-Account-row setup,
+    modeled on app/publishers/youtube.py::build_authorization_url (Phase
+    29a)'s shape.
+
+    X requires PKCE even for confidential clients (unlike Google's, which
+    doesn't need it for a server-side web flow). This module follows
+    standard RFC 7636 PKCE — code_challenge is BASE64URL(SHA256(verifier)),
+    method S256 — do NOT copy scripts/authorize_tiktok.py's deliberate hex-
+    digest deviation here; that's specific to TikTok's non-standard
+    implementation. The caller (dashboard/api.py) generates the
+    verifier/challenge pair and must round-trip the verifier itself (e.g.
+    inside the signed `state` token, see app/auth.py::create_oauth_state_token)
+    since this module has no session/state concept to stash it in, and X's
+    callback never echoes the verifier back on its own.
+
+    Uses the TWITTER_CLIENT_ID env var directly (app-level, not per-account
+    — there's no Account row yet at this point in the flow, same reasoning
+    as app/publishers/facebook.py reading META_APP_ID directly).
+    """
+    client_id = os.getenv("TWITTER_CLIENT_ID", "").strip()
+    if not client_id:
+        raise PermanentError("TWITTER_CLIENT_ID is not set — cannot start the X OAuth flow.")
+
+    query = urlencode(
+        {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": _OAUTH_SCOPES,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+    )
+    return f"{AUTHORIZE_URL}?{query}"
+
+
+def exchange_code_for_credentials(code: str, redirect_uri: str, code_verifier: str) -> dict:
+    """
+    Exchanges an authorization code (from the browser redirect back after
+    build_authorization_url's consent screen) for an access_token +
+    refresh_token pair, via the same token endpoint (_TOKEN_URL) and
+    confidential-client HTTP Basic auth as refresh_stored_credentials above
+    — reused here rather than duplicated. code_verifier must be the PKCE
+    verifier paired with the code_challenge sent to build_authorization_url
+    for this same flow; X rejects the exchange if it doesn't hash to the
+    challenge it received earlier.
+
+    Unlike refresh_stored_credentials (called from the proactive Beat task
+    and the reactive retry-once path, where distinguishing transient vs.
+    permanent matters so the caller can decide whether to retry
+    automatically), this is a one-shot interactive flow driven by a human
+    sitting at the consent screen — any failure just means clicking
+    "Connect" again — so every failure here normalizes to PermanentError,
+    the only exception dashboard/api.py's callback route needs to handle
+    (same contract as app/publishers/youtube.py::exchange_code_for_credentials).
+
+    Returns a credentials dict in the exact shape _resolve_credentials/
+    refresh_stored_credentials expect: client_id, client_secret,
+    access_token, refresh_token, expires_at.
+    """
+    client_id = os.getenv("TWITTER_CLIENT_ID", "").strip()
+    client_secret = os.getenv("TWITTER_CLIENT_SECRET", "").strip()
+    missing = [name for name, value in (("TWITTER_CLIENT_ID", client_id), ("TWITTER_CLIENT_SECRET", client_secret)) if not value]
+    if missing:
+        raise PermanentError(f"X self-service connect is not configured: missing {', '.join(missing)}.")
+
+    try:
+        response = requests.post(
+            _TOKEN_URL,
+            auth=(client_id, client_secret),
+            headers=_FORM_HEADERS,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
+                "client_id": client_id,
+            },
+            timeout=30,
+        )
+        body = _raise_for_token_error(response, "exchanging authorization code")
+    except (TransientError, PermanentError) as exc:
+        raise PermanentError(f"Failed to exchange the X authorization code for a token: {exc}") from exc
+    except requests.RequestException as exc:
+        raise PermanentError(f"Network error exchanging the X authorization code for a token: {exc}") from exc
+
+    refresh_token = body.get("refresh_token")
+    if not refresh_token:
+        raise PermanentError(f"X token endpoint did not return a refresh_token (was 'offline.access' granted?): {body}")
+
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "access_token": body["access_token"],
+        "refresh_token": refresh_token,
         "expires_at": _compute_expiry(body.get("expires_in")),
     }

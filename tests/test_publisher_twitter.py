@@ -235,3 +235,91 @@ class TestRefreshStoredCredentials:
         del creds["refresh_token"]
         with pytest.raises(PermanentError):
             twitter_publisher.refresh_stored_credentials(creds)
+
+
+class TestWebOAuthFlow:
+    """Phase 29b — build_authorization_url/exchange_code_for_credentials, the
+    web-flow (browser redirect) counterpart to a CLI authorize script (X has
+    none yet — see CLAUDE.md Phase 21), used by dashboard/api.py's
+    /api/oauth/twitter/* routes. Modeled on
+    tests/test_publisher_youtube.py::TestWebOAuthFlow."""
+
+    def test_build_authorization_url_missing_client_id_raises(self, monkeypatch):
+        monkeypatch.delenv("TWITTER_CLIENT_ID", raising=False)
+        with pytest.raises(PermanentError):
+            twitter_publisher.build_authorization_url("http://localhost/callback", "state123", "challenge123")
+
+    def test_build_authorization_url_happy_path(self, monkeypatch):
+        monkeypatch.setenv("TWITTER_CLIENT_ID", "client-id")
+
+        url = twitter_publisher.build_authorization_url("http://localhost/callback", "state123", "challenge123")
+
+        assert url.startswith(twitter_publisher.AUTHORIZE_URL + "?")
+        assert "client_id=client-id" in url
+        assert "state=state123" in url
+        assert "code_challenge=challenge123" in url
+        assert "code_challenge_method=S256" in url
+        assert "response_type=code" in url
+
+    def test_exchange_code_for_credentials_missing_env_raises(self, monkeypatch):
+        monkeypatch.delenv("TWITTER_CLIENT_ID", raising=False)
+        monkeypatch.delenv("TWITTER_CLIENT_SECRET", raising=False)
+        with pytest.raises(PermanentError):
+            twitter_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+    @responses.activate
+    def test_exchange_code_for_credentials_happy_path(self, monkeypatch):
+        monkeypatch.setenv("TWITTER_CLIENT_ID", "client-id")
+        monkeypatch.setenv("TWITTER_CLIENT_SECRET", "client-secret")
+        responses.add(
+            responses.POST,
+            _TOKEN_URL,
+            json={"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 7200},
+            status=200,
+        )
+
+        creds = twitter_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+        assert creds == {
+            "client_id": "client-id",
+            "client_secret": "client-secret",
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_at": creds["expires_at"],
+        }
+        assert creds["expires_at"] is not None
+
+        request = responses.calls[0].request
+        assert request.headers["Authorization"].startswith("Basic ")
+        assert "grant_type=authorization_code" in request.body
+        assert "code=auth-code" in request.body
+        assert "code_verifier=verifier123" in request.body
+
+    @responses.activate
+    def test_exchange_code_for_credentials_missing_refresh_token_is_permanent(self, monkeypatch):
+        # A missing "offline.access" grant (or a scope config that omits it)
+        # would otherwise silently return credentials nothing can refresh.
+        monkeypatch.setenv("TWITTER_CLIENT_ID", "client-id")
+        monkeypatch.setenv("TWITTER_CLIENT_SECRET", "client-secret")
+        responses.add(responses.POST, _TOKEN_URL, json={"access_token": "new-access"}, status=200)
+
+        with pytest.raises(PermanentError):
+            twitter_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+    @responses.activate
+    def test_exchange_code_for_credentials_wraps_token_endpoint_failure_as_permanent(self, monkeypatch):
+        # A PKCE verifier/challenge mismatch (or any other rejection) always
+        # normalizes to PermanentError here — this is a one-shot interactive
+        # flow, not something app/tasks.py should retry automatically. See
+        # the function's docstring.
+        monkeypatch.setenv("TWITTER_CLIENT_ID", "client-id")
+        monkeypatch.setenv("TWITTER_CLIENT_SECRET", "client-secret")
+        responses.add(
+            responses.POST,
+            _TOKEN_URL,
+            json={"error": "invalid_grant", "error_description": "code_verifier does not match code_challenge"},
+            status=400,
+        )
+
+        with pytest.raises(PermanentError, match="invalid_grant"):
+            twitter_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")

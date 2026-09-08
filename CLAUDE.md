@@ -1907,6 +1907,120 @@ unit-tested without Redis or a worker running.
   or a custom domain) added as an additional authorized redirect URI once
   deployed.
 
+### Phase 29b (current)
+- **In-browser X/Twitter OAuth for client self-service** — same pattern as
+  Phase 29a (YouTube), extended to Twitter/X. Scoped narrowly the same way:
+  `role="client_user"` sessions only, always creates the resulting `Account`
+  under the caller's own `client_id`. Other platforms (tiktok/facebook/
+  instagram) still require their CLI `scripts/authorize_*.py` scripts.
+  Unlike YouTube, X had no CLI authorize script to begin with (Phase 21's
+  note: "Twitter has no interactive authorize script yet... the alert
+  points at obtaining a fresh authorization code via X's OAuth 2.0 PKCE flow
+  by hand") — this phase is the first place X's Authorization Code + PKCE
+  flow is actually implemented in code, not just documented as a manual
+  procedure.
+- **`app/publishers/twitter.py`** gained two new pure functions, mirroring
+  `youtube.py`'s `build_authorization_url`/`exchange_code_for_credentials`
+  shape exactly, and reusing Phase 21's existing token-endpoint plumbing
+  (`_TOKEN_URL`, `_FORM_HEADERS`, `_raise_for_token_error`,
+  `_compute_expiry`) rather than duplicating it:
+  - `build_authorization_url(redirect_uri, state, code_challenge)` — builds
+    X's `https://twitter.com/i/oauth2/authorize` consent-screen URL
+    (`AUTHORIZE_URL`). Reads `TWITTER_CLIENT_ID` directly from the
+    environment (app-level, no `Account` row exists yet at this point in
+    the flow — same reasoning as `facebook.py` reading `META_APP_ID`
+    directly). Raises `PermanentError` if unset.
+  - `exchange_code_for_credentials(code, redirect_uri, code_verifier)` —
+    `POST` to the same `_TOKEN_URL` as `refresh_stored_credentials`
+    (`grant_type=authorization_code` instead of `refresh_token`),
+    authenticated the same way (HTTP Basic, `client_id:client_secret` from
+    `TWITTER_CLIENT_ID`/`TWITTER_CLIENT_SECRET`). Returns a credentials dict
+    in the exact shape `_resolve_credentials`/`refresh_stored_credentials`
+    already expect (`client_id`, `client_secret`, `access_token`,
+    `refresh_token`, `expires_at`). **Every failure normalizes to
+    `PermanentError`** (unlike `refresh_stored_credentials`, which
+    distinguishes transient/permanent for the Beat task's benefit) — this is
+    a one-shot interactive flow driven by a human at the consent screen, so
+    the only thing a failure needs to do is tell `dashboard/api.py`'s
+    callback route to show an error and let them click "Connect" again, the
+    same contract `youtube.py`'s `exchange_code_for_credentials` already
+    has.
+  - **PKCE is required by X even for a confidential client** (unlike
+    Google's web flow, which doesn't need it) — `build_authorization_url`
+    takes a caller-supplied `code_challenge` and neither function generates
+    the verifier/challenge pair itself (that's `dashboard/api.py`'s job, see
+    below), since this module has no state/session concept to stash the
+    verifier in between the two calls. **Standard RFC 7636 PKCE** —
+    `code_challenge = BASE64URL(SHA256(verifier))`, method `S256` — this is
+    the opposite of `scripts/authorize_tiktok.py`'s deliberate hex-digest
+    deviation for TikTok; do not copy that trick onto X, which follows the
+    RFC exactly.
+- **`dashboard/api.py`**: `_generate_pkce_pair()` (new) — `secrets.token_urlsafe(64)`
+  for the verifier, standard base64url-no-padding SHA-256 for the challenge.
+  Two new routes mirroring `youtube_oauth_start`/`youtube_oauth_callback`
+  (Phase 29a) exactly in shape:
+  - `GET /api/oauth/twitter/start` (gated, `client_user`-only) — generates
+    the PKCE pair, signs `{"client_id", "user_id", "code_verifier"}` into
+    `state` (one field more than YouTube's, since X's callback never echoes
+    the verifier back on its own — the signed state token is the only place
+    it survives the round trip through X's consent screen), and redirects
+    to X's authorize URL.
+  - `GET /api/oauth/twitter/callback` (public — added to `_PUBLIC_API_PATHS`
+    alongside the YouTube one, same reasoning: X's redirect carries no
+    session cookie) — verifies `state`, pulls `code_verifier` back out of it
+    (a validly-signed state token that happens to be missing this field —
+    e.g. a stale pre-29b token — redirects with
+    `reason=missing_pkce_verifier`, distinct from a tampered/expired
+    signature), exchanges `code` + `code_verifier` for credentials, and
+    upserts an `Account` row (`platform="twitter"`, named
+    `"<Client name> (self-service)"`) via the same
+    `scripts/add_account.py::upsert_account` helper every other authorize
+    path uses — reconnecting rotates the same Account in place instead of
+    duplicating it. Always redirects back into the SPA
+    (`/?screen=accounts&twitter_connect=success` or `...=error&reason=<code>`),
+    same as YouTube's callback.
+- **Frontend** (`dashboard/static/index.html`): a second "Connect X/Twitter"
+  button next to "Connect YouTube" on the Connected Accounts screen (both
+  `client_user`-only, both plain `<a href="/api/oauth/.../start">`
+  navigations so the session cookie rides along). `state.twitterConnectNotice`
+  mirrors `state.youtubeConnectNotice`; `consumeOauthRedirectParams()`
+  additionally reads `?twitter_connect=success|error&reason=...` and strips
+  it the same way.
+- **Tests**: `tests/test_publisher_twitter.py::TestWebOAuthFlow` (modeled on
+  `tests/test_publisher_youtube.py::TestWebOAuthFlow` — missing
+  `TWITTER_CLIENT_ID`/`_SECRET` on both functions, the authorization URL
+  built with the right PKCE params, code exchange returning parsed
+  credentials, a missing-`refresh_token` response and a token-endpoint
+  rejection both wrapped as `PermanentError`).
+  `tests/test_dashboard_twitter_oauth.py` (FastAPI `TestClient`, modeled on
+  `tests/test_dashboard_youtube_oauth.py`): `/start` 401 anonymous / 403
+  admin / redirects a `client_user` to the (mocked) X URL with a verifiable
+  signed state, asserting the `code_challenge` sent to X actually derives
+  from the `code_verifier` stashed in that state (RFC 7636 S256, checked
+  independently in the test); `/callback` handles X's `error` param, missing
+  code/state, a tampered state, a validly-signed state missing
+  `code_verifier`, a state naming a nonexistent client, a full happy path
+  asserting the created `Account`'s `client_id`/`credentials` (including
+  that the right `code_verifier` reached the exchange call), reconnecting
+  rotating the same `Account` instead of duplicating it, a simulated
+  verifier/challenge mismatch at the token endpoint, and a generic exchange
+  failure — both of the latter two leaving no `Account` behind.
+
+  **Local dev setup — register this exact redirect URI in the X Developer
+  Portal** (OAuth 2.0 app settings — same confidential client Phase 21 set
+  up for `TWITTER_CLIENT_ID`/`TWITTER_CLIENT_SECRET`, "Type of App" must
+  support the Authorization Code + PKCE flow with a client secret):
+  ```
+  http://localhost:8000/api/oauth/twitter/callback
+  ```
+  (Adjust the host/port if the dashboard runs elsewhere locally —
+  `/api/oauth/twitter/start` derives `redirect_uri` from the incoming
+  request, so it always matches whatever's actually registered as long as
+  that's what's typed into the browser.) In production this needs the real
+  deployed origin's equivalent
+  (`https://<fly-app>.fly.dev/api/oauth/twitter/callback` or a custom
+  domain) added as an additional callback URI once deployed.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

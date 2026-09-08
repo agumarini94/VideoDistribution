@@ -13,6 +13,8 @@ signature, stores the raw event, and dispatches a Celery task
 matching/alerting logic lives in app/tasks.py, not here.
 """
 
+import base64
+import hashlib
 import logging
 import os
 import secrets
@@ -43,6 +45,7 @@ from app.auth import (
 from app.db import SessionLocal
 from app.exceptions import PermanentError, StorageNotConfiguredError
 from app.models import Account, Client, Job, JobStatus, User, WebhookEvent
+from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
 from app.tasks import handle_tiktok_webhook_event, publish_job
 from app.webhooks import tiktok as tiktok_webhooks
@@ -109,18 +112,20 @@ _DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
 # reachable before any session exists, and /me is how the SPA silently
 # checks "am I logged in?" on load without forcing a 401 round trip.
 #
-# /api/oauth/youtube/callback (Phase 29a) is the other: Google redirects the
-# browser here with no session cookie at all, so it has to be public too —
-# its own security comes from verifying the signed "state" param (see
-# youtube_oauth_callback below), not from enforce_auth. Its sibling /start
-# route is deliberately NOT here — that one still requires a real
-# client_user session, gated normally.
+# /api/oauth/youtube/callback (Phase 29a) and /api/oauth/twitter/callback
+# (Phase 29b, same reasoning) are the other public ones: the platform
+# redirects the browser here with no session cookie at all, so both have to
+# be public too — their own security comes from verifying the signed
+# "state" param (see youtube_oauth_callback/twitter_oauth_callback below),
+# not from enforce_auth. Their sibling /start routes are deliberately NOT
+# here — those still require a real client_user session, gated normally.
 _PUBLIC_API_PATHS = {
     "/api/auth/register",
     "/api/auth/login",
     "/api/auth/logout",
     "/api/auth/me",
     "/api/oauth/youtube/callback",
+    "/api/oauth/twitter/callback",
 }
 
 
@@ -719,6 +724,99 @@ def youtube_oauth_callback(
     db.commit()
 
     return RedirectResponse("/?screen=accounts&youtube_connect=success")
+
+
+def _generate_pkce_pair() -> tuple[str, str]:
+    """
+    Standard RFC 7636 PKCE pair for X's OAuth 2.0 authorize flow (Phase
+    29b): code_challenge = BASE64URL(SHA256(verifier)), no padding. Unlike
+    scripts/authorize_tiktok.py's _generate_pkce_pair (TikTok's deliberate
+    hex-digest deviation), X follows the RFC exactly — do not copy that
+    trick here.
+    """
+    verifier = secrets.token_urlsafe(64)  # ~86 chars, within RFC 7636's 43-128 range
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+@app.get("/api/oauth/twitter/start")
+def twitter_oauth_start(request: Request = None):
+    """
+    Starts the in-browser X/Twitter connect flow (Phase 29b), mirroring
+    youtube_oauth_start (Phase 29a) exactly — client_user-only, since this
+    flow always creates the resulting Account under the caller's own
+    client_id.
+
+    X's OAuth 2.0 requires PKCE even for confidential clients (see
+    app/publishers/twitter.py::build_authorization_url), so unlike
+    YouTube's state (just client_id/user_id) this one also carries the PKCE
+    code_verifier — the callback has no other way to recover it, since X's
+    redirect back never echoes it. It rides inside the same signed
+    oauth-state token as client_id/user_id, so it's tamper-evident and
+    short-lived (10 minutes) exactly like the rest of the state.
+    """
+    auth = _get_auth(request)
+    if auth.role != "client_user":
+        raise HTTPException(status_code=403, detail="X/Twitter self-service connect is only available to a client account.")
+
+    redirect_uri = str(request.url_for("twitter_oauth_callback"))
+    code_verifier, code_challenge = _generate_pkce_pair()
+    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id, "code_verifier": code_verifier})
+    try:
+        authorization_url = twitter_publisher.build_authorization_url(redirect_uri, state, code_challenge)
+    except PermanentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(authorization_url)
+
+
+@app.get("/api/oauth/twitter/callback")
+def twitter_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public callback X redirects the browser back to after the consent
+    screen from twitter_oauth_start above — mirrors youtube_oauth_callback
+    (Phase 29a) exactly, see its docstring for why this must stay public
+    and redirect-only. The one addition: the PKCE code_verifier is pulled
+    back out of state (see twitter_oauth_start) and passed to
+    exchange_code_for_credentials, which X uses to verify this exchange
+    belongs to the same flow that sent the code_challenge.
+    """
+    if error:
+        return RedirectResponse(f"/?screen=accounts&twitter_connect=error&reason={quote(error)}")
+    if not code or not state:
+        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=missing_code_or_state")
+
+    state_data = verify_oauth_state_token(state)
+    if state_data is None:
+        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=invalid_or_expired_state")
+
+    code_verifier = state_data.get("code_verifier")
+    if not code_verifier:
+        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=missing_pkce_verifier")
+
+    client_id = state_data.get("client_id")
+    client = db.get(Client, client_id) if client_id is not None else None
+    if client is None:
+        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=unknown_client")
+
+    redirect_uri = str(request.url_for("twitter_oauth_callback"))
+    try:
+        credentials = twitter_publisher.exchange_code_for_credentials(code, redirect_uri, code_verifier)
+    except PermanentError as exc:
+        logger.warning("X OAuth code exchange failed for client %s: %s", client_id, exc)
+        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=exchange_failed")
+
+    account, _action = upsert_account(db, "twitter", f"{client.name} (self-service)", credentials)
+    account.client_id = client.id
+    db.commit()
+
+    return RedirectResponse("/?screen=accounts&twitter_connect=success")
 
 
 @app.get("/api/admin/users/pending", response_model=list[PendingUserOut])
