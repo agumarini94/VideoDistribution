@@ -1501,6 +1501,90 @@ unit-tested without Redis or a worker running.
      mechanism as Facebook's (Phase 24), since both platforms share
      `meta.py`'s refresh logic.
 
+### Phase 26 (in progress)
+- **Client model + scheduler UI foundation** — start of the "Postline"
+  scheduling tool from `design_handoff_scheduler/` (a high-fidelity design
+  handoff: `README.md` + `Scheduler.dc.html`, a reference-only prototype),
+  which replaces `dashboard/static/index.html`'s monitoring-only UI with a
+  full calendar/queue/composer/approvals/analytics/media-library/accounts/
+  clients tool. Built screen-by-screen on top of the existing
+  `dashboard/api.py` + `app/models.py` foundation, starting with the two
+  screens that needed no new backend concepts (Queue, Calendar).
+  - **`app/models.py::Client`** (new table) — a workspace this engine
+    publishes on behalf of (`name`, `kind`: `"individual"` | `"client"`),
+    backing the design's client-switcher. Deliberately minimal — dashboard-
+    only grouping metadata, never read by `app/tasks.py` or any publisher.
+    `Account.client_id` and `Job.client_id` (both new, nullable FKs) scope
+    accounts and jobs to a client. **`Job.client_id` is independent of
+    `Account.client_id`/`account_id`** rather than derived through the
+    account — a job can exist for a client before any `Account` is
+    connected (single-account/env-var-fallback platforms like
+    youtube/twitter), and the scheduler UI scopes every screen by the
+    active client directly. Both are additive/nullable, same pattern as
+    `account_id` (Phase 6): existing rows and jobs/accounts created without
+    a client keep working unchanged.
+  - **Manual schema step**, same pattern as every prior additive-column
+    phase (`account_id`, `external_id`, `last_stall_alert_at`): `init_db()`'s
+    `create_all` creates the new `clients` table automatically on an
+    existing Neon database, but does **not** add the new `client_id` columns
+    to the existing `accounts`/`jobs` tables. Run once, by hand, against
+    Neon:
+    ```sql
+    ALTER TABLE accounts ADD COLUMN client_id INTEGER REFERENCES clients(id);
+    ALTER TABLE jobs ADD COLUMN client_id INTEGER REFERENCES clients(id);
+    ```
+  - **`dashboard/api.py`**: `GET /api/clients`, `POST /api/clients`
+    (name + kind, no dedup/update/delete yet — narrow enough that adding
+    those later is additive). `GET /api/jobs` and `GET /api/accounts` both
+    gained an optional `client_id` filter and now return `client_id` +
+    `client_name` (resolved via a single extra query per request, not a
+    per-row query). `JobOut` also gained `caption` — a best-effort display
+    string extracted from `payload` by `_extract_caption` (checks `text`,
+    then `thread[0].text`, then `title`, then `caption`, in that order;
+    `None` if nothing matches) — the design's Queue/Calendar/Approvals
+    screens all show one line of post content per job, and payload shape
+    varies by platform (see each publisher's phase above) so this can't be
+    a single column. `POST /api/jobs` gained an optional `client_id` form
+    field, validated to exist (404 if not) and stored directly on the
+    created `Job` — independent of whichever `account_id` was also passed,
+    per the design decision above.
+  - **Frontend**: `dashboard/static/index.html` rewritten from scratch
+    against the design's tokens (`design_handoff_scheduler/README.md`'s
+    Design Tokens section — Barlow/Barlow Condensed fonts, `#f2f2f3`
+    background, steel-blue `#5980a6` accent, hairline `rgba(29,31,32,0.16)`
+    borders, square corners, no drop shadows), replacing the old
+    neobrutalist look entirely (violet header, black hard-shadow borders) —
+    same single-file-vanilla-JS-no-build-step convention as before, just a
+    different visual system. Persistent sidebar (all 7 nav items from the
+    design) + topbar (client switcher, screen title, "+ New post") render
+    on every screen. **Calendar** (month grid + agenda view, toggle is
+    local UI state) and **Queue** (status filter chips + table with Retry)
+    are fully wired to `/api/jobs`, `/api/clients`, and
+    `POST /api/jobs/{id}/retry`. Every other nav item (Composer, Approvals,
+    Analytics, Media library, Connected accounts beyond a basic list,
+    Clients grid beyond the switcher, Onboarding) renders a "not built yet"
+    placeholder in the content area — the nav item is clickable and
+    highighted like the design, it just doesn't have a real screen behind
+    it yet. Client switching persists via `activeClientId` in local state
+    and re-filters Calendar/Queue's `/api/jobs` calls by `client_id`; a
+    brand-new install has zero `Client` rows, so the switcher's own
+    dropdown includes an inline "+ Add client workspace" action
+    (`POST /api/clients`) since there's no separate Clients screen to do it
+    from yet.
+  - **Explicitly deferred to later phases** (each flagged in the design
+    handoff as needing a decision or new backend work before building):
+    Approvals (no "pending approval" concept exists in `JobStatus` today —
+    needs a new state or flag, plus somewhere to store a rejection reason),
+    Composer's "Save draft" (no `DRAFT` status), Media library (no `Media`
+    model — R2 storage exists but nothing tracks dimensions/filename/
+    usage independently of a job payload), Connected accounts' `@handle`
+    display (`Account` has no `handle` field, only `name`), real in-browser
+    OAuth onboarding (today's authorization flow is CLI scripts —
+    `scripts/authorize_meta.py` etc. — that pop a browser and bind a
+    one-shot local HTTP server, which doesn't translate directly into a
+    web dashboard flow), and Pinterest (in the design's platform set, no
+    publisher exists — `app/publishers/`).
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

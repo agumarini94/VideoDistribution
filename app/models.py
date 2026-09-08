@@ -22,6 +22,41 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class Client(Base):
+    """
+    A workspace this engine publishes on behalf of (Phase 26) — either the
+    operator's own brand ("individual") or an agency's managed client
+    ("client"). Introduced to back the scheduler UI's client-switcher
+    (design_handoff_scheduler/README.md): before this, a Job/Account's
+    "client" was only informally encoded in Account.name (e.g. "Client X"),
+    which the Queue/Calendar/Accounts screens can't reliably filter or
+    display against. Deliberately minimal (name + kind only) — nothing here
+    is read by app/tasks.py or any publisher; this is dashboard-only
+    grouping metadata, same spirit as Account.credentials being opaque to
+    everything except the publisher that reads it.
+    """
+
+    __tablename__ = "clients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Free string, not an enum, same rationale as Job.platform: the
+    # scheduler UI only distinguishes "individual" (the operator's own
+    # brand) from "client" (an agency's managed client) today, but adding a
+    # third kind shouldn't require a migration.
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="client")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return f"Client(id={self.id}, name={self.name!r}, kind={self.kind!r})"
+
+
 class Account(Base):
     """
     Credentials for one social-media account belonging to a client, scoped
@@ -53,6 +88,14 @@ class Account(Base):
     # Lets an account be disabled (revoked/expired credentials, client
     # request) without deleting it or its history.
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Which Client workspace this connected account belongs to (Phase 26).
+    # Nullable: accounts created before this phase, or created without a
+    # workspace assigned, keep working exactly as before — nothing in
+    # app/tasks.py or the publishers reads this, it's dashboard-only.
+    client_id: Mapped[int | None] = mapped_column(
+        ForeignKey("clients.id"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -112,6 +155,18 @@ class Job(Base):
     # (_resolve_account_credentials) and app/publishers/twitter.py.
     account_id: Mapped[int | None] = mapped_column(
         ForeignKey("accounts.id"), nullable=True
+    )
+
+    # Which Client workspace this job was created for (Phase 26). Kept
+    # independent of account_id rather than derived through Account.client_id
+    # — a job can exist for a client before any Account is connected (single-
+    # account/env-var fallback platforms like youtube/twitter), and the
+    # scheduler UI's screens (Queue/Calendar/Composer) all scope by the
+    # active client directly, not by an account's owner. Nullable: jobs
+    # created before this phase, or through a script with no client concept,
+    # keep working unchanged and simply show under no client.
+    client_id: Mapped[int | None] = mapped_column(
+        ForeignKey("clients.id"), nullable=True
     )
 
     status: Mapped[JobStatus] = mapped_column(

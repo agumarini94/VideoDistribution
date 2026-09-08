@@ -40,6 +40,7 @@ def _run_create_job(db_session, **overrides):
         file=None,
         media_files=[],
         account_id=None,
+        client_id=None,
         title=None,
         text=None,
         privacy=None,

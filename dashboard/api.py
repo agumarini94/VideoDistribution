@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 from app import storage
 from app.db import SessionLocal
 from app.exceptions import StorageNotConfiguredError
-from app.models import Account, Job, JobStatus, WebhookEvent
+from app.models import Account, Client, Job, JobStatus, WebhookEvent
 from app.tasks import handle_tiktok_webhook_event, publish_job
 from app.webhooks import tiktok as tiktok_webhooks
 
@@ -162,6 +162,35 @@ _VIDEO_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
 _ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook", "instagram"}
 
 
+def _extract_caption(payload: dict) -> str | None:
+    """
+    Best-effort human-readable label for a job's content, for screens that
+    show one line per post (Queue, Calendar, Approvals — scheduler UI,
+    Phase 26). Payload shapes vary by platform (see CLAUDE.md): "text" for
+    twitter/facebook/instagram, "title" for youtube/tiktok, "thread" (a list,
+    no top-level "text") for a twitter thread. Never raises — an
+    unrecognized/empty payload just yields None, displayed as a placeholder
+    by the frontend rather than breaking the row.
+    """
+    if not isinstance(payload, dict):
+        return None
+    text = payload.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    thread = payload.get("thread")
+    if isinstance(thread, list) and thread and isinstance(thread[0], dict):
+        first_text = thread[0].get("text")
+        if isinstance(first_text, str) and first_text.strip():
+            return first_text.strip()
+    title = payload.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    caption = payload.get("caption")
+    if isinstance(caption, str) and caption.strip():
+        return caption.strip()
+    return None
+
+
 class JobOut(BaseModel):
     id: int
     platform: str
@@ -171,9 +200,12 @@ class JobOut(BaseModel):
     scheduled_at: str | None
     created_at: str
     updated_at: str
+    client_id: int | None
+    client_name: str | None
+    caption: str | None
 
     @staticmethod
-    def from_job(job: Job) -> "JobOut":
+    def from_job(job: Job, client_name: str | None = None) -> "JobOut":
         return JobOut(
             id=job.id,
             platform=job.platform,
@@ -183,6 +215,9 @@ class JobOut(BaseModel):
             scheduled_at=job.scheduled_at.isoformat() if job.scheduled_at else None,
             created_at=job.created_at.isoformat(),
             updated_at=job.updated_at.isoformat(),
+            client_id=job.client_id,
+            client_name=client_name,
+            caption=_extract_caption(job.payload),
         )
 
 
@@ -202,23 +237,48 @@ class AccountOut(BaseModel):
     name: str
     is_active: bool
     created_at: str
+    client_id: int | None
+    client_name: str | None
     # Deliberately no credentials field: this response is served to the
     # browser, and Account.credentials holds live OAuth tokens / API
     # secrets (see app/models.py) that must never leave the server.
 
     @staticmethod
-    def from_account(account: Account) -> "AccountOut":
+    def from_account(account: Account, client_name: str | None = None) -> "AccountOut":
         return AccountOut(
             id=account.id,
             platform=account.platform,
             name=account.name,
             is_active=account.is_active,
             created_at=account.created_at.isoformat(),
+            client_id=account.client_id,
+            client_name=client_name,
         )
 
 
 class JobCreateOut(BaseModel):
     id: int
+
+
+class ClientOut(BaseModel):
+    id: int
+    name: str
+    kind: str
+    created_at: str
+
+    @staticmethod
+    def from_client(client: Client) -> "ClientOut":
+        return ClientOut(
+            id=client.id,
+            name=client.name,
+            kind=client.kind,
+            created_at=client.created_at.isoformat(),
+        )
+
+
+class ClientCreate(BaseModel):
+    name: str
+    kind: str = "client"
 
 
 @app.get("/health")
@@ -242,6 +302,7 @@ def health(db: Session = Depends(get_db)):
 def list_jobs(
     status: JobStatus | None = None,
     platform: str | None = None,
+    client_id: int | None = None,
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
@@ -250,8 +311,11 @@ def list_jobs(
         query = query.filter(Job.status == status)
     if platform is not None:
         query = query.filter(Job.platform == platform)
+    if client_id is not None:
+        query = query.filter(Job.client_id == client_id)
     jobs = query.order_by(Job.created_at.desc(), Job.id.desc()).limit(limit).all()
-    return [JobOut.from_job(job) for job in jobs]
+    client_names = {c.id: c.name for c in db.query(Client.id, Client.name)}
+    return [JobOut.from_job(job, client_names.get(job.client_id)) for job in jobs]
 
 
 @app.get("/api/stats", response_model=StatsOut)
@@ -285,12 +349,43 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/accounts", response_model=list[AccountOut])
-def list_accounts(platform: str | None = None, db: Session = Depends(get_db)):
+def list_accounts(
+    platform: str | None = None,
+    client_id: int | None = None,
+    db: Session = Depends(get_db),
+):
     query = db.query(Account)
     if platform is not None:
         query = query.filter(Account.platform == platform)
+    if client_id is not None:
+        query = query.filter(Account.client_id == client_id)
     accounts = query.order_by(Account.platform, Account.name).all()
-    return [AccountOut.from_account(account) for account in accounts]
+    client_names = {c.id: c.name for c in db.query(Client.id, Client.name)}
+    return [AccountOut.from_account(account, client_names.get(account.client_id)) for account in accounts]
+
+
+@app.get("/api/clients", response_model=list[ClientOut])
+def list_clients(db: Session = Depends(get_db)):
+    clients = db.query(Client).order_by(Client.name).all()
+    return [ClientOut.from_client(client) for client in clients]
+
+
+@app.post("/api/clients", response_model=ClientOut, status_code=201)
+def create_client(body: ClientCreate, db: Session = Depends(get_db)):
+    """
+    Creates a Client workspace (Phase 26 — see app/models.py::Client). Bare
+    minimum for the scheduler UI's client switcher/"Add client workspace"
+    tile: no dedup-by-name, no update/delete route yet — narrow enough that
+    adding those later is additive, not a breaking change.
+    """
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    client = Client(name=name, kind=body.kind.strip() or "client")
+    db.add(client)
+    db.commit()
+    db.refresh(client)
+    return ClientOut.from_client(client)
 
 
 async def _save_upload(file: UploadFile) -> Path:
@@ -326,6 +421,7 @@ async def create_job(
     file: UploadFile | None = File(default=None),
     media_files: list[UploadFile] = File(default=[]),
     account_id: int | None = Form(default=None),
+    client_id: int | None = Form(default=None),
     title: str | None = Form(default=None),
     text: str | None = Form(default=None),
     privacy: str | None = Form(default=None),
@@ -405,6 +501,9 @@ async def create_job(
             raise HTTPException(status_code=400, detail="Instagram posts require a media file (no text-only posts)")
         if len(uploaded_media_files) > 1:
             raise HTTPException(status_code=400, detail="Instagram posts support at most one media file")
+
+    if client_id is not None and db.get(Client, client_id) is None:
+        raise HTTPException(status_code=404, detail=f"Client {client_id} not found")
 
     account = None
     if account_id is not None:
@@ -487,6 +586,7 @@ async def create_job(
         platform=platform,
         payload=payload,
         account_id=account.id if account else None,
+        client_id=client_id,
         status=JobStatus.QUEUED,
     )
     db.add(job)

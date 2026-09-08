@@ -3,505 +3,355 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Distribution Engine — Dashboard</title>
+<title>Postline — Distribution Engine</title>
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@400;600&display=swap');
+
   :root {
-    color-scheme: light;
-    --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", "Courier New", monospace;
-
-    --bg: #ffffff;
-    --ink: #000000;
-    --panel: #ffffff;
-
-    --violet: #9D00FF;
-    --green: #22C55E;
-    --yellow: #FDE047;
-    --red: #EF4444;
-    --blue: #2B6CFF;
-    --gray: #9CA3AF;
-
-    --published: var(--green);
-    --failed: var(--red);
-    --scheduled: var(--blue);
-    --queued: var(--yellow);
-    --processing: var(--yellow);
-    --neutral: var(--gray);
-
-    --shadow-lg: 4px 4px 0 var(--ink);
-    --shadow-sm: 2px 2px 0 var(--ink);
-    --border: 3px solid var(--ink);
+    --bg: #f2f2f3;
+    --surface: #e9e9ea;
+    --ink: #1d1f20;
+    --accent: #5980a6;
+    --accent-hover: #597ea3;
+    --accent-dark: #416180;
+    --accent-deep: #2c455d;
+    --border: rgba(29, 31, 32, 0.16);
+    --border-soft: rgba(29, 31, 32, 0.08);
+    --muted: rgba(29, 31, 32, 0.55);
   }
 
   * { box-sizing: border-box; }
 
   body {
     margin: 0;
-    font-family: var(--font-mono);
+    font-family: 'Barlow', system-ui, sans-serif;
+    font-size: 15px;
     background: var(--bg);
     color: var(--ink);
-    padding: 0 0 48px;
   }
 
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 8px;
-    background: var(--violet);
-    border-bottom: var(--border);
-    padding: 20px 32px;
-    margin-bottom: 20px;
-  }
-
-  h1 {
-    font-size: 22px;
-    font-weight: 800;
+  h1, h2, h3, .heading {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-weight: 600;
     margin: 0;
-    color: #fff;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
   }
 
-  #last-updated {
-    color: #fff;
-    font-size: 12px;
-    text-transform: uppercase;
-    font-weight: 700;
-  }
+  button { font-family: inherit; }
 
-  main {
-    padding: 0 32px;
-  }
+  .app { display: flex; min-height: 100vh; }
 
-  /* Buttons — shared neobrutalist button system: flat bg, black border,
-     hard offset shadow; hover presses the button toward the shadow. */
-  .btn {
-    font-family: var(--font-mono);
-    font-weight: 800;
-    text-transform: uppercase;
-    letter-spacing: 0.02em;
-    border: var(--border);
-    border-radius: 0;
-    background: #fff;
-    color: var(--ink);
-    padding: 9px 18px;
-    font-size: 12px;
-    box-shadow: var(--shadow-lg);
-    cursor: pointer;
-    transition: transform 0.05s ease, box-shadow 0.05s ease;
-  }
-
-  .btn:hover:not(:disabled) {
-    transform: translate(2px, 2px);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .btn:active:not(:disabled) {
-    transform: translate(4px, 4px);
-    box-shadow: 0 0 0 var(--ink);
-  }
-
-  .btn:disabled { opacity: 0.5; cursor: default; }
-
-  .btn-green { background: var(--green); }
-
-  /* Tabs */
-  .tabs {
-    display: flex;
-    gap: 12px;
-    margin: 0 32px 24px;
-    flex-wrap: wrap;
-  }
-
-  .tab-btn.active { background: var(--ink); color: #fff; }
-
-  .tab-panel { display: none; }
-  .tab-panel.active { display: block; }
-
-  .stat-cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 16px;
-    margin-bottom: 28px;
-  }
-
-  .card {
-    background: var(--panel);
-    border: var(--border);
-    box-shadow: var(--shadow-lg);
-    padding: 14px 16px;
-  }
-
-  .card .label {
-    font-size: 12px;
-    text-transform: uppercase;
-    font-weight: 800;
-    letter-spacing: 0.04em;
-    color: var(--ink);
-    margin-bottom: 8px;
-  }
-
-  .card .value {
-    font-size: 32px;
-    font-weight: 800;
-    font-family: var(--font-mono);
-  }
-
-  .card.published .value { color: var(--published); }
-  .card.failed .value { color: var(--failed); }
-  .card.scheduled .value { color: var(--scheduled); }
-  .card.queued .value,
-  .card.processing .value { color: #CA8A04; }
-
-  .filters {
-    display: flex;
-    gap: 12px;
-    align-items: center;
-    margin-bottom: 18px;
-    flex-wrap: wrap;
-  }
-
-  select, input[type="text"], input[type="file"] {
-    background: #fff;
-    color: var(--ink);
-    border: var(--border);
-    box-shadow: var(--shadow-sm);
-    border-radius: 0;
-    padding: 8px 12px;
-    font-size: 13px;
-    font-family: var(--font-mono);
-    font-weight: 700;
-  }
-
-  select { text-transform: uppercase; appearance: none; cursor: pointer; }
-
-  select:focus, input:focus {
-    outline: none;
-    box-shadow: var(--shadow-lg);
-  }
-
-  .table-wrap {
-    background: var(--panel);
-    border: var(--border);
-    box-shadow: var(--shadow-lg);
-    overflow: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-    min-width: 760px;
-  }
-
-  th, td {
-    text-align: left;
-    padding: 10px 14px;
-    border-bottom: 3px solid var(--ink);
-    border-right: 3px solid var(--ink);
-    white-space: nowrap;
-  }
-
-  th:last-child, td:last-child { border-right: none; }
-
-  thead th {
-    background: var(--violet);
-    color: #fff;
-    font-weight: 800;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    border-bottom: 3px solid var(--ink);
-  }
-
-  tr:last-child td { border-bottom: none; }
-
-  tr.row-failed td { background: #FEE2E2; }
-
-  td.error-cell {
-    max-width: 260px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    cursor: help;
-  }
-
-  .badge {
-    display: inline-block;
-    padding: 3px 10px;
-    border: 2px solid var(--ink);
-    border-radius: 0;
-    font-size: 11px;
-    font-weight: 800;
-    text-transform: uppercase;
-    color: var(--ink);
-  }
-
-  .badge.published { background: var(--green); }
-  .badge.failed { background: var(--red); color: #fff; }
-  .badge.scheduled { background: var(--blue); color: #fff; }
-  .badge.queued, .badge.processing { background: var(--yellow); }
-
-  .badge.platform { background: var(--yellow); }
-  .badge.active { background: var(--green); }
-  .badge.inactive { background: var(--gray); }
-
-  .empty {
-    padding: 24px;
-    text-align: center;
-    color: var(--ink);
-    font-weight: 700;
-    text-transform: uppercase;
-    font-size: 12px;
-  }
-
-  .readonly-note {
-    color: var(--ink);
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    margin-top: 14px;
-  }
-
-  /* New job form */
-  .form-card {
-    max-width: 480px;
-  }
-
-  .field {
-    margin-bottom: 16px;
+  /* ---------------- Sidebar ---------------- */
+  .sidebar {
+    width: 216px;
+    flex: none;
+    border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    padding: 20px 14px;
+    gap: 24px;
   }
 
-  .field label {
-    font-size: 11px;
-    font-weight: 800;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+  .brand { display: flex; align-items: center; gap: 9px; padding: 0 6px; }
+  .brand-mark {
+    width: 26px; height: 26px; border: 1px solid var(--accent);
+    display: flex; align-items: center; justify-content: center; flex: none; color: var(--accent);
+  }
+  .brand-name { font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 19px; letter-spacing: -0.01em; }
+
+  .nav { display: flex; flex-direction: column; gap: 2px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px; padding: 9px 10px; cursor: pointer;
+    font-size: 14px; border: none; background: none; color: var(--ink); text-align: left; width: 100%;
+  }
+  .nav-item svg { width: 16px; height: 16px; flex: none; }
+  .nav-item.active { background: var(--accent); color: var(--bg); }
+  .nav-item:hover:not(.active) { background: var(--border-soft); }
+
+  .sidebar-footer {
+    margin-top: auto; padding: 10px 6px 0; border-top: 1px solid var(--border);
+    font-size: 11px; color: var(--muted);
   }
 
-  .field select, .field input { width: 100%; }
+  /* ---------------- Topbar ---------------- */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
-  .result-box {
-    margin-top: 16px;
-    padding: 12px 14px;
-    border: var(--border);
-    font-size: 13px;
-    font-weight: 700;
+  .topbar {
+    display: flex; align-items: center; gap: 14px; padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
   }
 
-  .result-box.ok { background: var(--green); }
-  .result-box.err { background: var(--red); color: #fff; }
+  .client-switch { position: relative; }
+  .client-switch-btn {
+    display: flex; align-items: center; gap: 8px; border: 1px solid var(--border);
+    padding: 7px 12px; cursor: pointer; min-width: 190px; background: var(--bg); color: var(--ink);
+  }
+  .client-initial {
+    width: 20px; height: 20px; border: 1px solid var(--accent-dark); display: flex; align-items: center;
+    justify-content: center; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 11px;
+    color: var(--accent-dark); flex: none;
+  }
+  .client-switch-btn .name { flex: 1; font-size: 14px; text-align: left; }
+  .client-switch-btn svg { width: 14px; height: 14px; color: var(--muted); }
+
+  .client-menu {
+    position: absolute; top: calc(100% + 4px); left: 0; width: 240px; background: var(--bg);
+    border: 1px solid var(--border); box-shadow: 0 3px 10px rgba(43,43,45,0.16); z-index: 20;
+  }
+  .client-menu-item {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px; cursor: pointer; font-size: 13px; border: none;
+    background: none; width: 100%; text-align: left; color: var(--ink);
+  }
+  .client-menu-item:hover { background: var(--border-soft); }
+  .client-menu-item .kind { font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .client-menu-add {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px; cursor: pointer; font-size: 13px;
+    color: var(--accent-dark); border-top: 1px solid var(--border); background: none; border-left: none;
+    border-right: none; border-bottom: none; width: 100%; text-align: left;
+  }
+  .client-menu-add:hover { background: var(--border-soft); }
+  .client-menu-add svg { width: 14px; height: 14px; }
+
+  .screen-title { flex: 1; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 20px; }
+
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 6px; background: var(--accent); color: var(--bg);
+    border: 1px solid var(--accent); padding: 8px 16px; font-family: 'Barlow Condensed', sans-serif;
+    font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .btn-primary svg { width: 14px; height: 14px; }
+
+  .btn-secondary {
+    display: inline-flex; align-items: center; gap: 6px; background: var(--bg); color: var(--ink);
+    border: 1px solid var(--border); padding: 7px 14px; font-family: 'Barlow Condensed', sans-serif;
+    font-weight: 600; font-size: 13px; cursor: pointer;
+  }
+  .btn-secondary:hover { background: var(--border-soft); }
+  .btn-secondary svg { width: 13px; height: 13px; }
+
+  .content { padding: 24px; flex: 1; overflow: auto; }
+
+  /* ---------------- Calendar ---------------- */
+  .calendar-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; gap: 12px; }
+  .calendar-context { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .month-nav-btn {
+    border: 1px solid var(--border); background: var(--bg); width: 26px; height: 26px; display: flex;
+    align-items: center; justify-content: center; cursor: pointer; color: var(--ink);
+  }
+  .month-nav-btn:hover { background: var(--border-soft); }
+  .month-nav-btn svg { width: 13px; height: 13px; }
+
+  .seg-control { display: inline-flex; border: 1px solid var(--border); }
+  .seg-btn { padding: 6px 14px; font-size: 13px; cursor: pointer; border: none; background: var(--bg); color: var(--ink); }
+  .seg-btn.active { background: var(--accent); color: var(--bg); }
+
+  .month-grid-wrap { position: relative; border: 1px solid var(--border); }
+  .reg-mark { position: absolute; width: 11px; height: 11px; color: var(--muted); }
+  .reg-mark::before, .reg-mark::after { content: ""; position: absolute; background: currentColor; }
+  .reg-mark::before { left: 5px; top: 0; width: 1px; height: 100%; }
+  .reg-mark::after { top: 5px; left: 0; width: 100%; height: 1px; }
+  .reg-tl { top: -6px; left: -6px; } .reg-tr { top: -6px; right: -6px; }
+  .reg-bl { bottom: -6px; left: -6px; } .reg-br { bottom: -6px; right: -6px; }
+
+  .month-grid { display: grid; grid-template-columns: repeat(7, 1fr); }
+  .weekday-cell {
+    padding: 8px 10px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); border-bottom: 1px solid var(--border);
+  }
+  .day-cell {
+    min-height: 96px; padding: 6px; border-right: 1px solid var(--border-soft);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .day-cell.faded { opacity: 0.35; }
+  .day-num { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .day-jobs { display: flex; flex-direction: column; gap: 3px; }
+  .job-chip {
+    display: flex; align-items: center; gap: 5px; font-size: 10.5px; padding: 2px 5px; cursor: default;
+    overflow: hidden;
+  }
+  .job-chip .letter { font-family: 'Barlow Condensed', sans-serif; font-weight: 600; flex: none; }
+  .job-chip .caption { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .day-overflow { font-size: 10px; color: var(--muted); }
+
+  .agenda-group { margin-bottom: 18px; }
+  .agenda-group-label { font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 15px; margin-bottom: 8px; }
+  .agenda-row {
+    display: flex; align-items: center; gap: 14px; padding: 11px 4px; border-bottom: 1px solid var(--border-soft);
+  }
+  .agenda-time { width: 52px; font-size: 12px; color: var(--muted); flex: none; }
+  .platform-box {
+    width: 22px; height: 22px; border: 1px solid rgba(29,31,32,0.25); display: flex; align-items: center;
+    justify-content: center; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 11px;
+    color: var(--accent-dark); flex: none;
+  }
+  .agenda-caption { flex: 1; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agenda-client { font-size: 11px; color: var(--muted); flex: none; }
+  .status-pill { font-size: 11px; padding: 3px 9px; flex: none; }
+
+  /* ---------------- Queue ---------------- */
+  .filter-chips { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .filter-chip {
+    padding: 6px 13px; font-size: 12.5px; cursor: pointer; border: 1px solid var(--border); background: var(--bg);
+    color: var(--ink);
+  }
+  .filter-chip.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+
+  table.data-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  table.data-table th {
+    text-align: left; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+    padding: 8px; border-bottom: 1px solid var(--border);
+  }
+  table.data-table td { padding: 9px 8px; border-bottom: 1px solid var(--border-soft); }
+  table.data-table td.truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  table.data-table td.muted { color: var(--muted); }
+  .retry-link {
+    display: inline-flex; align-items: center; gap: 5px; color: var(--accent-dark); cursor: pointer;
+    font-size: 12.5px; border: none; background: none; padding: 0;
+  }
+  .retry-link:hover { color: var(--accent-deep); }
+  .retry-link svg { width: 13px; height: 13px; }
+  .retry-link:disabled { opacity: 0.5; cursor: default; }
+
+  .empty-state { padding: 40px 0; text-align: center; color: var(--muted); font-size: 13.5px; }
+  .error-state { padding: 16px; border: 1px solid var(--border); background: #f5e7e7; color: #7a3030; font-size: 13.5px; }
+
+  /* ---------------- Placeholder screens ---------------- */
+  .placeholder { border: 1px solid var(--border); padding: 40px 24px; text-align: center; color: var(--muted); }
+  .placeholder .heading { font-size: 18px; margin-bottom: 8px; color: var(--ink); }
+  .placeholder p { font-size: 13.5px; margin: 0; }
+
+  /* Basic accounts list */
+  .accounts-list { display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); }
+  .account-row { display: flex; align-items: center; gap: 14px; padding: 13px 14px; border-bottom: 1px solid var(--border-soft); }
+  .account-row:last-child { border-bottom: none; }
+  .account-name { font-size: 13.5px; }
+  .account-sub { font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
 
-<header>
-  <h1>Distribution Engine</h1>
-  <div id="last-updated">Loading…</div>
-</header>
+<div class="app">
 
-<nav class="tabs">
-  <button class="btn tab-btn active" data-tab="monitor">Monitor</button>
-  <button class="btn tab-btn" data-tab="newjob">New Job</button>
-  <button class="btn tab-btn" data-tab="accounts">Accounts</button>
-</nav>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <i data-lucide="send" style="width:14px;height:14px;"></i>
+      </div>
+      <div class="brand-name">Postline</div>
+    </div>
 
-<main>
+    <nav class="nav" id="nav"></nav>
 
-<section class="tab-panel active" id="tab-monitor">
+    <div class="sidebar-footer">Workflow: Individual + Agency</div>
+  </aside>
 
-  <div class="stat-cards" id="stat-cards"></div>
+  <div class="main">
+    <div class="topbar">
+      <div class="client-switch" id="client-switch"></div>
+      <div class="screen-title" id="screen-title"></div>
+      <button class="btn-primary" id="new-post-btn">
+        <i data-lucide="plus"></i> New post
+      </button>
+    </div>
 
-  <div class="filters">
-    <select id="filter-status">
-      <option value="">All statuses</option>
-    </select>
-    <select id="filter-platform">
-      <option value="">All platforms</option>
-    </select>
+    <div class="content" id="content"></div>
   </div>
 
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Platform</th>
-          <th>Status</th>
-          <th>Attempts</th>
-          <th>Scheduled at</th>
-          <th>Error</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody id="jobs-body"></tbody>
-    </table>
-    <div class="empty" id="empty-msg" style="display:none;">No jobs match the current filters.</div>
-  </div>
+</div>
 
-  <p class="readonly-note">Read-only, except the Retry action on failed jobs. Auto-refreshes every 5s.</p>
-
-</section>
-
-<section class="tab-panel" id="tab-newjob">
-
-  <div class="card form-card">
-    <form id="new-job-form">
-      <div class="field">
-        <label for="job-platform">Platform</label>
-        <select id="job-platform" required>
-          <option value="">Select platform…</option>
-          <option value="youtube">YouTube</option>
-          <option value="tiktok">TikTok</option>
-          <option value="twitter">Twitter/X</option>
-          <option value="facebook">Facebook</option>
-          <option value="instagram">Instagram</option>
-        </select>
-      </div>
-
-      <div class="field">
-        <label for="job-account">Account</label>
-        <select id="job-account" disabled>
-          <option value="">Select a platform first…</option>
-        </select>
-      </div>
-
-      <div class="field" id="job-video-field">
-        <label for="job-file">Video file</label>
-        <input type="file" id="job-file" accept="video/*">
-      </div>
-
-      <div class="field" id="job-title-field">
-        <label for="job-title">Title (optional)</label>
-        <input type="text" id="job-title" placeholder="Auto-generated if left blank">
-      </div>
-
-      <div id="job-youtube-fields" style="display:none;">
-        <div class="field">
-          <label for="job-privacy">Privacy</label>
-          <select id="job-privacy">
-            <option value="private">Private</option>
-            <option value="unlisted">Unlisted</option>
-            <option value="public">Public</option>
-          </select>
-        </div>
-
-        <div class="field">
-          <label for="job-shorts">
-            <input type="checkbox" id="job-shorts" style="width:auto;">
-            Shorts (must be ≤60s, vertical)
-          </label>
-        </div>
-
-        <div class="field">
-          <label for="job-playlist-id">Playlist ID (optional)</label>
-          <input type="text" id="job-playlist-id" placeholder="e.g. PLxxxxxxxxxxxxxxxx">
-        </div>
-      </div>
-
-      <div id="job-twitter-fields" style="display:none;">
-        <div class="field">
-          <label for="job-text">Tweet text</label>
-          <input type="text" id="job-text" placeholder="What's happening?" maxlength="280">
-        </div>
-
-        <div class="field">
-          <label for="job-media-files">Media (optional — up to 4 images, or 1 video)</label>
-          <input type="file" id="job-media-files" accept="image/*,video/*" multiple>
-        </div>
-      </div>
-
-      <div id="job-facebook-fields" style="display:none;">
-        <div class="field">
-          <label for="job-fb-text">Post text (optional if a media file is attached)</label>
-          <input type="text" id="job-fb-text" placeholder="What's on your mind?">
-        </div>
-
-        <div class="field">
-          <label for="job-fb-media-file">Media (optional — 1 photo or video)</label>
-          <input type="file" id="job-fb-media-file" accept="image/*,video/*">
-        </div>
-      </div>
-
-      <div id="job-instagram-fields" style="display:none;">
-        <p class="readonly-note" style="margin-top:0;">
-          Requires Cloudflare R2 configured (R2_* in .env) — Meta downloads media from a public URL, so this
-          upload must stage successfully to R2 or job creation will be rejected.
-        </p>
-        <div class="field">
-          <label for="job-ig-text">Caption (optional)</label>
-          <input type="text" id="job-ig-text" placeholder="Write a caption…">
-        </div>
-
-        <div class="field">
-          <label for="job-ig-media-file">Media (required — 1 photo or video)</label>
-          <input type="file" id="job-ig-media-file" accept="image/*,video/*">
-        </div>
-      </div>
-
-      <button type="submit" class="btn btn-green" id="job-submit">Create job</button>
-    </form>
-
-    <div id="job-result"></div>
-  </div>
-
-</section>
-
-<section class="tab-panel" id="tab-accounts">
-
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Platform</th>
-          <th>Name</th>
-          <th>Status</th>
-          <th>Created</th>
-        </tr>
-      </thead>
-      <tbody id="accounts-body"></tbody>
-    </table>
-    <div class="empty" id="accounts-empty" style="display:none;">No accounts found.</div>
-  </div>
-
-</section>
-
-</main>
-
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
 <script>
-const STATUSES = ["scheduled", "queued", "processing", "published", "failed"];
-const REFRESH_MS = 5000;
+// ---------------------------------------------------------------------
+// Postline scheduler UI (Phase 26) — Calendar and Queue are fully wired
+// to the backend; every other nav item is a placeholder until its own
+// phase (see CLAUDE.md Phase 26 "explicitly deferred" list). Vanilla JS,
+// no build step, single re-render pass per state change — same
+// no-framework convention as the dashboard this replaces.
+// ---------------------------------------------------------------------
 
-const statusFilter = document.getElementById("filter-status");
-const platformFilter = document.getElementById("filter-platform");
-const jobsBody = document.getElementById("jobs-body");
-const emptyMsg = document.getElementById("empty-msg");
-const lastUpdated = document.getElementById("last-updated");
-const statCards = document.getElementById("stat-cards");
+const NAV_ITEMS = [
+  { id: "calendar", label: "Calendar", icon: "calendar" },
+  { id: "queue", label: "Queue", icon: "list" },
+  { id: "approvals", label: "Approvals", icon: "check-square" },
+  { id: "analytics", label: "Analytics", icon: "bar-chart-2" },
+  { id: "media", label: "Media library", icon: "image" },
+  { id: "accounts", label: "Connected accounts", icon: "plug" },
+  { id: "clients", label: "Clients", icon: "users" },
+];
 
-STATUSES.forEach(s => {
-  const opt = document.createElement("option");
-  opt.value = s;
-  opt.textContent = s;
-  statusFilter.appendChild(opt);
-});
+const SCREEN_TITLES = {
+  calendar: "Calendar",
+  queue: "Queue",
+  approvals: "Approvals",
+  analytics: "Analytics",
+  media: "Media library",
+  accounts: "Connected accounts",
+  clients: "Clients",
+  composer: "New post",
+};
 
-let knownPlatforms = new Set();
+const PLATFORM_LETTERS = { youtube: "Y", tiktok: "T", twitter: "X", facebook: "F", instagram: "I" };
+const PLATFORM_LABELS = { youtube: "YouTube", tiktok: "TikTok", twitter: "X (Twitter)", facebook: "Facebook", instagram: "Instagram" };
 
-function fmtDate(iso) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleString();
+const STATUS_STYLE = {
+  scheduled: { bg: "#eef6ff", color: "#2c455d", label: "Scheduled" },
+  queued: { bg: "#e7e7ea", color: "#424244", label: "Queued" },
+  processing: { bg: "#d6ebff", color: "#416180", label: "Processing" },
+  published: { bg: "#eef6ff", color: "#1d2d3d", label: "Published" },
+  failed: { bg: "#f5e7e7", color: "#7a3030", label: "Failed" },
+};
+
+const QUEUE_FILTERS = [
+  { id: "all", label: "All" },
+  { id: "scheduled", label: "Scheduled" },
+  { id: "queued", label: "Queued" },
+  { id: "published", label: "Published" },
+  { id: "failed", label: "Failed" },
+];
+
+const WEEKDAY_LABELS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+const state = {
+  screen: "calendar",
+  calendarView: "month",
+  monthOffset: 0,
+  clients: [],
+  clientsLoaded: false,
+  activeClientId: null, // null = all workspaces
+  clientMenuOpen: false,
+  queueFilter: "all",
+  jobs: [],
+  jobsLoading: false,
+  jobsError: null,
+  accounts: [],
+  accountsLoading: false,
+  accountsError: null,
+};
+
+function platformLetter(p) {
+  return (PLATFORM_LETTERS[p] || (p ? p[0] : "?")).toUpperCase();
 }
-
+function platformLabel(p) {
+  return PLATFORM_LABELS[p] || p;
+}
+function statusStyle(status) {
+  return STATUS_STYLE[status] || { bg: "#e7e7ea", color: "#424244", label: status };
+}
 function escapeHtml(str) {
   const div = document.createElement("div");
-  div.textContent = str;
+  div.textContent = str == null ? "" : String(str);
   return div.innerHTML;
+}
+function jobDate(job) {
+  return job.scheduled_at || job.created_at;
+}
+function fmtDateLabel(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+function fmtTimeLabel(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
 async function fetchJson(url, opts) {
@@ -516,321 +366,517 @@ async function fetchJson(url, opts) {
     err.status = res.status;
     throw err;
   }
+  if (res.status === 204) return null;
   return res.json();
 }
 
-function renderStats(stats) {
-  statCards.innerHTML = "";
-  const order = ["scheduled", "queued", "processing", "published", "failed"];
-  order.forEach(status => {
-    const card = document.createElement("div");
-    card.className = `card ${status}`;
-    card.innerHTML = `
-      <div class="label">${status}</div>
-      <div class="value">${stats.by_status[status] ?? 0}</div>
-    `;
-    statCards.appendChild(card);
-  });
-  const total = document.createElement("div");
-  total.className = "card";
-  total.innerHTML = `<div class="label">Total</div><div class="value">${stats.total}</div>`;
-  statCards.appendChild(total);
-}
+// ---------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------
 
-function renderPlatformOptions(jobs) {
-  const platforms = new Set(jobs.map(j => j.platform));
-  let changed = false;
-  platforms.forEach(p => {
-    if (!knownPlatforms.has(p)) changed = true;
-  });
-  if (!changed) return;
-  knownPlatforms = new Set([...knownPlatforms, ...platforms]);
-
-  const current = platformFilter.value;
-  platformFilter.innerHTML = '<option value="">All platforms</option>';
-  [...knownPlatforms].sort().forEach(p => {
-    const opt = document.createElement("option");
-    opt.value = p;
-    opt.textContent = p;
-    platformFilter.appendChild(opt);
-  });
-  platformFilter.value = current;
-}
-
-function renderJobs(jobs) {
-  jobsBody.innerHTML = "";
-  emptyMsg.style.display = jobs.length === 0 ? "block" : "none";
-
-  jobs.forEach(job => {
-    const tr = document.createElement("tr");
-    if (job.status === "failed") tr.classList.add("row-failed");
-
-    const errorText = job.error_message || "";
-    const truncated = errorText.length > 60 ? errorText.slice(0, 60) + "…" : errorText || "—";
-
-    tr.innerHTML = `
-      <td>${job.id}</td>
-      <td>${escapeHtml(job.platform)}</td>
-      <td><span class="badge ${job.status}">${job.status}</span></td>
-      <td>${job.attempts}</td>
-      <td>${fmtDate(job.scheduled_at)}</td>
-      <td class="error-cell" title="${escapeHtml(errorText)}">${escapeHtml(truncated)}</td>
-      <td></td>
-    `;
-
-    if (job.status === "failed") {
-      const btn = document.createElement("button");
-      btn.className = "btn btn-green";
-      btn.textContent = "Retry";
-      btn.onclick = async () => {
-        btn.disabled = true;
-        btn.textContent = "Retrying…";
-        try {
-          await fetchJson(`/api/jobs/${job.id}/retry`, { method: "POST" });
-          await refresh();
-        } catch (e) {
-          alert(`Retry failed: ${e.message}`);
-          btn.disabled = false;
-          btn.textContent = "Retry";
-        }
-      };
-      tr.lastElementChild.appendChild(btn);
-    }
-
-    jobsBody.appendChild(tr);
-  });
-}
-
-async function refresh() {
+async function loadClients() {
   try {
-    const [stats, jobs] = await Promise.all([
-      fetchJson("/api/stats"),
-      fetchJson(
-        "/api/jobs?" +
-          new URLSearchParams({
-            ...(statusFilter.value ? { status: statusFilter.value } : {}),
-            ...(platformFilter.value ? { platform: platformFilter.value } : {}),
-            limit: 50,
-          })
-      ),
-    ]);
-    renderStats(stats);
-    renderPlatformOptions(jobs);
-    renderJobs(jobs);
-    lastUpdated.textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+    state.clients = await fetchJson("/api/clients");
   } catch (e) {
-    lastUpdated.textContent = `Update failed: ${e.message}`;
+    state.clients = [];
   }
+  state.clientsLoaded = true;
+  renderAll();
 }
 
-statusFilter.addEventListener("change", refresh);
-platformFilter.addEventListener("change", refresh);
-
-refresh();
-setInterval(refresh, REFRESH_MS);
-
-// --- Tabs ---------------------------------------------------------------
-
-const tabButtons = document.querySelectorAll(".tab-btn");
-const tabPanels = {
-  monitor: document.getElementById("tab-monitor"),
-  newjob: document.getElementById("tab-newjob"),
-  accounts: document.getElementById("tab-accounts"),
-};
-
-function showTab(name) {
-  tabButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === name));
-  Object.entries(tabPanels).forEach(([key, el]) => el.classList.toggle("active", key === name));
-  if (name === "accounts") loadAccountsTab();
-  if (name === "newjob") {
-    loadAccountOptions(jobPlatformSelect.value);
-    togglePlatformFields(jobPlatformSelect.value);
-  }
-}
-
-tabButtons.forEach(btn => btn.addEventListener("click", () => showTab(btn.dataset.tab)));
-
-// --- Accounts tab ---------------------------------------------------------
-
-const accountsBody = document.getElementById("accounts-body");
-const accountsEmpty = document.getElementById("accounts-empty");
-
-async function loadAccountsTab() {
-  accountsBody.innerHTML = "";
+async function loadJobs() {
+  state.jobsLoading = true;
+  state.jobsError = null;
+  renderAll();
+  const params = new URLSearchParams({ limit: "500" });
+  if (state.activeClientId != null) params.set("client_id", state.activeClientId);
   try {
-    const accounts = await fetchJson("/api/accounts");
-    accountsEmpty.style.display = accounts.length === 0 ? "block" : "none";
-    accounts.forEach(a => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${a.id}</td>
-        <td><span class="badge platform">${escapeHtml(a.platform)}</span></td>
-        <td>${escapeHtml(a.name)}</td>
-        <td><span class="badge ${a.is_active ? "active" : "inactive"}">${a.is_active ? "Active" : "Inactive"}</span></td>
-        <td>${fmtDate(a.created_at)}</td>
-      `;
-      accountsBody.appendChild(tr);
+    state.jobs = await fetchJson("/api/jobs?" + params.toString());
+  } catch (e) {
+    state.jobsError = e.message;
+  }
+  state.jobsLoading = false;
+  renderAll();
+}
+
+async function loadAccounts() {
+  state.accountsLoading = true;
+  state.accountsError = null;
+  renderAll();
+  const params = new URLSearchParams();
+  if (state.activeClientId != null) params.set("client_id", state.activeClientId);
+  try {
+    state.accounts = await fetchJson("/api/accounts?" + params.toString());
+  } catch (e) {
+    state.accountsError = e.message;
+  }
+  state.accountsLoading = false;
+  renderAll();
+}
+
+async function retryJob(id) {
+  const btn = document.querySelector(`[data-retry-id="${id}"]`);
+  if (btn) { btn.disabled = true; btn.textContent = "Retrying…"; }
+  try {
+    await fetchJson(`/api/jobs/${id}/retry`, { method: "POST" });
+    await loadJobs();
+  } catch (e) {
+    alert(`Retry failed: ${e.message}`);
+    renderAll();
+  }
+}
+
+async function addClientWorkspace() {
+  const name = window.prompt("Client workspace name (e.g. \"Bloom Studio\"):");
+  if (!name || !name.trim()) return;
+  const isIndividual = window.confirm(
+    "Is this your own brand (Individual)?\nOK = Individual, Cancel = Agency client"
+  );
+  try {
+    const client = await fetchJson("/api/clients", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim(), kind: isIndividual ? "individual" : "client" }),
     });
+    state.clients.push(client);
+    state.activeClientId = client.id;
+    state.clientMenuOpen = false;
+    renderAll();
+    if (state.screen === "calendar" || state.screen === "queue") loadJobs();
+    if (state.screen === "accounts") loadAccounts();
   } catch (e) {
-    accountsEmpty.style.display = "none";
-    accountsBody.innerHTML = `<tr><td colspan="5">Failed to load accounts: ${escapeHtml(e.message)}</td></tr>`;
+    alert(`Could not create client workspace: ${e.message}`);
   }
 }
 
-// --- New job tab ----------------------------------------------------------
-
-const jobPlatformSelect = document.getElementById("job-platform");
-const jobAccountSelect = document.getElementById("job-account");
-const jobVideoField = document.getElementById("job-video-field");
-const jobFileInput = document.getElementById("job-file");
-const jobTitleField = document.getElementById("job-title-field");
-const jobTitleInput = document.getElementById("job-title");
-const jobForm = document.getElementById("new-job-form");
-const jobResult = document.getElementById("job-result");
-const jobSubmitBtn = document.getElementById("job-submit");
-const jobYoutubeFields = document.getElementById("job-youtube-fields");
-const jobPrivacySelect = document.getElementById("job-privacy");
-const jobShortsCheckbox = document.getElementById("job-shorts");
-const jobPlaylistIdInput = document.getElementById("job-playlist-id");
-const jobTwitterFields = document.getElementById("job-twitter-fields");
-const jobTextInput = document.getElementById("job-text");
-const jobMediaFilesInput = document.getElementById("job-media-files");
-const jobFacebookFields = document.getElementById("job-facebook-fields");
-const jobFbTextInput = document.getElementById("job-fb-text");
-const jobFbMediaFileInput = document.getElementById("job-fb-media-file");
-const jobInstagramFields = document.getElementById("job-instagram-fields");
-const jobIgTextInput = document.getElementById("job-ig-text");
-const jobIgMediaFileInput = document.getElementById("job-ig-media-file");
-
-const VIDEO_UPLOAD_PLATFORMS = new Set(["youtube", "tiktok"]);
-const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram"]);
-
-function togglePlatformFields(platform) {
-  const isVideo = VIDEO_UPLOAD_PLATFORMS.has(platform);
-  jobVideoField.style.display = isVideo ? "flex" : "none";
-  jobTitleField.style.display = isVideo ? "flex" : "none";
-  jobYoutubeFields.style.display = platform === "youtube" ? "block" : "none";
-  jobTwitterFields.style.display = platform === "twitter" ? "block" : "none";
-  jobFacebookFields.style.display = platform === "facebook" ? "block" : "none";
-  jobInstagramFields.style.display = platform === "instagram" ? "block" : "none";
+function selectClient(id) {
+  state.activeClientId = id;
+  state.clientMenuOpen = false;
+  renderAll();
+  if (state.screen === "calendar" || state.screen === "queue") loadJobs();
+  if (state.screen === "accounts") loadAccounts();
 }
 
-function resultBox(ok, msg) {
-  return `<div class="result-box ${ok ? "ok" : "err"}">${escapeHtml(msg)}</div>`;
+function toggleClientMenu() {
+  state.clientMenuOpen = !state.clientMenuOpen;
+  renderAll();
 }
 
-async function loadAccountOptions(platform) {
-  if (!platform) {
-    jobAccountSelect.innerHTML = '<option value="">Select a platform first…</option>';
-    jobAccountSelect.disabled = true;
-    return;
+function goScreen(id) {
+  state.screen = id;
+  state.clientMenuOpen = false;
+  renderAll();
+  if ((id === "calendar" || id === "queue") && !state.jobsLoading && state.jobs.length === 0 && !state.jobsError) {
+    loadJobs();
   }
-  jobAccountSelect.disabled = false;
-  jobAccountSelect.innerHTML = '<option value="">Loading…</option>';
-  try {
-    const accounts = await fetchJson("/api/accounts?" + new URLSearchParams({ platform }));
-    jobAccountSelect.innerHTML = "";
-    const placeholder = document.createElement("option");
-    placeholder.value = "";
-    placeholder.textContent = ACCOUNT_REQUIRED_PLATFORMS.has(platform)
-      ? "Select an account…"
-      : "No account (single-account fallback)";
-    jobAccountSelect.appendChild(placeholder);
-    accounts.filter(a => a.is_active).forEach(a => {
-      const opt = document.createElement("option");
-      opt.value = a.id;
-      opt.textContent = a.name;
-      jobAccountSelect.appendChild(opt);
+  if (id === "accounts") loadAccounts();
+}
+
+function setCalendarView(view) {
+  state.calendarView = view;
+  renderAll();
+}
+
+function shiftMonth(delta) {
+  state.monthOffset += delta;
+  renderAll();
+}
+
+function setQueueFilter(id) {
+  state.queueFilter = id;
+  renderAll();
+}
+
+// ---------------------------------------------------------------------
+// Render: sidebar
+// ---------------------------------------------------------------------
+
+function renderNav() {
+  const nav = document.getElementById("nav");
+  nav.innerHTML = "";
+  NAV_ITEMS.forEach((item) => {
+    const btn = document.createElement("button");
+    btn.className = "nav-item" + (state.screen === item.id ? " active" : "");
+    btn.innerHTML = `<i data-lucide="${item.icon}"></i><span>${escapeHtml(item.label)}</span>`;
+    btn.addEventListener("click", () => goScreen(item.id));
+    nav.appendChild(btn);
+  });
+}
+
+// ---------------------------------------------------------------------
+// Render: topbar
+// ---------------------------------------------------------------------
+
+function activeClientLabel() {
+  if (state.activeClientId == null) return { initial: "*", name: "All workspaces" };
+  const c = state.clients.find((c) => c.id === state.activeClientId);
+  if (!c) return { initial: "*", name: "All workspaces" };
+  return { initial: c.name.trim()[0].toUpperCase(), name: c.name };
+}
+
+function renderClientSwitch() {
+  const wrap = document.getElementById("client-switch");
+  const active = activeClientLabel();
+
+  let menuHtml = "";
+  if (state.clientMenuOpen) {
+    const allItem = `
+      <button class="client-menu-item" data-select-client="__all__">
+        <div class="client-initial">*</div>
+        <div style="flex:1;">All workspaces</div>
+      </button>`;
+    const clientItems = state.clients
+      .map(
+        (c) => `
+      <button class="client-menu-item" data-select-client="${c.id}">
+        <div class="client-initial">${escapeHtml(c.name.trim()[0].toUpperCase())}</div>
+        <div style="flex:1;">${escapeHtml(c.name)}</div>
+        <div class="kind">${escapeHtml(c.kind)}</div>
+      </button>`
+      )
+      .join("");
+    menuHtml = `
+      <div class="client-menu">
+        ${allItem}
+        ${clientItems}
+        <button class="client-menu-add" id="add-client-btn">
+          <i data-lucide="plus"></i> Add client workspace
+        </button>
+      </div>`;
+  }
+
+  wrap.innerHTML = `
+    <button class="client-switch-btn" id="client-switch-btn">
+      <div class="client-initial">${escapeHtml(active.initial)}</div>
+      <div class="name">${escapeHtml(active.name)}</div>
+      <i data-lucide="chevron-down"></i>
+    </button>
+    ${menuHtml}
+  `;
+
+  document.getElementById("client-switch-btn").addEventListener("click", toggleClientMenu);
+  if (state.clientMenuOpen) {
+    wrap.querySelectorAll("[data-select-client]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const v = el.getAttribute("data-select-client");
+        selectClient(v === "__all__" ? null : Number(v));
+      });
     });
-  } catch (e) {
-    jobAccountSelect.innerHTML = `<option value="">Failed to load accounts</option>`;
+    document.getElementById("add-client-btn").addEventListener("click", addClientWorkspace);
   }
 }
 
-jobPlatformSelect.addEventListener("change", () => {
-  loadAccountOptions(jobPlatformSelect.value);
-  togglePlatformFields(jobPlatformSelect.value);
-});
+function renderTopbar() {
+  document.getElementById("screen-title").textContent = SCREEN_TITLES[state.screen] || "";
+  renderClientSwitch();
+}
 
-jobForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  jobResult.innerHTML = "";
+// ---------------------------------------------------------------------
+// Render: Calendar
+// ---------------------------------------------------------------------
 
-  const platform = jobPlatformSelect.value;
-  const isVideo = VIDEO_UPLOAD_PLATFORMS.has(platform);
-  const file = jobFileInput.files[0];
-  const text = jobTextInput.value.trim();
+function monthCells(year, month, jobs) {
+  const firstWeekday = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const cells = [];
+  for (let i = 0; i < firstWeekday; i++) cells.push(null);
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dayJobs = jobs.filter((j) => {
+      const d = new Date(jobDate(j));
+      return d.getFullYear() === year && d.getMonth() === month && d.getDate() === day;
+    });
+    cells.push({ day, jobs: dayJobs });
+  }
+  return cells;
+}
 
-  if (!platform) {
-    jobResult.innerHTML = resultBox(false, "Select a platform.");
-    return;
-  }
-  if (isVideo && !file) {
-    jobResult.innerHTML = resultBox(false, "Choose a video file.");
-    return;
-  }
-  if (platform === "twitter" && !text) {
-    jobResult.innerHTML = resultBox(false, "Enter the tweet text.");
-    return;
-  }
-  const fbText = jobFbTextInput.value.trim();
-  const fbFile = jobFbMediaFileInput.files[0];
-  if (platform === "facebook" && !fbText && !fbFile) {
-    jobResult.innerHTML = resultBox(false, "Enter text and/or attach a media file.");
-    return;
-  }
-  const igFile = jobIgMediaFileInput.files[0];
-  if (platform === "instagram" && !igFile) {
-    jobResult.innerHTML = resultBox(false, "Attach a media file (Instagram has no text-only posts).");
-    return;
-  }
-  if (ACCOUNT_REQUIRED_PLATFORMS.has(platform) && !jobAccountSelect.value) {
-    jobResult.innerHTML = resultBox(false, `${platform} jobs require an account.`);
-    return;
-  }
+function renderCalendar() {
+  const now = new Date();
+  const target = new Date(now.getFullYear(), now.getMonth() + state.monthOffset, 1);
+  const year = target.getFullYear();
+  const month = target.getMonth();
+  const monthLabel = target.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  const clientLabel = activeClientLabel().name;
 
-  const formData = new FormData();
-  formData.append("platform", platform);
-  if (jobAccountSelect.value) formData.append("account_id", jobAccountSelect.value);
-
-  if (isVideo) {
-    formData.append("file", file);
-    if (jobTitleInput.value.trim()) formData.append("title", jobTitleInput.value.trim());
-    if (platform === "youtube") {
-      formData.append("privacy", jobPrivacySelect.value);
-      if (jobShortsCheckbox.checked) formData.append("shorts", "true");
-      if (jobPlaylistIdInput.value.trim()) formData.append("playlist_id", jobPlaylistIdInput.value.trim());
-    }
-  } else if (platform === "facebook") {
-    if (fbText) formData.append("text", fbText);
-    if (fbFile) formData.append("media_files", fbFile);
-  } else if (platform === "instagram") {
-    const igText = jobIgTextInput.value.trim();
-    if (igText) formData.append("text", igText);
-    formData.append("media_files", igFile);
+  let body = "";
+  if (state.jobsLoading) {
+    body = `<div class="empty-state">Loading…</div>`;
+  } else if (state.jobsError) {
+    body = `<div class="error-state">Failed to load jobs: ${escapeHtml(state.jobsError)}</div>`;
+  } else if (state.calendarView === "month") {
+    const cells = monthCells(year, month, state.jobs);
+    body = `
+      <div class="month-grid-wrap">
+        <div class="reg-mark reg-tl"></div><div class="reg-mark reg-tr"></div>
+        <div class="reg-mark reg-bl"></div><div class="reg-mark reg-br"></div>
+        <div class="month-grid">
+          ${WEEKDAY_LABELS.map((wd) => `<div class="weekday-cell">${wd}</div>`).join("")}
+          ${cells
+            .map((cell) => {
+              if (!cell) return `<div class="day-cell faded"></div>`;
+              const shown = cell.jobs.slice(0, 2);
+              const overflow = Math.max(0, cell.jobs.length - 2);
+              return `
+                <div class="day-cell">
+                  <div class="day-num">${cell.day}</div>
+                  <div class="day-jobs">
+                    ${shown
+                      .map((j) => {
+                        const s = statusStyle(j.status);
+                        const cap = j.caption || "(no caption)";
+                        const short = cap.length > 26 ? cap.slice(0, 26) + "…" : cap;
+                        return `<div class="job-chip" style="background:${s.bg};color:${s.color};" title="${escapeHtml(cap)}">
+                          <span class="letter">${escapeHtml(platformLetter(j.platform))}</span>
+                          <span class="caption">${escapeHtml(short)}</span>
+                        </div>`;
+                      })
+                      .join("")}
+                    ${overflow > 0 ? `<div class="day-overflow">+${overflow} more</div>` : ""}
+                  </div>
+                </div>`;
+            })
+            .join("")}
+        </div>
+      </div>`;
   } else {
-    formData.append("text", text);
-    Array.from(jobMediaFilesInput.files).forEach(f => formData.append("media_files", f));
+    const sorted = state.jobs.slice().sort((a, b) => new Date(jobDate(a)) - new Date(jobDate(b)));
+    const groups = {};
+    const order = [];
+    sorted.forEach((j) => {
+      const label = fmtDateLabel(jobDate(j));
+      if (!groups[label]) { groups[label] = []; order.push(label); }
+      groups[label].push(j);
+    });
+    if (order.length === 0) {
+      body = `<div class="empty-state">No posts scheduled${state.activeClientId != null ? " for this client" : ""}.</div>`;
+    } else {
+      body = order
+        .map(
+          (label) => `
+        <div class="agenda-group">
+          <div class="agenda-group-label">${escapeHtml(label)}</div>
+          <div>
+            ${groups[label]
+              .map((j) => {
+                const s = statusStyle(j.status);
+                return `
+              <div class="agenda-row">
+                <div class="agenda-time">${escapeHtml(fmtTimeLabel(jobDate(j)))}</div>
+                <div class="platform-box">${escapeHtml(platformLetter(j.platform))}</div>
+                <div class="agenda-caption">${escapeHtml(j.caption || "(no caption)")}</div>
+                <div class="agenda-client">${escapeHtml(j.client_name || "—")}</div>
+                <div class="status-pill" style="background:${s.bg};color:${s.color};">${escapeHtml(s.label)}</div>
+              </div>`;
+              })
+              .join("")}
+          </div>
+        </div>`
+        )
+        .join("");
+    }
   }
 
-  jobSubmitBtn.disabled = true;
-  jobSubmitBtn.textContent = "Creating…";
-  try {
-    const created = await fetchJson("/api/jobs", { method: "POST", body: formData });
-    jobResult.innerHTML = resultBox(true, `Job #${created.id} created and dispatched.`);
-    jobForm.reset();
-    loadAccountOptions("");
-    togglePlatformFields("");
-    showTab("monitor");
-    refresh();
-  } catch (err) {
-    jobResult.innerHTML = resultBox(false, `Failed: ${err.message}`);
-  } finally {
-    jobSubmitBtn.disabled = false;
-    jobSubmitBtn.textContent = "Create job";
+  return `
+    <div class="calendar-toolbar">
+      <div class="calendar-context">
+        <button class="month-nav-btn" id="month-prev"><i data-lucide="chevron-left"></i></button>
+        <span>${escapeHtml(monthLabel)} · ${escapeHtml(clientLabel)}</span>
+        <button class="month-nav-btn" id="month-next"><i data-lucide="chevron-right"></i></button>
+      </div>
+      <div class="seg-control">
+        <button class="seg-btn ${state.calendarView === "month" ? "active" : ""}" id="view-month">Month</button>
+        <button class="seg-btn ${state.calendarView === "agenda" ? "active" : ""}" id="view-agenda">Agenda</button>
+      </div>
+    </div>
+    ${body}
+  `;
+}
+
+// ---------------------------------------------------------------------
+// Render: Queue
+// ---------------------------------------------------------------------
+
+function renderQueue() {
+  let rowsHtml = "";
+  let bodyHtml = "";
+
+  if (state.jobsLoading) {
+    bodyHtml = `<div class="empty-state">Loading…</div>`;
+  } else if (state.jobsError) {
+    bodyHtml = `<div class="error-state">Failed to load jobs: ${escapeHtml(state.jobsError)}</div>`;
+  } else {
+    const filtered = state.jobs
+      .filter((j) => state.queueFilter === "all" || j.status === state.queueFilter)
+      .slice()
+      .sort((a, b) => new Date(jobDate(b)) - new Date(jobDate(a)));
+
+    if (filtered.length === 0) {
+      bodyHtml = `<div class="empty-state">No jobs match this filter.</div>`;
+    } else {
+      rowsHtml = filtered
+        .map((j) => {
+          const s = statusStyle(j.status);
+          return `
+        <tr>
+          <td><div class="platform-box" title="${escapeHtml(platformLabel(j.platform))}">${escapeHtml(platformLetter(j.platform))}</div></td>
+          <td class="truncate" title="${escapeHtml(j.caption || "")}">${escapeHtml(j.caption || "(no caption)")}</td>
+          <td class="muted">${escapeHtml(j.client_name || "—")}</td>
+          <td class="muted">${escapeHtml(fmtDateLabel(jobDate(j)))} · ${escapeHtml(fmtTimeLabel(jobDate(j)))}</td>
+          <td><span class="status-pill" style="background:${s.bg};color:${s.color};">${escapeHtml(s.label)}</span></td>
+          <td style="text-align:right;">
+            ${
+              j.status === "failed"
+                ? `<button class="retry-link" data-retry-id="${j.id}"><i data-lucide="rotate-ccw"></i> Retry</button>`
+                : ""
+            }
+          </td>
+        </tr>`;
+        })
+        .join("");
+
+      bodyHtml = `
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Platform</th><th>Post</th><th>Client</th><th>Scheduled</th><th>Status</th><th></th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>`;
+    }
+  }
+
+  return `
+    <div class="filter-chips">
+      ${QUEUE_FILTERS.map(
+        (f) => `<button class="filter-chip ${state.queueFilter === f.id ? "active" : ""}" data-queue-filter="${f.id}">${escapeHtml(f.label)}</button>`
+      ).join("")}
+    </div>
+    ${bodyHtml}
+  `;
+}
+
+// ---------------------------------------------------------------------
+// Render: Connected accounts (basic — no handle field / onboarding yet)
+// ---------------------------------------------------------------------
+
+function renderAccounts() {
+  let body;
+  if (state.accountsLoading) {
+    body = `<div class="empty-state">Loading…</div>`;
+  } else if (state.accountsError) {
+    body = `<div class="error-state">Failed to load accounts: ${escapeHtml(state.accountsError)}</div>`;
+  } else if (state.accounts.length === 0) {
+    body = `<div class="empty-state">No connected accounts${state.activeClientId != null ? " for this client" : ""} yet.</div>`;
+  } else {
+    body = `
+      <div class="accounts-list">
+        ${state.accounts
+          .map(
+            (a) => `
+          <div class="account-row">
+            <div class="platform-box" style="width:24px;height:24px;">${escapeHtml(platformLetter(a.platform))}</div>
+            <div style="flex:1;">
+              <div class="account-name">${escapeHtml(a.name)} <span class="muted" style="color:var(--muted);font-size:11px;">· ${escapeHtml(platformLabel(a.platform))}</span></div>
+              <div class="account-sub">${escapeHtml(a.client_name || "No client workspace")}</div>
+            </div>
+            <div class="status-pill" style="background:${a.is_active ? "#eef6ff" : "#f5e7e7"};color:${a.is_active ? "#2c455d" : "#7a3030"};">${a.is_active ? "Active" : "Inactive"}</div>
+          </div>`
+          )
+          .join("")}
+      </div>`;
+  }
+  return `
+    <div style="font-size:13px;color:var(--muted);margin-bottom:16px;">Connected platforms for ${escapeHtml(activeClientLabel().name)}</div>
+    ${body}
+    <p style="font-size:12px;color:var(--muted);margin-top:16px;">Onboarding a new platform connection isn't built in this UI yet — use the <code>scripts/authorize_*.py</code> CLI scripts, then it shows up here.</p>
+  `;
+}
+
+// ---------------------------------------------------------------------
+// Render: placeholder screens (not built yet)
+// ---------------------------------------------------------------------
+
+function renderPlaceholder(label) {
+  return `
+    <div class="placeholder">
+      <div class="heading">${escapeHtml(label)} isn't built yet</div>
+      <p>This screen needs backend work (see CLAUDE.md Phase 26) before it can go live — ask to build it next.</p>
+    </div>
+  `;
+}
+
+// ---------------------------------------------------------------------
+// Render: content router
+// ---------------------------------------------------------------------
+
+function renderContent() {
+  const el = document.getElementById("content");
+  switch (state.screen) {
+    case "calendar":
+      el.innerHTML = renderCalendar();
+      document.getElementById("month-prev").addEventListener("click", () => shiftMonth(-1));
+      document.getElementById("month-next").addEventListener("click", () => shiftMonth(1));
+      document.getElementById("view-month").addEventListener("click", () => setCalendarView("month"));
+      document.getElementById("view-agenda").addEventListener("click", () => setCalendarView("agenda"));
+      break;
+    case "queue":
+      el.innerHTML = renderQueue();
+      el.querySelectorAll("[data-queue-filter]").forEach((btn) => {
+        btn.addEventListener("click", () => setQueueFilter(btn.getAttribute("data-queue-filter")));
+      });
+      el.querySelectorAll("[data-retry-id]").forEach((btn) => {
+        btn.addEventListener("click", () => retryJob(Number(btn.getAttribute("data-retry-id"))));
+      });
+      break;
+    case "accounts":
+      el.innerHTML = renderAccounts();
+      break;
+    case "approvals":
+      el.innerHTML = renderPlaceholder("Approvals");
+      break;
+    case "analytics":
+      el.innerHTML = renderPlaceholder("Analytics");
+      break;
+    case "media":
+      el.innerHTML = renderPlaceholder("Media library");
+      break;
+    case "clients":
+      el.innerHTML = renderPlaceholder("Clients");
+      break;
+    case "composer":
+      el.innerHTML = renderPlaceholder("Composer");
+      break;
+    default:
+      el.innerHTML = renderPlaceholder(state.screen);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Render: everything
+// ---------------------------------------------------------------------
+
+function renderAll() {
+  renderNav();
+  renderTopbar();
+  renderContent();
+  if (window.lucide) window.lucide.createIcons();
+}
+
+document.getElementById("new-post-btn").addEventListener("click", () => goScreen("composer"));
+
+// Close the client dropdown when clicking outside it.
+document.addEventListener("click", (e) => {
+  const wrap = document.getElementById("client-switch");
+  if (state.clientMenuOpen && wrap && !wrap.contains(e.target)) {
+    state.clientMenuOpen = false;
+    renderAll();
   }
 });
-</script>
 
+renderAll();
+loadClients();
+loadJobs();
+</script>
 </body>
 </html>
