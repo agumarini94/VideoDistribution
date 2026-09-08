@@ -106,6 +106,62 @@ class Account(Base):
         return f"Account(id={self.id}, platform={self.platform!r}, name={self.name!r})"
 
 
+class User(Base):
+    """
+    A dashboard login for a client's team (Phase 28) — distinct from the
+    ADMIN Basic-Auth credentials (DASHBOARD_USERNAME/PASSWORD,
+    dashboard/api.py), which remain a separate, unchanged way to get full
+    access (e.g. for curl/scripts/the auto-generated /docs). A User row is
+    how a *named person* logs in, either as a client_user scoped to exactly
+    one Client, or as an admin (see scripts/create_admin_user.py — nothing
+    else can create a role="admin" row).
+
+    Self-registration (POST /api/auth/register) always creates a
+    role="client_user" row with is_approved=False and client_id=None: the
+    requester doesn't know internal client_id values, so they type the
+    client's name into requested_client_name instead, and an admin resolves
+    that to a real Client (assigning client_id) when approving the request.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+
+    # bcrypt hash (see app/auth.py::hash_password) — never plaintext.
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Free string rather than an enum: only "admin"/"client_user" exist
+    # today, but this avoids a schema migration if a third role is ever
+    # needed (same rationale as Job.platform/Client.kind).
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="client_user")
+
+    # Which Client workspace this user is scoped to. Null for role="admin"
+    # rows (an admin isn't scoped to any one client) and for a still-pending
+    # client_user registration (set at approval time, see
+    # dashboard/api.py::approve_user).
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("clients.id"), nullable=True)
+
+    # Free-text client name the user typed at registration — a hint for the
+    # admin approving the request, not a validated reference (they don't
+    # know internal client_id values, and exposing the full client roster
+    # on a public, unauthenticated endpoint for lookup/autocomplete was
+    # deliberately avoided; see CLAUDE.md Phase 28). Kept around after
+    # approval for audit/display purposes; irrelevant once client_id is set.
+    requested_client_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # False until an admin approves the registration (or the row was
+    # created directly as an admin by scripts/create_admin_user.py, which
+    # sets this True immediately — nothing else can create an admin row).
+    is_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return f"User(id={self.id}, email={self.email!r}, role={self.role!r}, is_approved={self.is_approved})"
+
+
 class JobStatus(str, enum.Enum):
     """
     States of the job's state machine.

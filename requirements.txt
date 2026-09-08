@@ -10,3 +10,5 @@ fastapi>=0.111,<1
 python-multipart>=0.0.9,<1
 uvicorn[standard]>=0.30,<1
 tweepy>=4.14,<5
+bcrypt>=4.1,<5
+itsdangerous>=2.1,<3

@@ -1585,6 +1585,229 @@ unit-tested without Redis or a worker running.
     web dashboard flow), and Pinterest (in the design's platform set, no
     publisher exists — `app/publishers/`).
 
+### Phase 28 (current)
+- **Multi-tenant user accounts: self-registration + admin approval** — up
+  to now the whole dashboard was gated by one shared credential pair
+  (`DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD`, Phase 11). This phase adds
+  real per-person logins for client teams (~100-200 users), each scoped to
+  exactly one `Client` (Phase 26) — a client user can never read or write
+  another client's jobs/accounts, even via a direct API call with a guessed
+  id. The Basic-Auth env-var credential is unchanged and remains a fully
+  separate "ops" admin mechanism (curl/scripts/`/docs`) — see below.
+- **`app/models.py::User`** (new table) — `email` (unique), `hashed_password`
+  (bcrypt, `app/auth.py::hash_password`, never plaintext), `role`
+  (`"admin"` | `"client_user"`, free string like `Job.platform`/
+  `Client.kind`), `client_id` (nullable FK to `clients` — null for
+  `role="admin"` and for a still-pending registration),
+  `requested_client_name` (free text the registrant typed, see below),
+  `is_approved` (bool, default `False`), `created_at`.
+  - **No manual Neon migration step this time** — unlike Phase 26's
+    `client_id` columns (added to the *existing* `jobs`/`accounts` tables,
+    which `create_all` can't retroactively `ALTER`), `users` is a brand
+    new table. `init_db()`'s `create_all` creates it automatically on an
+    existing Neon database, the same way it already creates `clients`
+    without a manual step. Nothing needs to be run by hand for this phase.
+- **`app/auth.py`** (new) — pure password/token helpers, kept in `app/`
+  rather than `dashboard/` because it's `User`-domain logic (same reasoning
+  as the model itself living in `app/models.py`), even though only
+  `dashboard/api.py` calls it today.
+  - `hash_password`/`verify_password` — bcrypt, via the `bcrypt` package
+    directly (not `passlib`, to avoid its bcrypt-backend version-detection
+    issues with modern `bcrypt` releases).
+  - `create_session_token`/`verify_session_token` — a signed, timestamped
+    token (`itsdangerous.URLSafeTimedSerializer`) encoding a `user_id`,
+    valid for `SESSION_MAX_AGE_SECONDS` (7 days). Signed with
+    `SESSION_SECRET_KEY` (env var, optional at the `Settings` layer like
+    the `R2_*` vars); if unset, falls back to a random per-process key and
+    warns loudly at import time (same style as every other "works locally,
+    loud in prod" warning in this project) — every session is invalidated
+    on the next restart until this is set for real.
+- **Session cookie, not JWT** (`dashboard/api.py`) — `de_session`, httponly
+  (JS can never read it), `SameSite=Lax`, `Secure` by default
+  (`SESSION_COOKIE_SECURE`, default `true`; set to `false` for local dev
+  over plain `http://localhost`, which logs the same style of loud warning).
+  **Security tradeoff, deliberately made**: no separate CSRF token —
+  `SameSite=Lax` already blocks the cookie from being sent on a cross-site
+  request, which covers this phase's actual attack surface (a same-origin
+  SPA calling its own API); a dedicated CSRF token was judged unnecessary
+  complexity on top of that, per the phase brief's "keep it simple"
+  instruction. Revisit if a cross-site embed/widget ever needs this API.
+- **Two parallel, independent admin mechanisms — by design**:
+  1. **Basic-Auth "ops" admin** (`DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD`,
+     unchanged from Phase 11) — still grants full, unscoped access on any
+     request carrying valid Basic credentials. No `User` row involved.
+     This is what curl/scripts/CI and the auto-generated `/docs` use.
+  2. **Admin `User` row** (`role="admin"`, `client_id=None`,
+     `is_approved=True`) — logs in through the same `/api/auth/login` form
+     as a client user, gets a session cookie, and is treated identically to
+     the Basic-Auth path by every scoped endpoint (`role == "admin"` either
+     way). **The only way to create one is `scripts/create_admin_user.py`**
+     — self-registration always creates `role="client_user"`, and the
+     admin-approval flow only ever assigns a `Client` to an existing
+     pending request, never promotes anyone to `role="admin"`.
+  This split exists because the phase brief requires admin's *existing*
+  mechanism to stay unchanged, while also wanting a real browser Login
+  screen instead of the OS-native Basic-Auth popup — which the static SPA
+  shell no longer triggers at all (see below), so a human admin normally
+  uses option 2 day-to-day and option 1 stays available for tooling.
+- **`dashboard/api.py`'s auth middleware rewritten**
+  (`enforce_basic_auth` -> `enforce_auth`): resolves an `AuthContext`
+  (`role`, `client_id`, `user_id`, `email`) once per request — Basic
+  header first, then the session cookie, else `"anonymous"` — and stashes
+  it on `request.state.auth` regardless of whether the path is gated, so
+  `GET /api/auth/me` can report real identity on an otherwise-public route.
+  - **The static SPA shell is now public** (`index.html`/JS/CSS) — the
+    biggest structural change here. Before this phase, gating *everything*
+    meant an anonymous visitor got the browser's native Basic-Auth popup
+    before ever seeing any of this app's own UI, which would have made a
+    custom Login screen unreachable. The shell contains no secrets, so
+    exempting it is the same tradeoff any SPA makes. `/health` and
+    `POST /webhooks/tiktok` were already exempt (Phase 9/10b) and still are.
+  - **`/api/auth/register`, `/api/auth/login`, `/api/auth/logout`,
+    `/api/auth/me` are also public** (`_PUBLIC_API_PATHS`) — the first
+    three are inherently pre-session, and `/me` is how the SPA silently
+    checks "am I logged in?" on load (`200 {"authenticated": false}`
+    instead of a `401`, so anonymous visitors just see the Login screen).
+  - **`WWW-Authenticate: Basic` is now scoped to `/docs`/`/redoc`/
+    `/openapi.json` only** — deliberately dropped from every other gated
+    `/api/*` 401. That header is what triggers a browser's native
+    credential popup on *any* 401 response (not just an explicit login
+    attempt), which would otherwise hijack a client_user's own Login screen
+    the moment a `fetch()` call happened to 401 (e.g. an expired session
+    mid-use). `/docs` is still opened directly in a browser tab by admins,
+    so the old native-popup UX is kept there on purpose.
+- **`POST /api/auth/register`** — public, always creates
+  `role="client_user"`, `is_approved=False`. Takes `client_name` (free
+  text), not `client_id` — the requester has no way to know internal ids.
+  **Deliberately no public client-search/autocomplete endpoint** was added
+  for this: exposing the full agency client roster to anyone hitting a
+  public, unauthenticated route was judged a worse tradeoff than a plain
+  text field the admin reconciles at approval time (`requested_client_name`
+  is only ever a *hint* — the admin picks the real `Client` from a dropdown
+  they already have full access to). **No user enumeration**: a duplicate
+  email returns the exact same response (`{"status": "submitted", ...}`,
+  same status code) as a genuine new registration — this is a deliberate
+  silent no-op, not a distinguishable error, checked by
+  `tests/test_dashboard_auth.py::TestRegister::test_duplicate_email_returns_identical_response_and_no_new_row`.
+- **`POST /api/auth/login`** — public, checked only against the `User`
+  table (never the Basic-Auth env vars — see the two-mechanisms note
+  above). **Security tradeoff, explicitly flagged**: an unknown email and
+  a wrong password return the exact same generic 401
+  (`"Invalid email or password."`), preventing enumeration via login
+  attempts. A **pending** (`is_approved=False`) account gets a distinctly
+  worded 403 (`"...pending admin approval."`) instead, per the phase
+  brief's explicit ask for a clear message — this narrowly reveals that
+  the email *is* registered-but-pending, a deliberate, smaller exception
+  to the no-enumeration rule above rather than applying it everywhere
+  uniformly. On success, sets the session cookie and returns
+  `{authenticated, role, client_id, client_name, email}`.
+- **Per-client scoping, enforced at the query level, not just hidden in
+  the UI** (`dashboard/api.py`) — every one of these treats an explicit,
+  *different* `client_id` from a `client_user` as a `403`, and a missing
+  one as "silently forced to their own":
+  - `GET /api/jobs`, `GET /api/accounts`, `GET /api/stats` (`stats` gained
+    an optional `client_id` filter it didn't have before this phase).
+  - `POST /api/jobs/{id}/retry` — 403 if the job's `client_id` isn't
+    theirs.
+  - `POST /api/jobs` — `client_id` is forced to the caller's own (an
+    explicit different value is rejected, not silently overridden, so a
+    buggy/malicious client isn't quietly redirected). **Also validates
+    `account_id` cross-tenant**: if the job names an `Account` belonging to
+    a different client, that's a `403` too — without this check a
+    `client_user` could *post content through* another client's connected
+    social account (not just read its data), a materially worse leak than
+    a read-only cross-tenant view.
+  - `GET /api/clients` / `POST /api/clients` — made **admin-only**
+    (`403` for `client_user`), a scoping decision not explicitly spelled
+    out in the phase brief but a natural extension of "must never see
+    another client's data" to the client roster itself.
+  - Every scoped route function takes `request: Request | None = None`
+    (special-cased by FastAPI to always inject the real request over HTTP,
+    regardless of the default) rather than a `Depends`-based dependency —
+    deliberately, so every one of them stays callable directly with no
+    request at all, the same way every existing test in this suite (e.g.
+    `tests/test_dashboard_media_staging.py::_run_create_job`) already
+    calls route functions, bypassing the HTTP layer/middleware entirely. A
+    direct call with `request=None` resolves to `ADMIN_AUTH` (trusted/
+    internal caller), preserving every pre-Phase-28 test unchanged.
+  - **Accepted enumeration side-channel**: a cross-tenant `403` (vs. a
+    `404` for a genuinely nonexistent id) confirms *that* a given job/
+    account/user id exists, just not its contents — judged an acceptable
+    tradeoff since the phase brief explicitly asked for `403` on
+    cross-tenant access, and the ids involved (autoincrement integers)
+    aren't secret/guess-resistant identifiers to begin with.
+- **Admin endpoints** (`dashboard/api.py`, all `403` for `client_user` via
+  `_require_admin`): `GET /api/admin/users/pending`,
+  `GET /api/admin/users` (approved, read-only — **editing role/client or
+  deactivating an approved user isn't built this phase**, flagged as a
+  follow-up), `POST /api/admin/users/{id}/approve` (body `{client_id}` —
+  the admin picks/confirms the real `Client`, using `requested_client_name`
+  only as a pre-selected guess if an exact case-insensitive name match
+  exists), `POST /api/admin/users/{id}/reject` (deletes the row — `400` if
+  the user is already approved, so the wrong button can't delete a live
+  account; deactivating an approved user isn't built this phase either).
+- **`scripts/create_admin_user.py`** (new) — the only way to bootstrap an
+  admin `User` row. Prompts for the password interactively via `getpass`
+  (twice, confirmed) rather than a CLI arg, so it never lands in shell
+  history. Re-running with the same `--email` resets that admin's password
+  and forces `role="admin"`/`client_id=None`/`is_approved=True` in place,
+  same upsert-by-identity spirit as `scripts/add_account.py`.
+  ```
+  python -m scripts.create_admin_user --email admin@example.com
+  ```
+- **Dashboard frontend** (`dashboard/static/index.html`) — new Login and
+  Register screens (`#auth-root`, shown instead of `#app-root` whenever
+  `GET /api/auth/me` reports `authenticated: false`), matching the Phase
+  26 design tokens. A `client_user` session hides the client-switcher
+  (replaced with a static label reading their own `client_name` from
+  `/api/auth/me` — no dropdown, no "+ Add client workspace", per the phase
+  brief) and the Admin nav item entirely (not just disabled — the
+  underlying endpoints `403` too, so this is UI convenience, not the real
+  boundary). A new Admin screen (admin-only, `403`+placeholder for anyone
+  else) lists pending registrations with a per-row client-assignment
+  `<select>` + Approve/Reject, and a read-only approved-users table.
+  - **Found and fixed while browser-testing this phase** (pre-existing,
+    not part of Phase 28's own diff, in the uncommitted Composer/Calendar
+    work): the client-switcher dropdown opened and instantly closed on the
+    same click. Cause: the "close on outside click" `document`-level
+    listener checked `wrap.contains(e.target)`, but the button's own click
+    handler synchronously re-rendered (replacing the button DOM node)
+    *before* that listener ran, leaving `e.target` a detached node that
+    `.contains()` always reports `false` for. Fixed with
+    `e.stopPropagation()` on the button's own click handler.
+  - `POST /api/auth/register`/`login` read their form fields *before*
+    calling `renderAuthScreen()` on submit — calling it first (to show a
+    "submitting…" disabled state) would wipe the uncontrolled `<input>`
+    values it's about to read, since re-rendering regenerates the form's
+    `innerHTML` from scratch. Caught by browser-testing the actual submit
+    flow (Playwright), not by the unit-style pytest suite, which never
+    drives the real DOM.
+  - `state.screen` resets to `"calendar"` on login/logout — without this,
+    switching identities in the same tab (logout then log back in as a
+    different role) could land the next session on whatever screen the
+    previous one was viewing (harmless — a `client_user` landing on
+    `"admin"` just sees the "isn't built yet" placeholder, not real admin
+    content, since the screen router itself checks the role — but
+    confusing UX).
+- **Tests**: `tests/test_auth.py` (password hash/verify, session token
+  round-trip/tamper/garbage — pure, no DB). `tests/test_dashboard_auth.py`
+  uses FastAPI's `TestClient` (real HTTP + middleware + cookies), unlike
+  the rest of this suite which calls route functions directly — this phase
+  is specifically about request-level behavior (the middleware, cross-
+  tenant `403`s), which a direct function call bypasses entirely. Covers:
+  public-path/`WWW-Authenticate` behavior, registration (happy path,
+  duplicate-email no-op, validation), login (happy path, wrong password,
+  unknown email, pending account), full cross-tenant scoping (jobs,
+  accounts, stats, retry, job creation incl. the cross-tenant `account_id`
+  check, `/api/clients`, admin routes all `403` for a `client_user`), and
+  the admin approve/reject flow. `tests/conftest.py` gained
+  `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` (so the suite exercises real
+  auth instead of the dev-mode bypass), `SESSION_SECRET_KEY`, and
+  `SESSION_COOKIE_SECURE=false` (FastAPI's `TestClient` talks plain HTTP to
+  `http://testserver`, so a `Secure`-flagged cookie would never round-trip
+  through its cookie jar — same reason a real browser wouldn't send one
+  back over `http://localhost` either).
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

@@ -37,11 +37,29 @@ os.environ.setdefault("TIKTOK_WEBHOOK_SKIP_SIGNATURE", "")
 # setdefault since we want to unconditionally win over any real .env value,
 # not just fill in a gap.
 os.environ["SCHEDULER_TIMEZONE"] = "UTC"
+# Pinned so app/auth.py doesn't fall back to a random per-process key (which
+# would still work, but would also print its loud startup warning on every
+# test run for no reason) and so session tokens are reproducible if a test
+# ever needs to hand-construct one.
+os.environ.setdefault("SESSION_SECRET_KEY", "test-session-secret-not-for-production")
+# Enables dashboard/api.py's Basic-Auth ("ops" admin) gate for the whole
+# suite, same reasoning as SESSION_SECRET_KEY above: without this,
+# dashboard/api.py's dev-mode bypass (_AUTH_ENABLED=False) would make every
+# request act as admin regardless of session state, which would silently
+# defeat tests/test_dashboard_auth.py's scoping/middleware assertions.
+os.environ.setdefault("DASHBOARD_USERNAME", "test-admin")
+os.environ.setdefault("DASHBOARD_PASSWORD", "test-admin-password")
+# FastAPI's TestClient talks to "http://testserver" (plain HTTP), so a
+# Secure-flagged session cookie (the production default) would never be
+# stored/resent by its cookie jar — same reason a real browser wouldn't
+# send one back over http://localhost either. Local/test-only, same as the
+# loud warning this triggers in dashboard/api.py.
+os.environ.setdefault("SESSION_COOKIE_SECURE", "false")
 
 import pytest  # noqa: E402
 
 from app.db import Base, SessionLocal, engine, init_db  # noqa: E402
-from app.models import Account, Job, JobStatus, WebhookEvent  # noqa: E402,F401
+from app.models import Account, Job, JobStatus, User, WebhookEvent  # noqa: E402,F401
 
 
 @pytest.fixture(scope="session", autouse=True)

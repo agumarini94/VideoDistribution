@@ -2,3 +2,4 @@
 
 pytest>=7.4,<9
 responses>=0.25,<1
+httpx>=0.27,<1

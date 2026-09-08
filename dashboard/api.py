@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,9 +31,10 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app import storage
+from app.auth import create_session_token, hash_password, verify_password, verify_session_token
 from app.db import SessionLocal
 from app.exceptions import StorageNotConfiguredError
-from app.models import Account, Client, Job, JobStatus, WebhookEvent
+from app.models import Account, Client, Job, JobStatus, User, WebhookEvent
 from app.tasks import handle_tiktok_webhook_event, publish_job
 from app.webhooks import tiktok as tiktok_webhooks
 
@@ -58,7 +60,9 @@ if tiktok_webhooks.verification_skipped():
 # Both DASHBOARD_USERNAME and DASHBOARD_PASSWORD must be set for auth to be
 # enforced; if either is missing the app still runs (local dev convenience)
 # but logs a loud warning, same style as the TIKTOK_WEBHOOK_SKIP_SIGNATURE
-# one above.
+# one above. Unchanged by Phase 28 — this remains the "ops" credential (curl,
+# scripts, /docs), always granting full/admin access, independent of the
+# User table below.
 _DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "").strip()
 _DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
 _AUTH_ENABLED = bool(_DASHBOARD_USERNAME and _DASHBOARD_PASSWORD)
@@ -74,7 +78,7 @@ if not _AUTH_ENABLED:
         + "!" * 78
     )
 
-# Paths exempted from Basic auth:
+# Paths exempted from auth entirely:
 # - the TikTok webhook: TikTok's servers POST here directly and can't
 #   supply dashboard credentials — the request's own signature
 #   (TikTok-Signature header, verified in tiktok_webhook below) is its auth.
@@ -83,6 +87,37 @@ if not _AUTH_ENABLED:
 _WEBHOOK_PATH = "/webhooks/tiktok"
 _HEALTH_PATH = "/health"
 _NO_AUTH_PATHS = {_WEBHOOK_PATH, _HEALTH_PATH}
+
+# FastAPI's auto-generated docs. Kept behind a real WWW-Authenticate
+# challenge (see enforce_auth below) since these are opened directly in a
+# browser tab, not fetched by the SPA's own JS — the old native Basic-Auth
+# popup UX is still appropriate here.
+_DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
+
+# Auth endpoints below (Phase 28) are the one place an unauthenticated
+# visitor is *expected* to hit a /api/* route — login/register have to be
+# reachable before any session exists, and /me is how the SPA silently
+# checks "am I logged in?" on load without forcing a 401 round trip.
+_PUBLIC_API_PATHS = {"/api/auth/register", "/api/auth/login", "/api/auth/logout", "/api/auth/me"}
+
+
+def _is_protected(path: str) -> bool:
+    """
+    Phase 28 change: the static SPA shell (index.html/JS/CSS) is no longer
+    gated at all — it contains no secrets, and gating it meant an
+    unauthenticated visitor got the browser's native Basic-Auth popup
+    before ever seeing this app's own Login screen. Only /docs & friends
+    and the real /api/* data routes (minus the public auth ones above)
+    require a credential now.
+    """
+    if path in _NO_AUTH_PATHS:
+        return False
+    if path in _DOC_PATHS:
+        return True
+    if path.startswith("/api/"):
+        return path not in _PUBLIC_API_PATHS
+    return False
+
 
 _basic_auth = HTTPBasic(auto_error=False)
 
@@ -98,23 +133,149 @@ def _credentials_valid(credentials: HTTPBasicCredentials | None) -> bool:
     return valid_username and valid_password
 
 
-# A single HTTP middleware (rather than a per-route Depends) so this covers
-# every route uniformly — API routes, the StaticFiles mount, and FastAPI's
-# auto-generated /docs, /redoc, /openapi.json — without having to remember
-# to wire it into each one individually. Registered before CORSMiddleware
-# below so CORS ends up as the outer layer and keeps handling preflight
-# OPTIONS requests (which never carry credentials) without hitting auth.
-@app.middleware("http")
-async def enforce_basic_auth(request: Request, call_next):
-    if not _AUTH_ENABLED or request.url.path in _NO_AUTH_PATHS:
-        return await call_next(request)
+@dataclass(frozen=True)
+class AuthContext:
+    """
+    Who's making this request, resolved once per request by enforce_auth
+    and stashed on request.state.auth. role is "admin", "client_user", or
+    "anonymous". client_id is only meaningful for "client_user" — every
+    scoped endpoint below filters by it. user_id/email are None for the
+    Basic-Auth ("ops") admin path, since that grants access without any
+    User row existing.
+    """
+
+    role: str
+    client_id: int | None
+    user_id: int | None
+    email: str | None
+
+
+ADMIN_AUTH = AuthContext(role="admin", client_id=None, user_id=None, email=None)
+ANONYMOUS_AUTH = AuthContext(role="anonymous", client_id=None, user_id=None, email=None)
+
+# Cookie carrying the signed session token (app/auth.py). httponly so page
+# JS can never read it (XSS can't exfiltrate it), SameSite=Lax so it's never
+# sent on a cross-site request (the main mitigation against CSRF for this
+# phase — see CLAUDE.md Phase 28 for why a dedicated CSRF token was judged
+# unnecessary on top of that for a same-origin SPA).
+_SESSION_COOKIE_NAME = "de_session"
+_SESSION_COOKIE_MAX_AGE = 7 * 24 * 3600  # matches app/auth.py::SESSION_MAX_AGE_SECONDS
+
+# Cookies marked Secure are only ever sent over HTTPS — required in
+# production (Fly), but a plain "true" default would silently break local
+# dev over http://localhost. Defaults to secure and warns loudly if turned
+# off, same posture as every other "safe by default, opt out explicitly"
+# setting in this file.
+_SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "true").strip().lower() not in ("0", "false", "no")
+if not _SESSION_COOKIE_SECURE:
+    logger.warning(
+        "\n"
+        + "!" * 78
+        + "\nSESSION_COOKIE_SECURE=false: dashboard session cookies will be sent "
+        "over plain HTTP.\nLocal dev ONLY — never set this in production "
+        "(the cookie could be intercepted\non the network).\n"
+        + "!" * 78
+    )
+
+
+def _set_session_cookie(response, token: str) -> None:
+    response.set_cookie(
+        _SESSION_COOKIE_NAME,
+        token,
+        max_age=_SESSION_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=_SESSION_COOKIE_SECURE,
+        path="/",
+    )
+
+
+async def _resolve_auth(request: Request) -> AuthContext:
+    """
+    Tries, in order: Basic Auth (env-var "ops" admin, unchanged) -> session
+    cookie (Phase 28 User table, either role) -> anonymous. Runs on every
+    request regardless of whether the path is gated, so GET /api/auth/me
+    can report real identity for a path that itself requires no auth.
+    """
+    if not _AUTH_ENABLED:
+        # Dev-mode bypass, unchanged from before Phase 28: with no
+        # DASHBOARD_USERNAME/PASSWORD configured the whole dashboard was
+        # already wide open, so every request acts as admin.
+        return ADMIN_AUTH
 
     credentials = await _basic_auth(request)
-    if not _credentials_valid(credentials):
+    if _credentials_valid(credentials):
+        return ADMIN_AUTH
+
+    token = request.cookies.get(_SESSION_COOKIE_NAME)
+    if not token:
+        return ANONYMOUS_AUTH
+
+    user_id = verify_session_token(token)
+    if user_id is None:
+        return ANONYMOUS_AUTH
+
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+    finally:
+        db.close()
+
+    # Re-checked live (not encoded in the token) so a since-rejected/
+    # deleted account loses access on its very next request, not just the
+    # next time it happens to re-authenticate.
+    if user is None or not user.is_approved:
+        return ANONYMOUS_AUTH
+
+    return AuthContext(role=user.role, client_id=user.client_id, user_id=user.id, email=user.email)
+
+
+def _get_auth(request: Request | None) -> AuthContext:
+    """
+    Every scoped route below takes `request: Request | None = None` instead
+    of a Depends-based dependency, specifically so it stays callable
+    directly with no request at all (every existing test in this suite,
+    e.g. tests/test_dashboard_media_staging.py, calls route functions this
+    way, bypassing the HTTP layer entirely — Depends objects don't resolve
+    outside of a real ASGI call). A direct call with no request is treated
+    as a trusted/internal admin caller, matching this project's existing
+    convention of everything being callable directly in tests.
+    """
+    if request is None:
+        return ADMIN_AUTH
+    return getattr(request.state, "auth", ADMIN_AUTH)
+
+
+def _require_admin(request: Request | None) -> AuthContext:
+    auth = _get_auth(request)
+    if auth.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return auth
+
+
+# A single HTTP middleware (rather than a per-route Depends) so this covers
+# every route uniformly without having to remember to wire it into each one
+# individually. Registered before CORSMiddleware below so CORS ends up as
+# the outer layer and keeps handling preflight OPTIONS requests (which never
+# carry credentials) without hitting auth.
+@app.middleware("http")
+async def enforce_auth(request: Request, call_next):
+    request.state.auth = await _resolve_auth(request)
+
+    if not _is_protected(request.url.path):
+        return await call_next(request)
+
+    if request.state.auth.role == "anonymous":
+        # WWW-Authenticate only on the /docs family (see _DOC_PATHS): it's
+        # what triggers a browser's native Basic-Auth popup, which is
+        # wanted there but must NOT fire on the SPA's own /api/* fetch()
+        # calls — that would interrupt a client_user's login screen with an
+        # unrelated OS-level credential prompt.
+        headers = {"WWW-Authenticate": "Basic"} if request.url.path in _DOC_PATHS else {}
         return JSONResponse(
             status_code=401,
             content={"detail": "Invalid or missing credentials"},
-            headers={"WWW-Authenticate": "Basic"},
+            headers=headers,
         )
     return await call_next(request)
 
@@ -281,6 +442,46 @@ class ClientCreate(BaseModel):
     kind: str = "client"
 
 
+class RegisterIn(BaseModel):
+    email: str
+    password: str
+    client_name: str
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class MeOut(BaseModel):
+    authenticated: bool
+    role: str | None = None
+    client_id: int | None = None
+    client_name: str | None = None
+    email: str | None = None
+
+
+class PendingUserOut(BaseModel):
+    id: int
+    email: str
+    requested_client_name: str | None
+    created_at: str
+
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+    role: str
+    client_id: int | None
+    client_name: str | None
+    is_approved: bool
+    created_at: str
+
+
+class ApproveUserIn(BaseModel):
+    client_id: int
+
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     """
@@ -298,14 +499,229 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok", "db": db_status}
 
 
+@app.post("/api/auth/register", status_code=201)
+def register(body: RegisterIn, db: Session = Depends(get_db)):
+    """
+    Self-registration (Phase 28): always creates a role="client_user" row
+    with is_approved=False — there is no way to self-register as an admin.
+    The requester names their client workspace by free-text name
+    (requested_client_name), not client_id, since they have no way to know
+    internal ids; an admin resolves that to a real Client at approval time
+    (see approve_user below).
+
+    Public route, no auth required. Deliberately returns the exact same
+    response whether or not the email was already registered — this is the
+    "don't reveal whether an email exists" requirement, applied by making
+    the duplicate-email case a silent no-op rather than a distinguishable
+    error. See CLAUDE.md Phase 28 for the one deliberate exception to this
+    (login's "pending approval" message, which is more specific by design).
+    """
+    email = body.email.strip().lower()
+    password = body.password
+    client_name = body.client_name.strip()
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required.")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    if not client_name:
+        raise HTTPException(status_code=400, detail="Tell us which client workspace you're requesting access to.")
+
+    generic_response = {
+        "status": "submitted",
+        "detail": "If this email isn't already registered, your request has been submitted for admin approval.",
+    }
+
+    existing = db.query(User).filter(func.lower(User.email) == email).one_or_none()
+    if existing is not None:
+        return generic_response
+
+    user = User(
+        email=email,
+        hashed_password=hash_password(password),
+        role="client_user",
+        client_id=None,
+        requested_client_name=client_name,
+        is_approved=False,
+    )
+    db.add(user)
+    db.commit()
+    return generic_response
+
+
+@app.post("/api/auth/login", response_model=MeOut)
+def login(body: LoginIn, db: Session = Depends(get_db)):
+    """
+    Public route. Checked only against the User table — the Basic-Auth
+    "ops" admin credentials (DASHBOARD_USERNAME/PASSWORD) are a completely
+    separate mechanism (see enforce_auth above) and aren't accepted here.
+
+    Security tradeoff, deliberately made (see CLAUDE.md Phase 28): an
+    unknown email and a wrong password both raise the exact same generic
+    401, so a login attempt can't be used to enumerate registered emails.
+    A *pending* account gets a distinctly-worded 403 instead, per the phase
+    brief's explicit ask for a clear pending-approval message — this does
+    narrowly reveal that the email is registered-but-not-yet-approved,
+    accepted as a smaller, intentional exception rather than applying full
+    non-enumeration everywhere.
+    """
+    identifier = body.email.strip().lower()
+    user = db.query(User).filter(func.lower(User.email) == identifier).one_or_none()
+
+    if user is None or not verify_password(body.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if not user.is_approved:
+        raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
+
+    token = create_session_token(user.id)
+    client_name = None
+    if user.client_id is not None:
+        client = db.get(Client, user.client_id)
+        client_name = client.name if client else None
+
+    response = JSONResponse(
+        MeOut(
+            authenticated=True,
+            role=user.role,
+            client_id=user.client_id,
+            client_name=client_name,
+            email=user.email,
+        ).model_dump()
+    )
+    _set_session_cookie(response, token)
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout():
+    response = JSONResponse({"status": "logged_out"})
+    response.delete_cookie(_SESSION_COOKIE_NAME, path="/")
+    return response
+
+
+@app.get("/api/auth/me", response_model=MeOut)
+def auth_me(request: Request = None, db: Session = Depends(get_db)):
+    """
+    How the SPA silently checks "am I logged in?" on load without ever
+    triggering enforce_auth's 401 (this path is in _PUBLIC_API_PATHS) —
+    letting it show the Login screen for an anonymous visitor instead of an
+    error, and letting an already-authenticated visitor skip straight to
+    the app.
+    """
+    auth = _get_auth(request)
+    if auth.role == "anonymous":
+        return MeOut(authenticated=False)
+
+    client_name = None
+    if auth.client_id is not None:
+        client = db.get(Client, auth.client_id)
+        client_name = client.name if client else None
+
+    return MeOut(authenticated=True, role=auth.role, client_id=auth.client_id, client_name=client_name, email=auth.email)
+
+
+@app.get("/api/admin/users/pending", response_model=list[PendingUserOut])
+def list_pending_users(request: Request = None, db: Session = Depends(get_db)):
+    _require_admin(request)
+    users = db.query(User).filter(User.is_approved.is_(False)).order_by(User.created_at).all()
+    return [
+        PendingUserOut(
+            id=u.id,
+            email=u.email,
+            requested_client_name=u.requested_client_name,
+            created_at=u.created_at.isoformat(),
+        )
+        for u in users
+    ]
+
+
+@app.get("/api/admin/users", response_model=list[UserOut])
+def list_approved_users(request: Request = None, db: Session = Depends(get_db)):
+    """Read-only for now — editing role/client or deactivating a user isn't built this phase."""
+    _require_admin(request)
+    users = db.query(User).filter(User.is_approved.is_(True)).order_by(User.created_at).all()
+    client_names = {c.id: c.name for c in db.query(Client.id, Client.name)}
+    return [
+        UserOut(
+            id=u.id,
+            email=u.email,
+            role=u.role,
+            client_id=u.client_id,
+            client_name=client_names.get(u.client_id),
+            is_approved=u.is_approved,
+            created_at=u.created_at.isoformat(),
+        )
+        for u in users
+    ]
+
+
+@app.post("/api/admin/users/{user_id}/approve", response_model=UserOut)
+def approve_user(user_id: int, body: ApproveUserIn, request: Request = None, db: Session = Depends(get_db)):
+    """Assigns/confirms the Client (the admin picks it, using requested_client_name only as a hint) and flips is_approved."""
+    _require_admin(request)
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+    client = db.get(Client, body.client_id)
+    if client is None:
+        raise HTTPException(status_code=404, detail=f"Client {body.client_id} not found")
+
+    user.client_id = client.id
+    user.is_approved = True
+    db.commit()
+    db.refresh(user)
+
+    return UserOut(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        client_id=user.client_id,
+        client_name=client.name,
+        is_approved=user.is_approved,
+        created_at=user.created_at.isoformat(),
+    )
+
+
+@app.post("/api/admin/users/{user_id}/reject", status_code=204)
+def reject_user(user_id: int, request: Request = None, db: Session = Depends(get_db)):
+    """
+    Deletes a still-pending registration request. Only for pending users —
+    rejecting/deactivating an already-approved user isn't built this phase
+    (see CLAUDE.md Phase 28), so that case gets a 400 instead of silently
+    deleting a live account.
+    """
+    _require_admin(request)
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+    if user.is_approved:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reject an already-approved user (deactivation isn't implemented yet).",
+        )
+    db.delete(user)
+    db.commit()
+
+
 @app.get("/api/jobs", response_model=list[JobOut])
 def list_jobs(
     status: JobStatus | None = None,
     platform: str | None = None,
     client_id: int | None = None,
     limit: int = Query(default=50, ge=1, le=500),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
+    auth = _get_auth(request)
+    if auth.role == "client_user":
+        # Automatic scoping, not just a UI filter: a client_id explicitly
+        # requesting another client's data is a 403, and an omitted one is
+        # silently forced to the caller's own — this endpoint can never
+        # return another client's jobs no matter what's passed.
+        if client_id is not None and client_id != auth.client_id:
+            raise HTTPException(status_code=403, detail="Cannot access another client's jobs.")
+        client_id = auth.client_id
+
     query = db.query(Job)
     if status is not None:
         query = query.filter(Job.status == status)
@@ -319,19 +735,29 @@ def list_jobs(
 
 
 @app.get("/api/stats", response_model=StatsOut)
-def stats(db: Session = Depends(get_db)):
-    counts = dict(
-        db.query(Job.status, func.count(Job.id)).group_by(Job.status).all()
-    )
+def stats(client_id: int | None = None, request: Request = None, db: Session = Depends(get_db)):
+    auth = _get_auth(request)
+    if auth.role == "client_user":
+        if client_id is not None and client_id != auth.client_id:
+            raise HTTPException(status_code=403, detail="Cannot access another client's stats.")
+        client_id = auth.client_id
+
+    query = db.query(Job.status, func.count(Job.id))
+    if client_id is not None:
+        query = query.filter(Job.client_id == client_id)
+    counts = dict(query.group_by(Job.status).all())
     by_status = {s.value: counts.get(s, 0) for s in JobStatus}
     return StatsOut(total=sum(by_status.values()), by_status=by_status)
 
 
 @app.post("/api/jobs/{job_id}/retry", response_model=RetryOut)
-def retry_job(job_id: int, db: Session = Depends(get_db)):
+def retry_job(job_id: int, request: Request = None, db: Session = Depends(get_db)):
+    auth = _get_auth(request)
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if auth.role == "client_user" and job.client_id != auth.client_id:
+        raise HTTPException(status_code=403, detail="Cannot retry another client's job.")
     if job.status != JobStatus.FAILED:
         raise HTTPException(
             status_code=409,
@@ -352,8 +778,15 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
 def list_accounts(
     platform: str | None = None,
     client_id: int | None = None,
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
+    auth = _get_auth(request)
+    if auth.role == "client_user":
+        if client_id is not None and client_id != auth.client_id:
+            raise HTTPException(status_code=403, detail="Cannot access another client's accounts.")
+        client_id = auth.client_id
+
     query = db.query(Account)
     if platform is not None:
         query = query.filter(Account.platform == platform)
@@ -365,19 +798,29 @@ def list_accounts(
 
 
 @app.get("/api/clients", response_model=list[ClientOut])
-def list_clients(db: Session = Depends(get_db)):
+def list_clients(request: Request = None, db: Session = Depends(get_db)):
+    """
+    Admin-only (Phase 28): the full client roster (names of every agency
+    client) isn't something a client_user should be able to enumerate, even
+    though it's not explicitly called out in the phase brief — the same
+    "must never see another client's data" principle extends naturally to
+    the client list itself.
+    """
+    _require_admin(request)
     clients = db.query(Client).order_by(Client.name).all()
     return [ClientOut.from_client(client) for client in clients]
 
 
 @app.post("/api/clients", response_model=ClientOut, status_code=201)
-def create_client(body: ClientCreate, db: Session = Depends(get_db)):
+def create_client(body: ClientCreate, request: Request = None, db: Session = Depends(get_db)):
     """
     Creates a Client workspace (Phase 26 — see app/models.py::Client). Bare
     minimum for the scheduler UI's client switcher/"Add client workspace"
     tile: no dedup-by-name, no update/delete route yet — narrow enough that
-    adding those later is additive, not a breaking change.
+    adding those later is additive, not a breaking change. Admin-only
+    (Phase 28) — a client_user has no reason to create workspaces.
     """
+    _require_admin(request)
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
@@ -427,6 +870,7 @@ async def create_job(
     privacy: str | None = Form(default=None),
     shorts: bool = Form(default=False),
     playlist_id: str | None = Form(default=None),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -477,6 +921,15 @@ async def create_job(
     upload fails, every platform but instagram still creates the job
     exactly as before this phase — see _stage_to_r2.
     """
+    auth = _get_auth(request)
+    if auth.role == "client_user":
+        # Forced, not merely defaulted: a client_user explicitly naming a
+        # different client_id is rejected rather than silently overridden,
+        # so a buggy/malicious client can't be quietly redirected either.
+        if client_id is not None and client_id != auth.client_id:
+            raise HTTPException(status_code=403, detail="Cannot create a job for another client.")
+        client_id = auth.client_id
+
     if platform not in _SUPPORTED_PLATFORMS:
         raise HTTPException(
             status_code=400,
@@ -517,6 +970,12 @@ async def create_job(
             )
         if not account.is_active:
             raise HTTPException(status_code=400, detail=f"Account {account_id} is inactive")
+        if auth.role == "client_user" and account.client_id != auth.client_id:
+            # Without this check a client_user could post content through
+            # another client's connected social account (not just read its
+            # data) by guessing/enumerating account_id — a materially worse
+            # leak than a read-only cross-tenant view.
+            raise HTTPException(status_code=403, detail="Cannot use another client's connected account.")
     elif platform in _ACCOUNT_REQUIRED_PLATFORMS:
         # Same rule the publisher itself enforces (app/publishers/tiktok.py,
         # app/publishers/facebook.py): no single-account/env-var fallback —

@@ -226,11 +226,67 @@
   .account-row:last-child { border-bottom: none; }
   .account-name { font-size: 13.5px; }
   .account-sub { font-size: 11px; color: var(--muted); }
+
+  /* ---------------- Composer ---------------- */
+  .composer-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+  .composer-col-left { display: flex; flex-direction: column; gap: 16px; }
+  .composer-col-right { display: flex; flex-direction: column; gap: 14px; }
+
+  .form-group { display: flex; flex-direction: column; }
+  .form-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .form-input {
+    width: 100%; min-height: 36px; padding: 6px 10px; font-family: 'Barlow', sans-serif;
+    font-size: 14px; background: var(--surface); border: 1px solid var(--border); color: var(--ink);
+  }
+  select.form-input { min-height: 36px; }
+  .composer-textarea { min-height: 110px; padding: 10px; resize: vertical; }
+  .composer-platform-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .dropzone {
+    border: 1px solid var(--border); padding: 22px; display: flex; flex-direction: column;
+    align-items: center; gap: 8px; color: var(--muted);
+  }
+  .dropzone input[type="file"] { font-size: 12.5px; max-width: 100%; }
+  .form-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .form-hint-warn { color: #7a3030; }
+  .composer-row { display: flex; gap: 12px; align-items: flex-end; }
+  .composer-row > div { flex: 1; }
+  .form-checkbox-row { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 13.5px; }
+  .composer-actions { display: flex; gap: 10px; margin-top: 4px; }
+  .composer-actions .btn-secondary, .composer-actions .btn-primary { flex: 1; justify-content: center; }
+  .composer-actions .btn-primary:disabled { opacity: 0.6; cursor: default; }
+
+  .preview-card { border: 1px solid var(--border); padding: 14px; }
+  .preview-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .preview-platform-label { font-size: 13px; font-weight: 500; }
+  .char-counter { margin-left: auto; font-size: 11px; color: var(--muted); }
+  .char-counter.over { color: #7a3030; }
+  .preview-media {
+    height: 120px; margin-bottom: 10px; display: flex; align-items: center; justify-content: center;
+    font-family: monospace; font-size: 11px; color: var(--muted); text-align: center; padding: 0 10px;
+    background-color: var(--surface);
+    background-image: repeating-linear-gradient(45deg, rgba(29,31,32,0.14) 0, rgba(29,31,32,0.14) 3px, transparent 3px, transparent 10px);
+  }
+  .preview-text { font-size: 13px; line-height: 1.4; }
+
+  /* ---------------- Auth (login / register) ---------------- */
+  .auth-shell { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); }
+  .auth-card { width: 380px; border: 1px solid var(--border); padding: 30px; background: var(--bg); }
+  .auth-title { font-size: 21px; margin-bottom: 4px; }
+  .auth-subtitle { font-size: 12.5px; color: var(--muted); margin-bottom: 20px; line-height: 1.4; }
+  .auth-switch { margin-top: 16px; font-size: 12.5px; color: var(--muted); text-align: center; }
+  .auth-switch-link { color: var(--accent-dark); cursor: pointer; }
+  .auth-switch-link:hover { color: var(--accent-deep); }
+  .auth-success { padding: 12px; border: 1px solid var(--border); background: #eef6ff; color: #2c455d; font-size: 13px; margin-bottom: 14px; line-height: 1.4; }
+
+  /* ---------------- Admin ---------------- */
+  .admin-section { margin-bottom: 30px; }
+  .admin-section-title { font-size: 16px; margin-bottom: 10px; }
+  .admin-note { font-size: 12px; color: var(--muted); margin-top: 10px; }
 </style>
 </head>
 <body>
 
-<div class="app">
+<div class="app" id="app-root" style="display:none;">
 
   <aside class="sidebar">
     <div class="brand">
@@ -242,7 +298,7 @@
 
     <nav class="nav" id="nav"></nav>
 
-    <div class="sidebar-footer">Workflow: Individual + Agency</div>
+    <div class="sidebar-footer" id="sidebar-footer"></div>
   </aside>
 
   <div class="main">
@@ -259,6 +315,8 @@
 
 </div>
 
+<div class="auth-shell" id="auth-root" style="display:none;"></div>
+
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
 <script>
 // ---------------------------------------------------------------------
@@ -269,7 +327,7 @@
 // no-framework convention as the dashboard this replaces.
 // ---------------------------------------------------------------------
 
-const NAV_ITEMS = [
+const BASE_NAV_ITEMS = [
   { id: "calendar", label: "Calendar", icon: "calendar" },
   { id: "queue", label: "Queue", icon: "list" },
   { id: "approvals", label: "Approvals", icon: "check-square" },
@@ -278,6 +336,14 @@ const NAV_ITEMS = [
   { id: "accounts", label: "Connected accounts", icon: "plug" },
   { id: "clients", label: "Clients", icon: "users" },
 ];
+
+// Admin-only nav item (Phase 28) — appended dynamically rather than kept in
+// BASE_NAV_ITEMS so a client_user session never even sees it rendered, not
+// just styled as disabled (the backend 403s the underlying endpoints too —
+// see dashboard/api.py's _require_admin — this is UI-layer only).
+function navItems() {
+  return isAdmin() ? [...BASE_NAV_ITEMS, { id: "admin", label: "Admin", icon: "shield-check" }] : BASE_NAV_ITEMS;
+}
 
 const SCREEN_TITLES = {
   calendar: "Calendar",
@@ -288,10 +354,20 @@ const SCREEN_TITLES = {
   accounts: "Connected accounts",
   clients: "Clients",
   composer: "New post",
+  admin: "Admin",
 };
 
 const PLATFORM_LETTERS = { youtube: "Y", tiktok: "T", twitter: "X", facebook: "F", instagram: "I" };
 const PLATFORM_LABELS = { youtube: "YouTube", tiktok: "TikTok", twitter: "X (Twitter)", facebook: "Facebook", instagram: "Instagram" };
+
+// Composer platform set and per-platform rules, mirroring dashboard/api.py's
+// create_job exactly (_VIDEO_UPLOAD_PLATFORMS / _ACCOUNT_REQUIRED_PLATFORMS) —
+// pinterest is in the design's platform set but has no publisher (CLAUDE.md
+// Phase 26), so it's excluded here.
+const COMPOSER_PLATFORMS = ["youtube", "tiktok", "twitter", "facebook", "instagram"];
+const VIDEO_UPLOAD_PLATFORMS = new Set(["youtube", "tiktok"]);
+const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram"]);
+const TWITTER_CHAR_LIMIT = 280;
 
 const STATUS_STYLE = {
   scheduled: { bg: "#eef6ff", color: "#2c455d", label: "Scheduled" },
@@ -312,6 +388,9 @@ const QUEUE_FILTERS = [
 const WEEKDAY_LABELS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 const state = {
+  auth: null, // null while boot() hasn't resolved yet; else { authenticated, role, client_id, client_name, email }
+  authForm: { mode: "login", error: null, success: null, submitting: false },
+  admin: { pendingUsers: [], approvedUsers: [], clientsForAssign: [], loading: false, error: null },
   screen: "calendar",
   calendarView: "month",
   monthOffset: 0,
@@ -326,7 +405,29 @@ const state = {
   accounts: [],
   accountsLoading: false,
   accountsError: null,
+  composer: {
+    platform: "youtube",
+    accounts: [],
+    accountsLoading: false,
+    accountsError: null,
+    accountId: "",
+    submitting: false,
+  },
 };
+
+function isAdmin() {
+  return !!(state.auth && state.auth.authenticated && state.auth.role === "admin");
+}
+
+function showApp() {
+  document.getElementById("app-root").style.display = "";
+  document.getElementById("auth-root").style.display = "none";
+}
+
+function showAuth() {
+  document.getElementById("app-root").style.display = "none";
+  document.getElementById("auth-root").style.display = "";
+}
 
 function platformLetter(p) {
   return (PLATFORM_LETTERS[p] || (p ? p[0] : "?")).toUpperCase();
@@ -375,6 +476,13 @@ async function fetchJson(url, opts) {
 // ---------------------------------------------------------------------
 
 async function loadClients() {
+  // GET /api/clients is admin-only (Phase 28) — a client_user's own
+  // workspace name/id already comes from state.auth (see /api/auth/me),
+  // and activeClientLabel() below reads that directly instead.
+  if (!isAdmin()) {
+    state.clientsLoaded = true;
+    return;
+  }
   try {
     state.clients = await fetchJson("/api/clients");
   } catch (e) {
@@ -382,6 +490,20 @@ async function loadClients() {
   }
   state.clientsLoaded = true;
   renderAll();
+}
+
+async function logout() {
+  try {
+    await fetchJson("/api/auth/logout", { method: "POST" });
+  } catch (e) {
+    // Ignore — clearing local state and showing the Login screen is the
+    // right outcome even if the network call itself failed.
+  }
+  state.auth = { authenticated: false };
+  state.authForm = { mode: "login", error: null, success: null, submitting: false };
+  state.screen = "calendar";
+  showAuth();
+  renderAuthScreen();
 }
 
 async function loadJobs() {
@@ -412,6 +534,45 @@ async function loadAccounts() {
   }
   state.accountsLoading = false;
   renderAll();
+}
+
+async function loadComposerAccounts() {
+  const c = state.composer;
+  c.accountsLoading = true;
+  c.accountsError = null;
+  renderAll();
+  const params = new URLSearchParams({ platform: c.platform });
+  if (state.activeClientId != null) params.set("client_id", state.activeClientId);
+  try {
+    c.accounts = await fetchJson("/api/accounts?" + params.toString());
+  } catch (e) {
+    c.accounts = [];
+    c.accountsError = e.message;
+  }
+  if (!c.accounts.some((a) => String(a.id) === c.accountId)) c.accountId = "";
+  c.accountsLoading = false;
+  renderAll();
+}
+
+function openComposer() {
+  state.composer = {
+    platform: "youtube",
+    accounts: [],
+    accountsLoading: false,
+    accountsError: null,
+    accountId: "",
+    submitting: false,
+  };
+  goScreen("composer");
+  loadComposerAccounts();
+}
+
+function setComposerPlatform(platform) {
+  if (state.composer.platform === platform) return;
+  state.composer.platform = platform;
+  state.composer.accountId = "";
+  renderAll();
+  loadComposerAccounts();
 }
 
 async function retryJob(id) {
@@ -470,6 +631,7 @@ function goScreen(id) {
     loadJobs();
   }
   if (id === "accounts") loadAccounts();
+  if (id === "admin" && isAdmin()) loadAdminData();
 }
 
 function setCalendarView(view) {
@@ -494,7 +656,7 @@ function setQueueFilter(id) {
 function renderNav() {
   const nav = document.getElementById("nav");
   nav.innerHTML = "";
-  NAV_ITEMS.forEach((item) => {
+  navItems().forEach((item) => {
     const btn = document.createElement("button");
     btn.className = "nav-item" + (state.screen === item.id ? " active" : "");
     btn.innerHTML = `<i data-lucide="${item.icon}"></i><span>${escapeHtml(item.label)}</span>`;
@@ -503,11 +665,29 @@ function renderNav() {
   });
 }
 
+function renderSidebarFooter() {
+  const el = document.getElementById("sidebar-footer");
+  const who = state.auth && state.auth.authenticated ? state.auth.email || "Admin" : "";
+  el.innerHTML = `
+    <div style="margin-bottom:8px;font-size:11px;color:var(--muted);word-break:break-all;">${escapeHtml(who)}</div>
+    <button class="btn-secondary" id="logout-btn" style="width:100%;justify-content:center;">Log out</button>
+  `;
+  document.getElementById("logout-btn").addEventListener("click", logout);
+}
+
 // ---------------------------------------------------------------------
 // Render: topbar
 // ---------------------------------------------------------------------
 
 function activeClientLabel() {
+  if (!isAdmin()) {
+    // client_user sessions are permanently scoped to one client (see
+    // boot()/submitLogin, which set activeClientId from the session) —
+    // there's no "all workspaces" concept for them and no /api/clients
+    // access to resolve a name from, so state.auth.client_name is used.
+    const name = (state.auth && state.auth.client_name) || "Your workspace";
+    return { initial: name.trim()[0].toUpperCase(), name };
+  }
   if (state.activeClientId == null) return { initial: "*", name: "All workspaces" };
   const c = state.clients.find((c) => c.id === state.activeClientId);
   if (!c) return { initial: "*", name: "All workspaces" };
@@ -517,6 +697,18 @@ function activeClientLabel() {
 function renderClientSwitch() {
   const wrap = document.getElementById("client-switch");
   const active = activeClientLabel();
+
+  if (!isAdmin()) {
+    // No dropdown/switcher for a client_user — just a static label (Phase
+    // 28 requirement: "no client switcher, that's admin-only").
+    wrap.innerHTML = `
+      <div class="client-switch-btn" style="cursor:default;">
+        <div class="client-initial">${escapeHtml(active.initial)}</div>
+        <div class="name">${escapeHtml(active.name)}</div>
+      </div>
+    `;
+    return;
+  }
 
   let menuHtml = "";
   if (state.clientMenuOpen) {
@@ -554,7 +746,17 @@ function renderClientSwitch() {
     ${menuHtml}
   `;
 
-  document.getElementById("client-switch-btn").addEventListener("click", toggleClientMenu);
+  document.getElementById("client-switch-btn").addEventListener("click", (e) => {
+    // stopPropagation matters here: the document-level "close on outside
+    // click" listener below checks wrap.contains(e.target), but
+    // toggleClientMenu's renderAll() synchronously replaces this button
+    // with a new DOM node, leaving e.target detached by the time that
+    // listener runs — .contains() on a detached node is always false, so
+    // the menu opened and then immediately closed on this same click.
+    // Stopping propagation keeps this click from reaching that handler.
+    e.stopPropagation();
+    toggleClientMenu();
+  });
   if (state.clientMenuOpen) {
     wrap.querySelectorAll("[data-select-client]").forEach((el) => {
       el.addEventListener("click", () => {
@@ -794,6 +996,436 @@ function renderAccounts() {
 }
 
 // ---------------------------------------------------------------------
+// Render: Composer
+// ---------------------------------------------------------------------
+
+// Field ids per platform match exactly what submitComposer() reads and what
+// POST /api/jobs (dashboard/api.py::create_job) accepts — see CLAUDE.md
+// Phases 15/21/24/25 for the payload shape each publisher expects.
+function renderComposerPlatformFields(platform) {
+  if (VIDEO_UPLOAD_PLATFORMS.has(platform)) {
+    const isYoutube = platform === "youtube";
+    return `
+      <div class="form-group">
+        <div class="form-label">Video file</div>
+        <div class="dropzone">
+          <i data-lucide="upload" style="width:18px;height:18px;"></i>
+          <input type="file" id="composer-file" accept="video/*" />
+        </div>
+      </div>
+      <div class="form-group">
+        <div class="form-label">Title</div>
+        <input type="text" id="composer-title" class="form-input" placeholder="Auto-generated if left blank" />
+      </div>
+      ${
+        isYoutube
+          ? `
+      <div class="composer-row">
+        <div class="form-group">
+          <div class="form-label">Privacy</div>
+          <select id="composer-privacy" class="form-input">
+            <option value="private" selected>Private</option>
+            <option value="unlisted">Unlisted</option>
+            <option value="public">Public</option>
+          </select>
+        </div>
+        <div class="form-checkbox-row">
+          <label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="composer-shorts" /> Shorts</label>
+        </div>
+      </div>
+      <div class="form-group">
+        <div class="form-label">Playlist ID (optional)</div>
+        <input type="text" id="composer-playlist" class="form-input" placeholder="e.g. PLxxxxxxxxxxxx" />
+      </div>`
+          : ""
+      }
+    `;
+  }
+  if (platform === "twitter") {
+    return `
+      <div class="form-group">
+        <div class="form-label">Text</div>
+        <textarea id="composer-text" class="form-input composer-textarea" placeholder="What's happening?"></textarea>
+      </div>
+      <div class="form-group">
+        <div class="form-label">Media (optional — up to 4 images, or 1 video)</div>
+        <div class="dropzone">
+          <i data-lucide="upload" style="width:18px;height:18px;"></i>
+          <input type="file" id="composer-media-files" accept="image/*,video/*" multiple />
+        </div>
+        <div class="form-hint">Threads aren't supported here — use scripts/enqueue_twitter_test.py --mode thread for those.</div>
+      </div>
+    `;
+  }
+  if (platform === "facebook") {
+    return `
+      <div class="form-group">
+        <div class="form-label">Text</div>
+        <textarea id="composer-text" class="form-input composer-textarea" placeholder="Write a caption… (optional if a media file is attached)"></textarea>
+      </div>
+      <div class="form-group">
+        <div class="form-label">Media (optional — one photo or video)</div>
+        <div class="dropzone">
+          <i data-lucide="upload" style="width:18px;height:18px;"></i>
+          <input type="file" id="composer-media-file" accept="image/*,video/*" />
+        </div>
+        <div class="form-hint">At least one of text or media is required.</div>
+      </div>
+    `;
+  }
+  // instagram
+  return `
+    <div class="form-group">
+      <div class="form-label">Media (required — one photo or video)</div>
+      <div class="dropzone">
+        <i data-lucide="upload" style="width:18px;height:18px;"></i>
+        <input type="file" id="composer-media-file" accept="image/*,video/*" />
+      </div>
+      <div class="form-hint">Instagram has no text-only post type and needs a publicly accessible media URL — the server stages this to Cloudflare R2 automatically. If R2 isn't configured, job creation will fail with a clear error below.</div>
+    </div>
+    <div class="form-group">
+      <div class="form-label">Caption (optional)</div>
+      <textarea id="composer-text" class="form-input composer-textarea" placeholder="Write a caption…"></textarea>
+    </div>
+  `;
+}
+
+function renderComposer() {
+  const c = state.composer;
+  const chips = COMPOSER_PLATFORMS.map((p) => {
+    const active = c.platform === p;
+    return `<button type="button" class="filter-chip${active ? " active" : ""}" data-composer-platform="${p}">${escapeHtml(platformLetter(p))} ${escapeHtml(platformLabel(p))}</button>`;
+  }).join("");
+
+  const accountRequired = ACCOUNT_REQUIRED_PLATFORMS.has(c.platform);
+  let accountFieldHtml;
+  if (c.accountsLoading) {
+    accountFieldHtml = `<div class="form-hint">Loading accounts…</div>`;
+  } else if (c.accountsError) {
+    accountFieldHtml = `<div class="error-state">Failed to load accounts: ${escapeHtml(c.accountsError)}</div>`;
+  } else {
+    const fallbackOption = accountRequired
+      ? ""
+      : `<option value="" ${c.accountId === "" ? "selected" : ""}>No account (single-account fallback)</option>`;
+    const options = c.accounts
+      .map((a) => `<option value="${a.id}" ${String(a.id) === c.accountId ? "selected" : ""}>${escapeHtml(a.name)}</option>`)
+      .join("");
+    accountFieldHtml = `
+      <select id="composer-account" class="form-input">
+        ${fallbackOption}
+        ${options}
+      </select>
+      ${
+        c.accounts.length === 0 && accountRequired
+          ? `<div class="form-hint form-hint-warn">No ${escapeHtml(platformLabel(c.platform))} accounts connected${state.activeClientId != null ? " for this client" : ""} — this platform has no single-account fallback, so connect one first (see scripts/authorize_*.py).</div>`
+          : ""
+      }
+    `;
+  }
+
+  return `
+    <form id="composer-form" class="composer-layout">
+      <div class="composer-col-left">
+        <div class="form-group">
+          <div class="form-label">Platform</div>
+          <div class="composer-platform-chips">${chips}</div>
+        </div>
+        <div class="form-group">
+          <div class="form-label">Account</div>
+          ${accountFieldHtml}
+        </div>
+        ${renderComposerPlatformFields(c.platform)}
+        <div id="composer-error"></div>
+        <div class="composer-actions">
+          <button type="button" class="btn-secondary" id="composer-cancel">Cancel</button>
+          <button type="submit" class="btn-primary" id="composer-submit" ${c.submitting ? "disabled" : ""}>${c.submitting ? "Posting…" : "Add to queue"}</button>
+        </div>
+      </div>
+      <div class="composer-col-right">
+        <div class="form-label">Live preview</div>
+        <div class="preview-card" id="composer-preview"></div>
+      </div>
+    </form>
+  `;
+}
+
+function updateComposerPreview() {
+  const c = state.composer;
+  const preview = document.getElementById("composer-preview");
+  if (!preview) return;
+
+  const textEl = document.getElementById("composer-text");
+  const titleEl = document.getElementById("composer-title");
+  const captionText = textEl ? textEl.value : titleEl ? titleEl.value : "";
+
+  let mediaLabel = "No media selected";
+  const singleFileEl = document.getElementById("composer-file") || document.getElementById("composer-media-file");
+  const multiFileEl = document.getElementById("composer-media-files");
+  if (singleFileEl && singleFileEl.files && singleFileEl.files.length) {
+    mediaLabel = singleFileEl.files[0].name;
+  } else if (multiFileEl && multiFileEl.files && multiFileEl.files.length) {
+    mediaLabel = `${multiFileEl.files.length} file${multiFileEl.files.length > 1 ? "s" : ""} selected`;
+  }
+
+  let counterHtml = "";
+  if (c.platform === "twitter") {
+    const len = textEl ? textEl.value.length : 0;
+    const over = len > TWITTER_CHAR_LIMIT;
+    counterHtml = `<div class="char-counter${over ? " over" : ""}">${len}/${TWITTER_CHAR_LIMIT}</div>`;
+  }
+
+  preview.innerHTML = `
+    <div class="preview-header">
+      <div class="platform-box">${escapeHtml(platformLetter(c.platform))}</div>
+      <div class="preview-platform-label">${escapeHtml(platformLabel(c.platform))}</div>
+      ${counterHtml}
+    </div>
+    <div class="preview-media">${escapeHtml(mediaLabel)}</div>
+    <div class="preview-text">${captionText ? escapeHtml(captionText) : '<span style="color:var(--muted);">(no caption)</span>'}</div>
+  `;
+}
+
+function setComposerError(message) {
+  const el = document.getElementById("composer-error");
+  if (el) el.innerHTML = message ? `<div class="error-state">${escapeHtml(message)}</div>` : "";
+}
+
+async function submitComposer(e) {
+  e.preventDefault();
+  const c = state.composer;
+  if (c.submitting) return;
+  setComposerError(null);
+
+  const platform = c.platform;
+  const fd = new FormData();
+  fd.append("platform", platform);
+  if (state.activeClientId != null) fd.append("client_id", state.activeClientId);
+
+  if (c.accountId) {
+    fd.append("account_id", c.accountId);
+  } else if (ACCOUNT_REQUIRED_PLATFORMS.has(platform)) {
+    setComposerError(`${platformLabel(platform)} requires a connected account — none selected.`);
+    return;
+  }
+
+  if (VIDEO_UPLOAD_PLATFORMS.has(platform)) {
+    const fileEl = document.getElementById("composer-file");
+    const file = fileEl && fileEl.files[0];
+    if (!file) {
+      setComposerError("A video file is required.");
+      return;
+    }
+    fd.append("file", file);
+    const title = document.getElementById("composer-title").value.trim();
+    if (title) fd.append("title", title);
+    if (platform === "youtube") {
+      fd.append("privacy", document.getElementById("composer-privacy").value);
+      if (document.getElementById("composer-shorts").checked) fd.append("shorts", "true");
+      const playlistId = document.getElementById("composer-playlist").value.trim();
+      if (playlistId) fd.append("playlist_id", playlistId);
+    }
+  } else if (platform === "twitter") {
+    const text = document.getElementById("composer-text").value.trim();
+    if (!text) {
+      setComposerError("Text is required for a tweet.");
+      return;
+    }
+    fd.append("text", text);
+    const filesEl = document.getElementById("composer-media-files");
+    Array.from((filesEl && filesEl.files) || []).forEach((f) => fd.append("media_files", f));
+  } else if (platform === "facebook") {
+    const text = document.getElementById("composer-text").value.trim();
+    const fileEl = document.getElementById("composer-media-file");
+    const file = fileEl && fileEl.files[0];
+    if (!text && !file) {
+      setComposerError("Add text and/or a media file.");
+      return;
+    }
+    if (text) fd.append("text", text);
+    if (file) fd.append("media_files", file);
+  } else {
+    // instagram
+    const fileEl = document.getElementById("composer-media-file");
+    const file = fileEl && fileEl.files[0];
+    if (!file) {
+      setComposerError("A media file is required for Instagram.");
+      return;
+    }
+    fd.append("media_files", file);
+    const text = document.getElementById("composer-text").value.trim();
+    if (text) fd.append("text", text);
+  }
+
+  c.submitting = true;
+  const submitBtn = document.getElementById("composer-submit");
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Posting…";
+  }
+  try {
+    await fetchJson("/api/jobs", { method: "POST", body: fd });
+    c.submitting = false;
+    goScreen("queue");
+    await loadJobs();
+  } catch (err) {
+    c.submitting = false;
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Add to queue";
+    }
+    setComposerError(err.message);
+  }
+}
+
+function wireComposerEvents() {
+  document.querySelectorAll("[data-composer-platform]").forEach((btn) => {
+    btn.addEventListener("click", () => setComposerPlatform(btn.getAttribute("data-composer-platform")));
+  });
+
+  const accountSel = document.getElementById("composer-account");
+  if (accountSel) {
+    accountSel.addEventListener("change", () => {
+      state.composer.accountId = accountSel.value;
+    });
+  }
+
+  ["composer-text", "composer-title"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("input", updateComposerPreview);
+  });
+  ["composer-file", "composer-media-file", "composer-media-files"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", updateComposerPreview);
+  });
+
+  const form = document.getElementById("composer-form");
+  if (form) form.addEventListener("submit", submitComposer);
+  const cancelBtn = document.getElementById("composer-cancel");
+  if (cancelBtn) cancelBtn.addEventListener("click", () => goScreen("queue"));
+}
+
+// ---------------------------------------------------------------------
+// Admin panel (Phase 28)
+// ---------------------------------------------------------------------
+
+async function loadAdminData() {
+  const a = state.admin;
+  a.loading = true;
+  a.error = null;
+  renderAll();
+  try {
+    const [pending, approved, clients] = await Promise.all([
+      fetchJson("/api/admin/users/pending"),
+      fetchJson("/api/admin/users"),
+      fetchJson("/api/clients"),
+    ]);
+    a.pendingUsers = pending;
+    a.approvedUsers = approved;
+    a.clientsForAssign = clients;
+  } catch (e) {
+    a.error = e.message;
+  }
+  a.loading = false;
+  renderAll();
+}
+
+async function approveUser(userId) {
+  const select = document.querySelector(`[data-approve-client="${userId}"]`);
+  const clientId = select && select.value;
+  if (!clientId) {
+    alert("Select a client to assign before approving.");
+    return;
+  }
+  try {
+    await fetchJson(`/api/admin/users/${userId}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_id: Number(clientId) }),
+    });
+    await loadAdminData();
+  } catch (e) {
+    alert(`Approve failed: ${e.message}`);
+  }
+}
+
+async function rejectUser(userId) {
+  if (!window.confirm("Reject and delete this registration request? This cannot be undone.")) return;
+  try {
+    await fetchJson(`/api/admin/users/${userId}/reject`, { method: "POST" });
+    await loadAdminData();
+  } catch (e) {
+    alert(`Reject failed: ${e.message}`);
+  }
+}
+
+function renderAdmin() {
+  const a = state.admin;
+  if (a.loading) return `<div class="empty-state">Loading…</div>`;
+  if (a.error) return `<div class="error-state">Failed to load admin data: ${escapeHtml(a.error)}</div>`;
+
+  const pendingRows =
+    a.pendingUsers.length === 0
+      ? `<tr><td colspan="4" class="empty-state">No pending registrations.</td></tr>`
+      : a.pendingUsers
+          .map((u) => {
+            const guess = a.clientsForAssign.find(
+              (c) => c.name.trim().toLowerCase() === (u.requested_client_name || "").trim().toLowerCase()
+            );
+            const options = a.clientsForAssign
+              .map((c) => `<option value="${c.id}" ${guess && guess.id === c.id ? "selected" : ""}>${escapeHtml(c.name)}</option>`)
+              .join("");
+            return `
+        <tr>
+          <td>${escapeHtml(u.email)}</td>
+          <td class="muted">${escapeHtml(u.requested_client_name || "—")}</td>
+          <td>
+            <select class="form-input" data-approve-client="${u.id}" style="min-height:30px;">
+              <option value="">Select client…</option>
+              ${options}
+            </select>
+          </td>
+          <td style="text-align:right;white-space:nowrap;">
+            <button class="btn-secondary" data-approve-user="${u.id}">Approve</button>
+            <button class="btn-secondary" data-reject-user="${u.id}" style="color:#7a3030;">Reject</button>
+          </td>
+        </tr>`;
+          })
+          .join("");
+
+  const approvedRows =
+    a.approvedUsers.length === 0
+      ? `<tr><td colspan="3" class="empty-state">No approved users yet.</td></tr>`
+      : a.approvedUsers
+          .map(
+            (u) => `
+        <tr>
+          <td>${escapeHtml(u.email)}</td>
+          <td class="muted">${escapeHtml(u.client_name || "—")}</td>
+          <td class="muted">${escapeHtml(u.role)}</td>
+        </tr>`
+          )
+          .join("");
+
+  return `
+    <div class="admin-section">
+      <div class="heading admin-section-title">Pending registrations</div>
+      <table class="data-table">
+        <thead><tr><th>Email</th><th>Requested client</th><th>Assign to</th><th></th></tr></thead>
+        <tbody>${pendingRows}</tbody>
+      </table>
+    </div>
+    <div>
+      <div class="heading admin-section-title">Approved users</div>
+      <table class="data-table">
+        <thead><tr><th>Email</th><th>Client</th><th>Role</th></tr></thead>
+        <tbody>${approvedRows}</tbody>
+      </table>
+      <div class="admin-note">Editing role/client or deactivating an approved user isn't built yet.</div>
+    </div>
+  `;
+}
+
+// ---------------------------------------------------------------------
 // Render: placeholder screens (not built yet)
 // ---------------------------------------------------------------------
 
@@ -845,7 +1477,22 @@ function renderContent() {
       el.innerHTML = renderPlaceholder("Clients");
       break;
     case "composer":
-      el.innerHTML = renderPlaceholder("Composer");
+      el.innerHTML = renderComposer();
+      wireComposerEvents();
+      updateComposerPreview();
+      break;
+    case "admin":
+      if (!isAdmin()) {
+        el.innerHTML = renderPlaceholder("Admin");
+        break;
+      }
+      el.innerHTML = renderAdmin();
+      el.querySelectorAll("[data-approve-user]").forEach((btn) => {
+        btn.addEventListener("click", () => approveUser(Number(btn.getAttribute("data-approve-user"))));
+      });
+      el.querySelectorAll("[data-reject-user]").forEach((btn) => {
+        btn.addEventListener("click", () => rejectUser(Number(btn.getAttribute("data-reject-user"))));
+      });
       break;
     default:
       el.innerHTML = renderPlaceholder(state.screen);
@@ -858,12 +1505,190 @@ function renderContent() {
 
 function renderAll() {
   renderNav();
+  renderSidebarFooter();
   renderTopbar();
   renderContent();
   if (window.lucide) window.lucide.createIcons();
 }
 
-document.getElementById("new-post-btn").addEventListener("click", () => goScreen("composer"));
+// ---------------------------------------------------------------------
+// Render: Login / Register (Phase 28) — shown instead of .app whenever
+// state.auth.authenticated is false. Uncontrolled inputs (read from the
+// DOM on submit), same pattern the Composer form already uses.
+// ---------------------------------------------------------------------
+
+function renderLoginForm() {
+  const f = state.authForm;
+  return `
+    <div class="heading auth-title">Log in</div>
+    <div class="auth-subtitle">Sign in to your Postline workspace.</div>
+    ${f.error ? `<div class="error-state" style="margin-bottom:14px;">${escapeHtml(f.error)}</div>` : ""}
+    <form id="login-form">
+      <div class="form-group" style="margin-bottom:12px;">
+        <div class="form-label">Email</div>
+        <input type="email" id="login-email" class="form-input" required />
+      </div>
+      <div class="form-group" style="margin-bottom:18px;">
+        <div class="form-label">Password</div>
+        <input type="password" id="login-password" class="form-input" required />
+      </div>
+      <button type="submit" class="btn-primary" style="width:100%;justify-content:center;" ${f.submitting ? "disabled" : ""}>
+        ${f.submitting ? "Logging in…" : "Log in"}
+      </button>
+    </form>
+    <div class="auth-switch">No account yet? <span class="auth-switch-link" id="go-register">Request access</span></div>
+  `;
+}
+
+function renderRegisterForm() {
+  const f = state.authForm;
+  return `
+    <div class="heading auth-title">Request access</div>
+    <div class="auth-subtitle">Ask to join a client workspace — an admin will review and approve your request.</div>
+    ${f.error ? `<div class="error-state" style="margin-bottom:14px;">${escapeHtml(f.error)}</div>` : ""}
+    ${f.success ? `<div class="auth-success">${escapeHtml(f.success)}</div>` : ""}
+    <form id="register-form">
+      <div class="form-group" style="margin-bottom:12px;">
+        <div class="form-label">Email</div>
+        <input type="email" id="register-email" class="form-input" required />
+      </div>
+      <div class="form-group" style="margin-bottom:12px;">
+        <div class="form-label">Password</div>
+        <input type="password" id="register-password" class="form-input" required minlength="8" />
+      </div>
+      <div class="form-group" style="margin-bottom:18px;">
+        <div class="form-label">Client workspace name</div>
+        <input type="text" id="register-client" class="form-input" placeholder="e.g. Bloom Studio" required />
+        <div class="form-hint">Type the name your admin gave you — they'll confirm it when approving your request.</div>
+      </div>
+      <button type="submit" class="btn-primary" style="width:100%;justify-content:center;" ${f.submitting ? "disabled" : ""}>
+        ${f.submitting ? "Submitting…" : "Request access"}
+      </button>
+    </form>
+    <div class="auth-switch">Already approved? <span class="auth-switch-link" id="go-login">Log in</span></div>
+  `;
+}
+
+function renderAuthScreen() {
+  const root = document.getElementById("auth-root");
+  root.innerHTML = `
+    <div class="auth-card">
+      <div class="brand" style="justify-content:center;margin-bottom:22px;">
+        <div class="brand-mark"><i data-lucide="send" style="width:14px;height:14px;"></i></div>
+        <div class="brand-name">Postline</div>
+      </div>
+      ${state.authForm.mode === "login" ? renderLoginForm() : renderRegisterForm()}
+    </div>
+  `;
+  wireAuthEvents();
+  if (window.lucide) window.lucide.createIcons();
+}
+
+function wireAuthEvents() {
+  const goRegister = document.getElementById("go-register");
+  if (goRegister) {
+    goRegister.addEventListener("click", () => {
+      state.authForm = { mode: "register", error: null, success: null, submitting: false };
+      renderAuthScreen();
+    });
+  }
+  const goLogin = document.getElementById("go-login");
+  if (goLogin) {
+    goLogin.addEventListener("click", () => {
+      state.authForm = { mode: "login", error: null, success: null, submitting: false };
+      renderAuthScreen();
+    });
+  }
+  const loginForm = document.getElementById("login-form");
+  if (loginForm) loginForm.addEventListener("submit", submitLogin);
+  const registerForm = document.getElementById("register-form");
+  if (registerForm) registerForm.addEventListener("submit", submitRegister);
+}
+
+async function submitLogin(e) {
+  e.preventDefault();
+  // Read the fields BEFORE re-rendering: renderAuthScreen() regenerates the
+  // form's innerHTML from scratch (these are uncontrolled inputs, same as
+  // the Composer form), which would otherwise wipe whatever was just typed
+  // the instant the "submitting…" state renders.
+  const email = document.getElementById("login-email").value.trim();
+  const password = document.getElementById("login-password").value;
+
+  const f = state.authForm;
+  f.submitting = true;
+  f.error = null;
+  renderAuthScreen();
+
+  try {
+    const me = await fetchJson("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    state.auth = me;
+    state.screen = "calendar";
+    if (!isAdmin()) state.activeClientId = me.client_id;
+    showApp();
+    renderAll();
+    loadClients();
+    loadJobs();
+  } catch (err) {
+    f.submitting = false;
+    f.error = err.message || "Invalid email or password.";
+    renderAuthScreen();
+  }
+}
+
+async function submitRegister(e) {
+  e.preventDefault();
+  // Same ordering fix as submitLogin above: read before re-rendering.
+  const email = document.getElementById("register-email").value.trim();
+  const password = document.getElementById("register-password").value;
+  const clientName = document.getElementById("register-client").value.trim();
+
+  const f = state.authForm;
+  f.submitting = true;
+  f.error = null;
+  f.success = null;
+  renderAuthScreen();
+
+  try {
+    const res = await fetchJson("/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, client_name: clientName }),
+    });
+    f.submitting = false;
+    f.success = res.detail || "Request submitted.";
+    renderAuthScreen();
+  } catch (err) {
+    f.submitting = false;
+    f.error = err.message || "Could not submit your request.";
+    renderAuthScreen();
+  }
+}
+
+async function boot() {
+  try {
+    const me = await fetchJson("/api/auth/me");
+    if (me.authenticated) {
+      state.auth = me;
+      if (!isAdmin()) state.activeClientId = me.client_id;
+      showApp();
+      renderAll();
+      loadClients();
+      loadJobs();
+      return;
+    }
+  } catch (e) {
+    // Falls through to the anonymous/login-screen path below.
+  }
+  state.auth = { authenticated: false };
+  showAuth();
+  renderAuthScreen();
+}
+
+document.getElementById("new-post-btn").addEventListener("click", openComposer);
 
 // Close the client dropdown when clicking outside it.
 document.addEventListener("click", (e) => {
@@ -874,9 +1699,7 @@ document.addEventListener("click", (e) => {
   }
 });
 
-renderAll();
-loadClients();
-loadJobs();
+boot();
 </script>
 </body>
 </html>

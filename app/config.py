@@ -80,6 +80,14 @@ class Settings:
     # depend on it.
     r2_public_base_url: str = os.getenv("R2_PUBLIC_BASE_URL", "").strip()
 
+    # Secret key used by app/auth.py to sign dashboard session cookies
+    # (Phase 28 — client_user/admin logins via POST /api/auth/login).
+    # Optional at this layer, same treatment as the R2_* vars: a missing
+    # value doesn't stop the whole app (Celery workers never touch this),
+    # app/auth.py itself falls back to a random per-process key and warns
+    # loudly, since that's a dashboard-process-only concern.
+    session_secret_key: str = os.getenv("SESSION_SECRET_KEY", "").strip()
+
     def __post_init__(self) -> None:
         if not self.database_url:
             raise RuntimeError(
