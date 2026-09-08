@@ -20,10 +20,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -31,12 +32,21 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app import storage
-from app.auth import create_session_token, hash_password, verify_password, verify_session_token
+from app.auth import (
+    create_oauth_state_token,
+    create_session_token,
+    hash_password,
+    verify_oauth_state_token,
+    verify_password,
+    verify_session_token,
+)
 from app.db import SessionLocal
-from app.exceptions import StorageNotConfiguredError
+from app.exceptions import PermanentError, StorageNotConfiguredError
 from app.models import Account, Client, Job, JobStatus, User, WebhookEvent
+from app.publishers import youtube as youtube_publisher
 from app.tasks import handle_tiktok_webhook_event, publish_job
 from app.webhooks import tiktok as tiktok_webhooks
+from scripts.add_account import upsert_account
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +108,20 @@ _DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
 # visitor is *expected* to hit a /api/* route — login/register have to be
 # reachable before any session exists, and /me is how the SPA silently
 # checks "am I logged in?" on load without forcing a 401 round trip.
-_PUBLIC_API_PATHS = {"/api/auth/register", "/api/auth/login", "/api/auth/logout", "/api/auth/me"}
+#
+# /api/oauth/youtube/callback (Phase 29a) is the other: Google redirects the
+# browser here with no session cookie at all, so it has to be public too —
+# its own security comes from verifying the signed "state" param (see
+# youtube_oauth_callback below), not from enforce_auth. Its sibling /start
+# route is deliberately NOT here — that one still requires a real
+# client_user session, gated normally.
+_PUBLIC_API_PATHS = {
+    "/api/auth/register",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/me",
+    "/api/oauth/youtube/callback",
+}
 
 
 def _is_protected(path: str) -> bool:
@@ -618,6 +641,84 @@ def auth_me(request: Request = None, db: Session = Depends(get_db)):
         client_name = client.name if client else None
 
     return MeOut(authenticated=True, role=auth.role, client_id=auth.client_id, client_name=client_name, email=auth.email)
+
+
+@app.get("/api/oauth/youtube/start")
+def youtube_oauth_start(request: Request = None):
+    """
+    Starts the in-browser YouTube connect flow (Phase 29a) — client_user
+    self-service onboarding, replacing scripts/authorize_youtube.py's CLI
+    flow for client teams who can't run a local script themselves. Not
+    offered to the admin path (Basic-Auth or an admin User session): an
+    admin isn't scoped to any one Client, and this flow always creates the
+    resulting Account under the caller's own client_id, encoded (signed)
+    into the OAuth "state" param below since Google's callback redirect
+    carries no session cookie to read it from otherwise.
+    """
+    auth = _get_auth(request)
+    if auth.role != "client_user":
+        raise HTTPException(status_code=403, detail="YouTube self-service connect is only available to a client account.")
+
+    redirect_uri = str(request.url_for("youtube_oauth_callback"))
+    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id})
+    try:
+        authorization_url = youtube_publisher.build_authorization_url(redirect_uri, state)
+    except PermanentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(authorization_url)
+
+
+@app.get("/api/oauth/youtube/callback")
+def youtube_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public callback Google redirects the browser back to after the consent
+    screen from youtube_oauth_start above (see _PUBLIC_API_PATHS — Google's
+    redirect carries no session cookie, so this route's only trust anchor is
+    the signed "state" param, not request.state.auth). Verifies state,
+    exchanges the code for credentials, and upserts an Account row
+    (platform="youtube") scoped to the client_id encoded in state, via the
+    same insert-or-update-by-platform+name helper
+    scripts/authorize_youtube.py --account uses — reconnecting the same
+    channel rotates its stored token in place instead of creating a
+    duplicate Account.
+
+    Always redirects back into the SPA (never a raw JSON error): this is a
+    full-page browser navigation, not a fetch() call, so errors are reported
+    via a query string the frontend reads and displays rather than an HTTP
+    error status the browser would render as a bare error page.
+    """
+    if error:
+        return RedirectResponse(f"/?screen=accounts&youtube_connect=error&reason={quote(error)}")
+    if not code or not state:
+        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=missing_code_or_state")
+
+    state_data = verify_oauth_state_token(state)
+    if state_data is None:
+        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=invalid_or_expired_state")
+
+    client_id = state_data.get("client_id")
+    client = db.get(Client, client_id) if client_id is not None else None
+    if client is None:
+        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=unknown_client")
+
+    redirect_uri = str(request.url_for("youtube_oauth_callback"))
+    try:
+        credentials = youtube_publisher.exchange_code_for_credentials(code, redirect_uri)
+    except PermanentError as exc:
+        logger.warning("YouTube OAuth code exchange failed for client %s: %s", client_id, exc)
+        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=exchange_failed")
+
+    account, _action = upsert_account(db, "youtube", f"{client.name} (self-service)", credentials)
+    account.client_id = client.id
+    db.commit()
+
+    return RedirectResponse("/?screen=accounts&youtube_connect=success")
 
 
 @app.get("/api/admin/users/pending", response_model=list[PendingUserOut])

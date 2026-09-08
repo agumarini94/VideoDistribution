@@ -1808,6 +1808,105 @@ unit-tested without Redis or a worker running.
   through its cookie jar — same reason a real browser wouldn't send one
   back over `http://localhost` either).
 
+### Phase 29a (current)
+- **In-browser YouTube OAuth for client self-service** — the start of
+  replacing CLI-only onboarding (`scripts/authorize_youtube.py`) with a
+  browser flow a `client_user` can complete themselves, without shell
+  access. Scoped narrowly to YouTube and to `role="client_user"` sessions
+  only (not admin — an admin isn't scoped to any one `Client`, and this
+  flow always creates the resulting `Account` under the caller's own
+  `client_id`). Other platforms (twitter/tiktok/facebook/instagram) still
+  require the CLI `scripts/authorize_*.py` scripts — a natural follow-up,
+  not built this phase.
+- **`app/publishers/youtube.py`** gained two new pure functions, the
+  web-flow (browser redirect) counterpart to
+  `scripts/authorize_youtube.py`'s `InstalledAppFlow`, built on
+  `google_auth_oauthlib.flow.Flow` (already a dependency):
+  - `build_authorization_url(redirect_uri, state)` — builds the Google
+    consent-screen URL. `state` is opaque to this module (round-tripped by
+    Google verbatim) — the caller is responsible for making it
+    tamper-evident.
+  - `exchange_code_for_credentials(code, redirect_uri)` — exchanges an
+    authorization code for credentials JSON (same shape as
+    `Credentials.to_json()`, the module's existing "Credentials JSON
+    shape").
+  Both raise `PermanentError` if `client_secret.json` is missing at
+  `CLIENT_SECRET_PATH` — same fail-clearly posture as every other
+  credential-dependent path in this module. **The registered OAuth Client
+  ID must be a "Web application" type, not "Desktop app"** (which
+  `scripts/authorize_youtube.py` uses) — Google validates `redirect_uri`
+  against the client type, and a Desktop-app client will reject a web
+  redirect URI.
+- **`app/auth.py`** gained `create_oauth_state_token`/
+  `verify_oauth_state_token` — signs the OAuth `state` param through the
+  external Google redirect (which carries no session cookie back), reusing
+  `_SESSION_SECRET_KEY` but a distinct salt
+  (`"distribution-engine-oauth-state"`) from the session-cookie signer, so
+  a session token and an OAuth-state token can never be replayed as each
+  other. Short-lived (10 minutes, `OAUTH_STATE_MAX_AGE_SECONDS`) — it only
+  needs to survive one round trip through Google's consent screen.
+- **Two new routes in `dashboard/api.py`**:
+  - `GET /api/oauth/youtube/start` (gated, `client_user`-only — `403` for
+    admin or an unscoped caller) — builds `redirect_uri` from
+    `request.url_for("youtube_oauth_callback")` (so it's always exactly
+    this server's own callback URL, whatever host it's running on), signs
+    `{"client_id", "user_id"}` into `state`, and redirects the browser to
+    Google's consent screen.
+  - `GET /api/oauth/youtube/callback` (public — added to
+    `_PUBLIC_API_PATHS`, since Google's redirect carries no session cookie
+    at all; this route's only trust anchor is the signed `state` param, not
+    `enforce_auth`) — verifies `state`, exchanges `code` for credentials,
+    and upserts an `Account` row (`platform="youtube"`, named
+    `"<Client name> (self-service)"`) via the same
+    `scripts/add_account.py::upsert_account` helper every other
+    authorize script uses, with `client_id` set from the verified state —
+    so reconnecting the same channel rotates its token in place instead of
+    creating a duplicate `Account`. **Always redirects back into the SPA**
+    (`/?screen=accounts&youtube_connect=success` or
+    `...=error&reason=<code>`), never a raw JSON error response, since this
+    is a full-page browser navigation, not a `fetch()` call.
+- **Frontend** (`dashboard/static/index.html`): a "Connect YouTube" button
+  on the Connected Accounts screen, shown only for a `client_user` session
+  (`<a href="/api/oauth/youtube/start">`, a plain top-level navigation so
+  the session cookie rides along and the redirect chain to Google and back
+  works without any JS-side fetch/CORS handling). `boot()` gained
+  `consumeOauthRedirectParams()`, which reads `?screen=...&youtube_connect=
+  success|error&reason=...` left by the callback route's redirect, sets
+  `state.screen` and a one-time notice banner, and strips the query string
+  via `history.replaceState` so a page refresh doesn't re-show it.
+- **Tests**: `tests/test_auth.py::TestOAuthStateTokens` (roundtrip, tamper,
+  garbage, and — the one specific to this being a second signer — a valid
+  *session* token is rejected as OAuth state). `tests/test_publisher_youtube.py::TestWebOAuthFlow`
+  (`Flow.from_client_secrets_file` mocked with an in-memory fake, no real
+  Google HTTP — missing-`client_secret.json` on both functions, the
+  authorization URL/params built correctly, code exchange returning parsed
+  credentials JSON, a `Flow.fetch_token` failure wrapped as
+  `PermanentError`). `tests/test_dashboard_youtube_oauth.py` (FastAPI
+  `TestClient`, same reasoning as `tests/test_dashboard_auth.py` — this is
+  request-level behavior): `/start` 401 anonymous / 403 admin / redirects a
+  `client_user` to the (mocked) Google URL with a verifiable signed state;
+  `/callback` handles Google's `error` param, missing code/state, a
+  tampered state, a state naming a nonexistent client, a full happy path
+  asserting the created `Account`'s `client_id`/`credentials`, reconnecting
+  rotating the same `Account` instead of duplicating it, and a mocked
+  exchange failure leaving no `Account` behind.
+
+  **Local dev setup — register this exact redirect URI in Google Cloud
+  Console** (OAuth Client ID type: **Web application**, distinct from the
+  "Desktop app" client `scripts/authorize_youtube.py` uses — a second
+  Client ID, or reconfigure the existing one to Web application if it's
+  only ever used via this flow):
+  ```
+  http://localhost:8000/api/oauth/youtube/callback
+  ```
+  (Adjust the host/port if the dashboard runs elsewhere locally —
+  `/api/oauth/youtube/start` derives `redirect_uri` from the incoming
+  request, so it always matches whatever's actually registered as long as
+  that's what's typed into the browser.) In production this needs the
+  real deployed origin's equivalent (`https://<fly-app>.fly.dev/api/oauth/youtube/callback`
+  or a custom domain) added as an additional authorized redirect URI once
+  deployed.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

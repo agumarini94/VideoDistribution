@@ -52,6 +52,16 @@ compatible (both absent -> unchanged behavior).
     point, so a playlist failure must never fail the job or trigger a
     retry that would re-upload it — it's caught, logged, and surfaced as
     result["playlist_error"] instead of raised.
+
+In-browser connect flow (Phase 29a): build_authorization_url() and
+exchange_code_for_credentials() are the web-flow equivalent of
+scripts/authorize_youtube.py's InstalledAppFlow, used by
+dashboard/api.py's /api/oauth/youtube/start + /callback routes so a
+client_user can connect their own YouTube channel from the browser instead
+of running a CLI script. Same client_secret.json/SCOPES, but the OAuth
+Client ID registered in Google Cloud Console must be a "Web application"
+type (not "Desktop app") with the callback route's URL registered as an
+authorized redirect URI.
 """
 
 import json
@@ -62,6 +72,7 @@ from pathlib import Path
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
@@ -303,6 +314,56 @@ def refresh_stored_credentials(credentials: dict) -> dict:
         raise PermanentError(f"YouTube refresh token is invalid or has been revoked: {exc}") from exc
 
     return json.loads(creds.to_json())
+
+
+def build_authorization_url(redirect_uri: str, state: str) -> str:
+    """
+    Builds the Google OAuth consent-screen URL for a web-based (browser
+    redirect) authorization flow — used by dashboard/api.py's in-browser
+    "Connect YouTube" self-service flow (Phase 29a), as opposed to
+    scripts/authorize_youtube.py's local-server InstalledAppFlow. Uses the
+    same client_secret.json/SCOPES this module already owns, but requires
+    it be an OAuth "Web application" Client ID (not "Desktop app") — Google
+    validates redirect_uri against the type registered for the client.
+
+    `state` is opaque here (round-tripped to redirect_uri verbatim by
+    Google) — the caller is responsible for it being tamper-evident (see
+    app/auth.py::create_oauth_state_token), since this module has no
+    concept of a Client/session to encode into it.
+    """
+    if not CLIENT_SECRET_PATH.exists():
+        raise PermanentError(
+            f"YouTube self-service connect is not configured (missing {CLIENT_SECRET_PATH.name} "
+            "at the project root)."
+        )
+    flow = Flow.from_client_secrets_file(str(CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
+    # access_type=offline gets a refresh token; prompt=consent forces Google
+    # to re-issue one even if this Google account already granted access
+    # before — same reasoning as scripts/authorize_youtube.py's flow.
+    authorization_url, _ = flow.authorization_url(access_type="offline", prompt="consent", state=state)
+    return authorization_url
+
+
+def exchange_code_for_credentials(code: str, redirect_uri: str) -> dict:
+    """
+    Exchanges an OAuth authorization code (from the callback Google redirects
+    the browser to after build_authorization_url's consent screen) for
+    credentials JSON — same shape as Credentials.to_json(), see the module
+    docstring's "Credentials JSON shape". redirect_uri must be byte-identical
+    to the one passed to build_authorization_url for the same flow, per
+    OAuth2's spec.
+    """
+    if not CLIENT_SECRET_PATH.exists():
+        raise PermanentError(
+            f"YouTube self-service connect is not configured (missing {CLIENT_SECRET_PATH.name} "
+            "at the project root)."
+        )
+    flow = Flow.from_client_secrets_file(str(CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        raise PermanentError(f"Failed to exchange the YouTube authorization code for a token: {exc}") from exc
+    return json.loads(flow.credentials.to_json())
 
 
 def _classify_http_error(exc: HttpError) -> PublishError:

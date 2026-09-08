@@ -3,7 +3,14 @@ Tests for app/auth.py's password hashing and session token helpers (Phase
 28). Pure functions, no DB/network involved.
 """
 
-from app.auth import create_session_token, hash_password, verify_password, verify_session_token
+from app.auth import (
+    create_oauth_state_token,
+    create_session_token,
+    hash_password,
+    verify_oauth_state_token,
+    verify_password,
+    verify_session_token,
+)
 
 
 class TestPasswordHashing:
@@ -42,3 +49,27 @@ class TestSessionTokens:
 
     def test_empty_token_is_rejected(self):
         assert verify_session_token("") is None
+
+
+class TestOAuthStateTokens:
+    """Phase 29a — signed OAuth "state" param, app/auth.py's create/verify_oauth_state_token."""
+
+    def test_create_and_verify_roundtrip(self):
+        token = create_oauth_state_token({"client_id": 7, "user_id": 42})
+        assert verify_oauth_state_token(token) == {"client_id": 7, "user_id": 42}
+
+    def test_tampered_token_is_rejected(self):
+        token = create_oauth_state_token({"client_id": 7, "user_id": 42})
+        tampered = token[:-1] + ("a" if token[-1] != "a" else "b")
+        assert verify_oauth_state_token(tampered) is None
+
+    def test_garbage_token_is_rejected(self):
+        assert verify_oauth_state_token("not-a-token-at-all") is None
+
+    def test_session_token_is_not_accepted_as_oauth_state(self):
+        # Different salts (_SESSION_SALT vs _OAUTH_STATE_SALT) mean the two
+        # token kinds are cryptographically distinct even though they share
+        # _SESSION_SECRET_KEY — a session cookie can't be replayed as OAuth
+        # state.
+        session_token = create_session_token(42)
+        assert verify_oauth_state_token(session_token) is None

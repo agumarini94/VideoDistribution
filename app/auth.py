@@ -50,6 +50,18 @@ else:
 
 _serializer = URLSafeTimedSerializer(_SESSION_SECRET_KEY, salt=_SESSION_SALT)
 
+# Signs the OAuth "state" param for in-browser platform-connect flows (Phase
+# 29a: YouTube self-service onboarding, dashboard/api.py's
+# /api/oauth/youtube/start + /callback). A separate salt from the session
+# token above means the two are cryptographically distinct even though they
+# share _SESSION_SECRET_KEY — a session cookie can't be replayed as OAuth
+# state or vice versa. Short-lived (10 minutes) since it only needs to
+# survive one round trip through Google's consent screen, not a login
+# session.
+_OAUTH_STATE_SALT = "distribution-engine-oauth-state"
+_oauth_state_serializer = URLSafeTimedSerializer(_SESSION_SECRET_KEY, salt=_OAUTH_STATE_SALT)
+OAUTH_STATE_MAX_AGE_SECONDS = 600
+
 
 def hash_password(password: str) -> str:
     """Never store plaintext — bcrypt's own random salt makes each hash unique."""
@@ -89,3 +101,23 @@ def verify_session_token(token: str) -> int | None:
         return None
     user_id = data.get("user_id")
     return user_id if isinstance(user_id, int) else None
+
+
+def create_oauth_state_token(data: dict) -> str:
+    """Signed, timestamped token carrying arbitrary data (e.g. client_id) through an external OAuth redirect."""
+    return _oauth_state_serializer.dumps(data)
+
+
+def verify_oauth_state_token(token: str) -> dict | None:
+    """
+    Returns the encoded dict if the token's signature is valid and it hasn't
+    exceeded OAUTH_STATE_MAX_AGE_SECONDS, else None — same "clean fallback,
+    never raise" contract as verify_session_token, since the caller (an
+    OAuth callback route) always wants to treat a tampered/expired/malformed
+    state as a rejected request, not a 500.
+    """
+    try:
+        data = _oauth_state_serializer.loads(token, max_age=OAUTH_STATE_MAX_AGE_SECONDS)
+    except (BadSignature, SignatureExpired):
+        return None
+    return data if isinstance(data, dict) else None

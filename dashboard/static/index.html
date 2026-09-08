@@ -405,6 +405,7 @@ const state = {
   accounts: [],
   accountsLoading: false,
   accountsError: null,
+  youtubeConnectNotice: null, // { ok, text } | null — set from ?youtube_connect=... on boot (Phase 29a)
   composer: {
     platform: "youtube",
     accounts: [],
@@ -963,6 +964,16 @@ function renderQueue() {
 // ---------------------------------------------------------------------
 
 function renderAccounts() {
+  // Self-service connect (Phase 29a) is client_user-only — an admin isn't
+  // scoped to any one Client, so the backend route (dashboard/api.py's
+  // /api/oauth/youtube/start) 403s it too; hiding the button for admin is
+  // UI convenience on top of that real boundary, same convention as the
+  // Admin nav item being hidden for a client_user.
+  const canConnectYoutube = !!(state.auth && state.auth.role === "client_user");
+  const connectHtml = canConnectYoutube
+    ? `<div style="margin-bottom:16px;"><a class="btn-primary" style="text-decoration:none;" href="/api/oauth/youtube/start">Connect YouTube</a></div>`
+    : "";
+
   let body;
   if (state.accountsLoading) {
     body = `<div class="empty-state">Loading…</div>`;
@@ -988,10 +999,17 @@ function renderAccounts() {
           .join("")}
       </div>`;
   }
+  const noticeHtml = state.youtubeConnectNotice
+    ? state.youtubeConnectNotice.ok
+      ? `<div style="margin-bottom:16px;padding:10px 14px;border:1px solid var(--border);background:#eef6ff;color:#2c455d;font-size:13px;">${escapeHtml(state.youtubeConnectNotice.text)}</div>`
+      : `<div class="error-state" style="margin-bottom:16px;">${escapeHtml(state.youtubeConnectNotice.text)}</div>`
+    : "";
   return `
     <div style="font-size:13px;color:var(--muted);margin-bottom:16px;">Connected platforms for ${escapeHtml(activeClientLabel().name)}</div>
+    ${noticeHtml}
+    ${connectHtml}
     ${body}
-    <p style="font-size:12px;color:var(--muted);margin-top:16px;">Onboarding a new platform connection isn't built in this UI yet — use the <code>scripts/authorize_*.py</code> CLI scripts, then it shows up here.</p>
+    <p style="font-size:12px;color:var(--muted);margin-top:16px;">YouTube can be connected above (Phase 29a); every other platform's onboarding isn't built in this UI yet — use the <code>scripts/authorize_*.py</code> CLI scripts, then it shows up here.</p>
   `;
 }
 
@@ -1668,16 +1686,41 @@ async function submitRegister(e) {
   }
 }
 
+// Reads ?screen=...&youtube_connect=success|error&reason=... left by the
+// /api/oauth/youtube/callback redirect (Phase 29a — a full-page browser
+// navigation, so this is how that route reports its outcome back into the
+// SPA instead of a fetch() response) and strips them from the URL via
+// history.replaceState so a page refresh doesn't re-show the same notice.
+function consumeOauthRedirectParams() {
+  const params = new URLSearchParams(window.location.search);
+  const screen = params.get("screen");
+  if (screen && SCREEN_TITLES[screen]) state.screen = screen;
+
+  const youtubeConnect = params.get("youtube_connect");
+  if (youtubeConnect === "success") {
+    state.youtubeConnectNotice = { ok: true, text: "YouTube account connected." };
+  } else if (youtubeConnect === "error") {
+    const reason = params.get("reason") || "unknown_error";
+    state.youtubeConnectNotice = { ok: false, text: `Could not connect YouTube (${reason}). Please try again.` };
+  }
+
+  if (screen || youtubeConnect) {
+    window.history.replaceState({}, "", window.location.pathname);
+  }
+}
+
 async function boot() {
   try {
     const me = await fetchJson("/api/auth/me");
     if (me.authenticated) {
       state.auth = me;
       if (!isAdmin()) state.activeClientId = me.client_id;
+      consumeOauthRedirectParams();
       showApp();
       renderAll();
       loadClients();
       loadJobs();
+      if (state.screen === "accounts") loadAccounts();
       return;
     }
   } catch (e) {
