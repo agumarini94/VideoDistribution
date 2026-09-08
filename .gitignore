@@ -12,3 +12,4 @@ token.json
 uploads/
 celerybeat-schedule*
 celerybeat-schedule
+client_secret_desktop_backup.json
