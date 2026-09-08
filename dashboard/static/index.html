@@ -407,6 +407,7 @@ const state = {
   accountsError: null,
   youtubeConnectNotice: null, // { ok, text } | null — set from ?youtube_connect=... on boot (Phase 29a)
   twitterConnectNotice: null, // { ok, text } | null — set from ?twitter_connect=... on boot (Phase 29b)
+  tiktokConnectNotice: null, // { ok, text } | null — set from ?tiktok_connect=... on boot (Phase 29c)
   composer: {
     platform: "youtube",
     accounts: [],
@@ -965,17 +966,19 @@ function renderQueue() {
 // ---------------------------------------------------------------------
 
 function renderAccounts() {
-  // Self-service connect (Phase 29a YouTube, Phase 29b Twitter/X) is
-  // client_user-only — an admin isn't scoped to any one Client, so the
-  // backend routes (dashboard/api.py's /api/oauth/{youtube,twitter}/start)
-  // 403 it too; hiding the buttons for admin is UI convenience on top of
-  // that real boundary, same convention as the Admin nav item being hidden
-  // for a client_user.
+  // Self-service connect (Phase 29a YouTube, Phase 29b Twitter/X, Phase 29c
+  // TikTok) is client_user-only — an admin isn't scoped to any one Client,
+  // so the backend routes
+  // (dashboard/api.py's /api/oauth/{youtube,twitter,tiktok}/start) 403 it
+  // too; hiding the buttons for admin is UI convenience on top of that real
+  // boundary, same convention as the Admin nav item being hidden for a
+  // client_user.
   const canConnectPlatforms = !!(state.auth && state.auth.role === "client_user");
   const connectHtml = canConnectPlatforms
     ? `<div style="margin-bottom:16px;display:flex;gap:10px;">
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/youtube/start">Connect YouTube</a>
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/twitter/start">Connect X/Twitter</a>
+        <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/tiktok/start">Connect TikTok</a>
       </div>`
     : "";
 
@@ -1010,13 +1013,14 @@ function renderAccounts() {
         ? `<div style="margin-bottom:16px;padding:10px 14px;border:1px solid var(--border);background:#eef6ff;color:#2c455d;font-size:13px;">${escapeHtml(notice.text)}</div>`
         : `<div class="error-state" style="margin-bottom:16px;">${escapeHtml(notice.text)}</div>`
       : "";
-  const noticeHtml = renderNotice(state.youtubeConnectNotice) + renderNotice(state.twitterConnectNotice);
+  const noticeHtml =
+    renderNotice(state.youtubeConnectNotice) + renderNotice(state.twitterConnectNotice) + renderNotice(state.tiktokConnectNotice);
   return `
     <div style="font-size:13px;color:var(--muted);margin-bottom:16px;">Connected platforms for ${escapeHtml(activeClientLabel().name)}</div>
     ${noticeHtml}
     ${connectHtml}
     ${body}
-    <p style="font-size:12px;color:var(--muted);margin-top:16px;">YouTube and X/Twitter can be connected above (Phases 29a/29b); every other platform's onboarding isn't built in this UI yet — use the <code>scripts/authorize_*.py</code> CLI scripts, then it shows up here.</p>
+    <p style="font-size:12px;color:var(--muted);margin-top:16px;">YouTube, X/Twitter and TikTok can be connected above (Phases 29a/29b/29c); every other platform's onboarding isn't built in this UI yet — use the <code>scripts/authorize_*.py</code> CLI scripts, then it shows up here.</p>
   `;
 }
 
@@ -1693,12 +1697,14 @@ async function submitRegister(e) {
   }
 }
 
-// Reads ?screen=...&youtube_connect=success|error&reason=... (Phase 29a) or
-// ?twitter_connect=success|error&reason=... (Phase 29b) left by the
-// /api/oauth/{youtube,twitter}/callback redirect — a full-page browser
-// navigation, so this is how those routes report their outcome back into
-// the SPA instead of a fetch() response — and strips them from the URL via
-// history.replaceState so a page refresh doesn't re-show the same notice.
+// Reads ?screen=...&youtube_connect=success|error&reason=... (Phase 29a),
+// ?twitter_connect=success|error&reason=... (Phase 29b) or
+// ?tiktok_connect=success|error&reason=... (Phase 29c) left by the
+// /api/oauth/{youtube,twitter,tiktok}/callback redirect — a full-page
+// browser navigation, so this is how those routes report their outcome back
+// into the SPA instead of a fetch() response — and strips them from the URL
+// via history.replaceState so a page refresh doesn't re-show the same
+// notice.
 function consumeOauthRedirectParams() {
   const params = new URLSearchParams(window.location.search);
   const screen = params.get("screen");
@@ -1720,7 +1726,15 @@ function consumeOauthRedirectParams() {
     state.twitterConnectNotice = { ok: false, text: `Could not connect X/Twitter (${reason}). Please try again.` };
   }
 
-  if (screen || youtubeConnect || twitterConnect) {
+  const tiktokConnect = params.get("tiktok_connect");
+  if (tiktokConnect === "success") {
+    state.tiktokConnectNotice = { ok: true, text: "TikTok account connected." };
+  } else if (tiktokConnect === "error") {
+    const reason = params.get("reason") || "unknown_error";
+    state.tiktokConnectNotice = { ok: false, text: `Could not connect TikTok (${reason}). Please try again.` };
+  }
+
+  if (screen || youtubeConnect || twitterConnect || tiktokConnect) {
     window.history.replaceState({}, "", window.location.pathname);
   }
 }

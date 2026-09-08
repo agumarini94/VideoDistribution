@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +45,7 @@ from app.auth import (
 from app.db import SessionLocal
 from app.exceptions import PermanentError, StorageNotConfiguredError
 from app.models import Account, Client, Job, JobStatus, User, WebhookEvent
+from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
 from app.tasks import handle_tiktok_webhook_event, publish_job
@@ -112,13 +113,15 @@ _DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
 # reachable before any session exists, and /me is how the SPA silently
 # checks "am I logged in?" on load without forcing a 401 round trip.
 #
-# /api/oauth/youtube/callback (Phase 29a) and /api/oauth/twitter/callback
-# (Phase 29b, same reasoning) are the other public ones: the platform
-# redirects the browser here with no session cookie at all, so both have to
-# be public too — their own security comes from verifying the signed
-# "state" param (see youtube_oauth_callback/twitter_oauth_callback below),
-# not from enforce_auth. Their sibling /start routes are deliberately NOT
-# here — those still require a real client_user session, gated normally.
+# /api/oauth/youtube/callback (Phase 29a), /api/oauth/twitter/callback
+# (Phase 29b) and /api/oauth/tiktok/callback (Phase 29c, same reasoning) are
+# the other public ones: the platform redirects the browser here with no
+# session cookie at all, so all three have to be public too — their own
+# security comes from verifying the signed "state" param (see
+# youtube_oauth_callback/twitter_oauth_callback/tiktok_oauth_callback
+# below), not from enforce_auth. Their sibling /start routes are
+# deliberately NOT here — those still require a real client_user session,
+# gated normally.
 _PUBLIC_API_PATHS = {
     "/api/auth/register",
     "/api/auth/login",
@@ -126,6 +129,7 @@ _PUBLIC_API_PATHS = {
     "/api/auth/me",
     "/api/oauth/youtube/callback",
     "/api/oauth/twitter/callback",
+    "/api/oauth/tiktok/callback",
 }
 
 
@@ -740,6 +744,26 @@ def _generate_pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
+def _use_loopback_ip_for_local_host(redirect_uri: str) -> str:
+    """
+    X's OAuth 2.0 authorize endpoint rejects "localhost" redirect_uris
+    outright (a generic "Something went wrong" error) — for non-HTTPS local
+    development it only accepts the loopback IP 127.0.0.1 instead (confirmed
+    via X's own developer forum, not documented in its official OAuth
+    docs). This only rewrites the redirect_uri sent to X as part of the
+    authorize request (twitter_oauth_start, below) — the callback ROUTE
+    itself is unaffected (FastAPI matches by path, not host): once X
+    redirects the browser back to this rewritten URI, request.url_for in
+    twitter_oauth_callback naturally reproduces "127.0.0.1" too, since
+    that's the real Host header on that follow-up request.
+    """
+    parts = urlsplit(redirect_uri)
+    if parts.hostname != "localhost":
+        return redirect_uri
+    netloc = "127.0.0.1" if parts.port is None else f"127.0.0.1:{parts.port}"
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
 @app.get("/api/oauth/twitter/start")
 def twitter_oauth_start(request: Request = None):
     """
@@ -755,12 +779,16 @@ def twitter_oauth_start(request: Request = None):
     redirect back never echoes it. It rides inside the same signed
     oauth-state token as client_id/user_id, so it's tamper-evident and
     short-lived (10 minutes) exactly like the rest of the state.
+
+    redirect_uri is rewritten to use 127.0.0.1 instead of localhost (see
+    _use_loopback_ip_for_local_host above) before being sent to X — X's
+    authorize endpoint rejects "localhost" outright for local dev.
     """
     auth = _get_auth(request)
     if auth.role != "client_user":
         raise HTTPException(status_code=403, detail="X/Twitter self-service connect is only available to a client account.")
 
-    redirect_uri = str(request.url_for("twitter_oauth_callback"))
+    redirect_uri = _use_loopback_ip_for_local_host(str(request.url_for("twitter_oauth_callback")))
     code_verifier, code_challenge = _generate_pkce_pair()
     state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id, "code_verifier": code_verifier})
     try:
@@ -817,6 +845,96 @@ def twitter_oauth_callback(
     db.commit()
 
     return RedirectResponse("/?screen=accounts&twitter_connect=success")
+
+
+def _generate_tiktok_pkce_pair() -> tuple[str, str]:
+    """
+    TikTok's non-standard PKCE pair (Phase 29c) — the challenge is the raw
+    HEX digest of SHA256(verifier), NOT standard RFC 7636 base64url (see
+    _generate_pkce_pair above for X's standard version, and
+    scripts/authorize_tiktok.py::_generate_pkce_pair, whose exact shape this
+    mirrors, for why TikTok's Login Kit requires the deviation). Do not
+    "fix" this to match _generate_pkce_pair — that would break against
+    TikTok's login page.
+    """
+    verifier = secrets.token_urlsafe(64)  # ~86 chars, within RFC 7636's 43-128 range
+    challenge = hashlib.sha256(verifier.encode("ascii")).hexdigest()
+    return verifier, challenge
+
+
+@app.get("/api/oauth/tiktok/start")
+def tiktok_oauth_start(request: Request = None):
+    """
+    Starts the in-browser TikTok connect flow (Phase 29c), mirroring
+    youtube_oauth_start (29a) / twitter_oauth_start (29b) — client_user-only,
+    since this flow always creates the resulting Account under the caller's
+    own client_id. Like Twitter's, this needs PKCE, but with TikTok's
+    non-standard hex-digest challenge (_generate_tiktok_pkce_pair) rather
+    than X's standard RFC 7636 one — the verifier rides inside the signed
+    state token exactly the same way Twitter's does, since TikTok's callback
+    never echoes it back either.
+    """
+    auth = _get_auth(request)
+    if auth.role != "client_user":
+        raise HTTPException(status_code=403, detail="TikTok self-service connect is only available to a client account.")
+
+    redirect_uri = str(request.url_for("tiktok_oauth_callback"))
+    code_verifier, code_challenge = _generate_tiktok_pkce_pair()
+    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id, "code_verifier": code_verifier})
+    try:
+        authorization_url = tiktok_publisher.build_authorization_url(redirect_uri, state, code_challenge)
+    except PermanentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(authorization_url)
+
+
+@app.get("/api/oauth/tiktok/callback")
+def tiktok_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public callback TikTok redirects the browser back to after the consent
+    screen from tiktok_oauth_start above — mirrors
+    youtube_oauth_callback/twitter_oauth_callback exactly, see their
+    docstrings for why this must stay public and redirect-only. Like
+    Twitter's callback, the PKCE code_verifier is pulled back out of state
+    and passed to exchange_code_for_credentials, which TikTok uses to verify
+    this exchange belongs to the same flow that sent the code_challenge.
+    """
+    if error:
+        return RedirectResponse(f"/?screen=accounts&tiktok_connect=error&reason={quote(error)}")
+    if not code or not state:
+        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=missing_code_or_state")
+
+    state_data = verify_oauth_state_token(state)
+    if state_data is None:
+        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=invalid_or_expired_state")
+
+    code_verifier = state_data.get("code_verifier")
+    if not code_verifier:
+        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=missing_pkce_verifier")
+
+    client_id = state_data.get("client_id")
+    client = db.get(Client, client_id) if client_id is not None else None
+    if client is None:
+        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=unknown_client")
+
+    redirect_uri = str(request.url_for("tiktok_oauth_callback"))
+    try:
+        credentials = tiktok_publisher.exchange_code_for_credentials(code, redirect_uri, code_verifier)
+    except PermanentError as exc:
+        logger.warning("TikTok OAuth code exchange failed for client %s: %s", client_id, exc)
+        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=exchange_failed")
+
+    account, _action = upsert_account(db, "tiktok", f"{client.name} (self-service)", credentials)
+    account.client_id = client.id
+    db.commit()
+
+    return RedirectResponse("/?screen=accounts&tiktok_connect=success")
 
 
 @app.get("/api/admin/users/pending", response_model=list[PendingUserOut])

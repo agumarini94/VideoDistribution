@@ -113,3 +113,100 @@ class TestHappyPath:
 
         assert result == {"platform": "tiktok", "external_id": "pub-123"}
         assert len(responses.calls) == 2  # the init POST + exactly one PUT chunk
+
+
+class TestWebOAuthFlow:
+    """Phase 29c — build_authorization_url/exchange_code_for_credentials, the
+    web-flow (browser redirect) counterpart to scripts/authorize_tiktok.py's
+    local-server flow, used by dashboard/api.py's /api/oauth/tiktok/*
+    routes. Modeled on
+    tests/test_publisher_twitter.py::TestWebOAuthFlow."""
+
+    def test_build_authorization_url_missing_client_key_raises(self, monkeypatch):
+        monkeypatch.delenv("TIKTOK_CLIENT_KEY", raising=False)
+        with pytest.raises(PermanentError):
+            tiktok_publisher.build_authorization_url("http://localhost/callback", "state123", "deadbeef")
+
+    def test_build_authorization_url_happy_path(self, monkeypatch):
+        monkeypatch.setenv("TIKTOK_CLIENT_KEY", "client-key")
+
+        url = tiktok_publisher.build_authorization_url("http://localhost/callback", "state123", "deadbeef")
+
+        assert url.startswith(tiktok_publisher.AUTHORIZE_URL + "?")
+        assert "client_key=client-key" in url
+        assert "state=state123" in url
+        assert "code_challenge=deadbeef" in url
+        assert "code_challenge_method=S256" in url
+        assert "response_type=code" in url
+
+    @responses.activate
+    def test_exchange_code_for_credentials_happy_path(self, monkeypatch):
+        monkeypatch.setenv("TIKTOK_CLIENT_KEY", "client-key")
+        monkeypatch.setenv("TIKTOK_CLIENT_SECRET", "client-secret")
+        responses.add(
+            responses.POST,
+            tiktok_publisher.TOKEN_URL,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "open_id": "user-123",
+                "scope": "user.info.basic,video.upload",
+                "expires_in": 86400,
+            },
+            status=200,
+        )
+
+        creds = tiktok_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+        assert creds["access_token"] == "new-access"
+        assert creds["refresh_token"] == "new-refresh"
+        assert creds["open_id"] == "user-123"
+        assert creds["expires_at"] is not None
+
+        request = responses.calls[0].request
+        assert "grant_type=authorization_code" in request.body
+        assert "code=auth-code" in request.body
+        assert "code_verifier=verifier123" in request.body
+
+    def test_exchange_code_for_credentials_missing_app_credentials_is_permanent(self, monkeypatch):
+        monkeypatch.delenv("TIKTOK_CLIENT_KEY", raising=False)
+        monkeypatch.delenv("TIKTOK_CLIENT_SECRET", raising=False)
+        with pytest.raises(PermanentError):
+            tiktok_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+    @responses.activate
+    def test_exchange_code_for_credentials_wraps_token_endpoint_failure_as_permanent(self, monkeypatch):
+        # A PKCE verifier/challenge mismatch normally surfaces as a
+        # TransientError or PermanentError from exchange_authorization_code
+        # depending on the error code — this one-shot interactive flow
+        # normalizes either way to PermanentError. See the function's
+        # docstring.
+        monkeypatch.setenv("TIKTOK_CLIENT_KEY", "client-key")
+        monkeypatch.setenv("TIKTOK_CLIENT_SECRET", "client-secret")
+        responses.add(
+            responses.POST,
+            tiktok_publisher.TOKEN_URL,
+            json={"error": "invalid_grant", "error_description": "code_verifier does not match code_challenge"},
+            status=400,
+        )
+
+        with pytest.raises(PermanentError):
+            tiktok_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+    @responses.activate
+    def test_exchange_code_for_credentials_wraps_transient_token_error_as_permanent(self, monkeypatch):
+        # Even a transient-classified token-endpoint error (server_error)
+        # normalizes to PermanentError here — unlike
+        # exchange_authorization_code (used by the CLI script), which lets
+        # transient/permanent distinguish for a caller that might retry.
+        monkeypatch.setenv("TIKTOK_CLIENT_KEY", "client-key")
+        monkeypatch.setenv("TIKTOK_CLIENT_SECRET", "client-secret")
+        responses.add(
+            responses.POST,
+            tiktok_publisher.TOKEN_URL,
+            json={"error": "server_error", "error_description": "temporary failure"},
+            status=500,
+        )
+
+        with pytest.raises(PermanentError):
+            tiktok_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")

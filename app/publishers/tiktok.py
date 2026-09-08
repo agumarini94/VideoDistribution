@@ -49,6 +49,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 
@@ -381,3 +382,62 @@ def refresh_stored_credentials(credentials: dict) -> dict:
         "scope": body.get("scope", credentials.get("scope")),
         "expires_at": _compute_expiry(body.get("expires_in")),
     }
+
+
+def build_authorization_url(redirect_uri: str, state: str, code_challenge: str) -> str:
+    """
+    Builds TikTok's OAuth authorize URL for the in-browser "Connect TikTok"
+    self-service flow (Phase 29c), mirroring
+    youtube.py/twitter.py::build_authorization_url's shape. Reads
+    TIKTOK_CLIENT_KEY directly from the environment (app-level, no Account
+    row exists yet at this point in the flow — same reasoning as
+    twitter.py reading TWITTER_CLIENT_ID directly).
+
+    code_challenge must be TikTok's non-standard HEX digest of
+    SHA256(verifier), NOT standard RFC 7636 base64url — see
+    scripts/authorize_tiktok.py::_generate_pkce_pair for why TikTok's Login
+    Kit requires the deviation. The caller (dashboard/api.py) generates the
+    verifier/challenge pair the same way that script does, and must
+    round-trip the verifier itself (e.g. inside the signed state token,
+    see app/auth.py::create_oauth_state_token) since this module has no
+    session/state concept to stash it in, and TikTok's callback never
+    echoes the verifier back on its own.
+    """
+    client_key = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
+    if not client_key:
+        raise PermanentError("TIKTOK_CLIENT_KEY is not set — cannot start the TikTok OAuth flow.")
+
+    query = urlencode(
+        {
+            "client_key": client_key,
+            "scope": SCOPES,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+    )
+    return f"{AUTHORIZE_URL}?{query}"
+
+
+def exchange_code_for_credentials(code: str, redirect_uri: str, code_verifier: str) -> dict:
+    """
+    Exchanges an authorization code (from the browser redirect back after
+    build_authorization_url's consent screen) for credentials, reusing
+    exchange_authorization_code above rather than duplicating the token
+    request — same TOKEN_URL, same credential shape.
+
+    Same contract as youtube.py/twitter.py's exchange_code_for_credentials:
+    this is a one-shot interactive flow driven by a human at the consent
+    screen, so unlike exchange_authorization_code (which distinguishes
+    transient/permanent for the CLI script's benefit) every failure here
+    normalizes to PermanentError — the only exception dashboard/api.py's
+    callback route needs to handle.
+    """
+    try:
+        return exchange_authorization_code(code, redirect_uri, code_verifier)
+    except (TransientError, PermanentError) as exc:
+        raise PermanentError(f"Failed to exchange the TikTok authorization code for a token: {exc}") from exc
+    except requests.RequestException as exc:
+        raise PermanentError(f"Network error exchanging the TikTok authorization code for a token: {exc}") from exc

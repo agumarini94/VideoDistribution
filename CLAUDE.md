@@ -1974,7 +1974,22 @@ unit-tested without Redis or a worker running.
     `state` (one field more than YouTube's, since X's callback never echoes
     the verifier back on its own — the signed state token is the only place
     it survives the round trip through X's consent screen), and redirects
-    to X's authorize URL.
+    to X's authorize URL. **`redirect_uri` is rewritten from `localhost` to
+    the loopback IP `127.0.0.1` before being sent to X**
+    (`_use_loopback_ip_for_local_host`, added shortly after this phase
+    shipped) — X's OAuth 2.0 authorize endpoint rejects a `localhost`
+    redirect_uri outright with a generic "Something went wrong" error; for
+    non-HTTPS local development it only accepts `127.0.0.1` (confirmed via
+    X's own developer forum, not documented in its official OAuth docs).
+    This is X-specific — YouTube's and TikTok's equivalent routes accept
+    `localhost` directly and are unaffected. The rewrite only touches what's
+    sent to X; the callback **route** itself is unchanged (FastAPI matches
+    by path, not host) — once X redirects the browser back to the
+    rewritten URI, `request.url_for` in `twitter_oauth_callback` naturally
+    reproduces `127.0.0.1` too, since that's the real `Host` header on that
+    follow-up request, so the `redirect_uri` passed to
+    `exchange_code_for_credentials` still matches what X received in the
+    original authorize request.
   - `GET /api/oauth/twitter/callback` (public — added to `_PUBLIC_API_PATHS`
     alongside the YouTube one, same reasoning: X's redirect carries no
     session cookie) — verifies `state`, pulls `code_verifier` back out of it
@@ -2021,15 +2036,149 @@ unit-tested without Redis or a worker running.
   up for `TWITTER_CLIENT_ID`/`TWITTER_CLIENT_SECRET`, "Type of App" must
   support the Authorization Code + PKCE flow with a client secret):
   ```
-  http://localhost:8000/api/oauth/twitter/callback
+  http://127.0.0.1:8000/api/oauth/twitter/callback
   ```
-  (Adjust the host/port if the dashboard runs elsewhere locally —
-  `/api/oauth/twitter/start` derives `redirect_uri` from the incoming
-  request, so it always matches whatever's actually registered as long as
-  that's what's typed into the browser.) In production this needs the real
+  **Note the loopback IP, not `localhost`** — unlike every other
+  platform's local redirect URI in this project, X's OAuth 2.0 authorize
+  endpoint rejects `localhost` outright (see `_use_loopback_ip_for_local_host`
+  above), so `127.0.0.1` is what must be registered in the Portal. The
+  operator can still open the dashboard at `http://localhost:8000` in the
+  browser as usual — `twitter_oauth_start` rewrites `redirect_uri` to
+  `127.0.0.1` before redirecting to X regardless of which host the request
+  came in on, so the two don't need to match. (Adjust the port if the
+  dashboard runs elsewhere locally.) In production this needs the real
   deployed origin's equivalent
   (`https://<fly-app>.fly.dev/api/oauth/twitter/callback` or a custom
-  domain) added as an additional callback URI once deployed.
+  domain) added as an additional callback URI once deployed — the
+  loopback-IP rewrite only ever applies to a `localhost` host, so it's a
+  no-op there.
+
+### Phase 29c (current)
+- **In-browser TikTok OAuth for client self-service** — same pattern as
+  Phase 29a (YouTube) and 29b (Twitter/X), extended to TikTok. Scoped
+  narrowly the same way: `role="client_user"` sessions only, always creates
+  the resulting `Account` under the caller's own `client_id`. Facebook/
+  Instagram still require `scripts/authorize_meta.py`. Like X, TikTok
+  requires PKCE on its authorize flow — but with `scripts/authorize_tiktok.py`'s
+  deliberate non-standard deviation (Phase 10): the `code_challenge` is the
+  raw **hex** digest of SHA256(verifier), not RFC 7636's base64url — this
+  phase reuses that exact deviation, not X's standard one.
+- **`app/publishers/tiktok.py`** gained two new pure functions, mirroring
+  `youtube.py`/`twitter.py`'s `build_authorization_url`/
+  `exchange_code_for_credentials` shape:
+  - `build_authorization_url(redirect_uri, state, code_challenge)` — builds
+    TikTok's `https://www.tiktok.com/v2/auth/authorize/` consent-screen URL
+    (`AUTHORIZE_URL`, `SCOPES` — unchanged from Phase 10). Reads
+    `TIKTOK_CLIENT_KEY` directly from the environment (app-level, no
+    `Account` row exists yet at this point in the flow — same reasoning as
+    `twitter.py` reading `TWITTER_CLIENT_ID` directly). Raises
+    `PermanentError` if unset.
+  - `exchange_code_for_credentials(code, redirect_uri, code_verifier)` —
+    reuses Phase 10's existing `exchange_authorization_code(code,
+    redirect_uri, code_verifier)` outright (same `TOKEN_URL`, same
+    credentials shape: `access_token`, `refresh_token`, `open_id`, `scope`,
+    `expires_at`) rather than duplicating the token request. **Every
+    failure normalizes to `PermanentError`** — unlike
+    `exchange_authorization_code` (used directly by the CLI script, which
+    lets a transient/permanent distinction pass through), this is a
+    one-shot interactive flow driven by a human at the consent screen, so
+    the only thing a failure needs to do is tell `dashboard/api.py`'s
+    callback route to show an error and let them click "Connect" again —
+    same contract as `youtube.py`'s/`twitter.py`'s
+    `exchange_code_for_credentials`.
+  - **The hex-digest PKCE deviation is NOT re-implemented in `tiktok.py`**
+    — both functions just take/pass through whatever `code_challenge`/
+    `code_verifier` they're given, same as `twitter.py`'s equivalents. The
+    hex-vs-base64url choice lives entirely in the caller
+    (`dashboard/api.py`, see below), matching where
+    `scripts/authorize_tiktok.py`'s own `_generate_pkce_pair` already lives
+    today.
+- **`dashboard/api.py`**: `_generate_tiktok_pkce_pair()` (new, distinct from
+  the existing `_generate_pkce_pair()` added for Twitter in Phase 29b) —
+  `secrets.token_urlsafe(64)` for the verifier, **hex** SHA-256 digest
+  (`hashlib.sha256(...).hexdigest()`) for the challenge, i.e. exactly
+  `scripts/authorize_tiktok.py::_generate_pkce_pair`'s shape, not X's
+  standard base64url one. Two new routes mirroring
+  `youtube_oauth_start`/`youtube_oauth_callback` (Phase 29a) and
+  `twitter_oauth_start`/`twitter_oauth_callback` (Phase 29b) exactly in
+  shape:
+  - `GET /api/oauth/tiktok/start` (gated, `client_user`-only) — generates
+    the hex PKCE pair, signs `{"client_id", "user_id", "code_verifier"}`
+    into `state` (same shape as Twitter's state, for the same reason: the
+    verifier has to survive the round trip through TikTok's consent screen
+    since TikTok's callback never echoes it back), and redirects to
+    TikTok's authorize URL.
+  - `GET /api/oauth/tiktok/callback` (public — added to `_PUBLIC_API_PATHS`
+    alongside the YouTube/Twitter ones, same reasoning: TikTok's redirect
+    carries no session cookie) — verifies `state`, pulls `code_verifier`
+    back out of it (a validly-signed state token missing this field
+    redirects with `reason=missing_pkce_verifier`, same as Twitter's
+    callback), exchanges `code` + `code_verifier` for credentials, and
+    upserts an `Account` row (`platform="tiktok"`, named
+    `"<Client name> (self-service)"`) via the same
+    `scripts/add_account.py::upsert_account` helper every other authorize
+    path uses — reconnecting rotates the same Account in place instead of
+    duplicating it. Always redirects back into the SPA
+    (`/?screen=accounts&tiktok_connect=success` or `...=error&reason=<code>`),
+    same as YouTube's/Twitter's callbacks.
+- **Frontend** (`dashboard/static/index.html`): a third "Connect TikTok"
+  button alongside "Connect YouTube"/"Connect X/Twitter" on the Connected
+  Accounts screen (all `client_user`-only, all plain
+  `<a href="/api/oauth/.../start">` navigations so the session cookie rides
+  along). `state.tiktokConnectNotice` mirrors
+  `state.youtubeConnectNotice`/`state.twitterConnectNotice`;
+  `consumeOauthRedirectParams()` additionally reads
+  `?tiktok_connect=success|error&reason=...` and strips it the same way.
+- **Tests**: `tests/test_publisher_tiktok.py::TestWebOAuthFlow` (modeled on
+  `tests/test_publisher_twitter.py::TestWebOAuthFlow` — missing
+  `TIKTOK_CLIENT_KEY`/`_SECRET` on both functions, the authorization URL
+  built with the right params, code exchange returning parsed credentials,
+  a token-endpoint rejection and a transient-classified token-endpoint
+  error both wrapped as `PermanentError` — since
+  `exchange_code_for_credentials` normalizes either way, unlike
+  `exchange_authorization_code`).
+  `tests/test_dashboard_tiktok_oauth.py` (FastAPI `TestClient`, modeled on
+  `tests/test_dashboard_twitter_oauth.py`): `/start` 401 anonymous / 403
+  admin / redirects a `client_user` to the (mocked) TikTok URL with a
+  verifiable signed state, asserting the `code_challenge` sent to TikTok
+  actually derives from the `code_verifier` stashed in that state via the
+  hex-digest formula (checked independently in the test, distinct from
+  Twitter's base64url assertion); `/callback` handles TikTok's `error`
+  param, missing code/state, a tampered state, a validly-signed state
+  missing `code_verifier`, a state naming a nonexistent client, a full
+  happy path asserting the created `Account`'s `client_id`/`credentials`
+  (including that the right `code_verifier` reached the exchange call),
+  reconnecting rotating the same `Account` instead of duplicating it, a
+  simulated verifier/challenge mismatch at the token endpoint, and a
+  generic exchange failure — both of the latter two leaving no `Account`
+  behind.
+
+  **Local dev setup — register this exact redirect URI in the TikTok for
+  Developers portal**, per the phase brief:
+  ```
+  http://localhost:8000/api/oauth/tiktok/callback
+  ```
+  **Same caveat as Phase 10's `TIKTOK_REDIRECT_URI`: the TikTok Developer
+  Portal rejects localhost/127.0.0.1 redirect URIs outright.** This route
+  itself doesn't need the forwarder page the way `scripts/authorize_tiktok.py`'s
+  local one-shot server does (`dashboard/api.py` is a real HTTP server, not
+  a script binding a throwaway port) — but the *portal registration* still
+  has to be a public HTTPS URL for local dev to work at all, the same
+  GitHub-Pages-forwarder-page trick as Phase 10 (registering the forwarder's
+  URL and pointing its `location.replace()` at
+  `http://localhost:8000/api/oauth/tiktok/callback` instead of
+  Phase 10's `:8910/callback`). This differs from YouTube's/Twitter's local
+  setup (Phases 29a/29b), whose portals accept `http://localhost` directly
+  — flagging it here rather than repeating their instructions verbatim,
+  since copying those would silently break against TikTok's portal. Once
+  deployed to a real HTTPS origin (Fly or a custom domain), the forwarder
+  trick is unnecessary — register
+  `https://<fly-app>.fly.dev/api/oauth/tiktok/callback` (or the custom
+  domain equivalent) directly, same as every other platform's production
+  redirect URI in this project. `/api/oauth/tiktok/start` derives
+  `redirect_uri` from the incoming request either way, so it always matches
+  whatever's actually registered as long as that's what the forwarder page
+  (locally) or the browser (in production) ultimately hits.
 
 ## Monitoring dashboard (extra, not in the spec)
 
