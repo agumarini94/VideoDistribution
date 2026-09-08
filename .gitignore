@@ -6,6 +6,7 @@ venv/
 *.db
 *.sqlite3
 client_secret.json
+client_secret_web.json
 token.json
 .DS_Store
 uploads/

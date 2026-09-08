@@ -5,6 +5,7 @@ venv/
 *.mp4
 token.json
 client_secret.json
+client_secret_web.json
 celerybeat-schedule
 celerybeat-schedule-shm
 celerybeat-schedule-wal

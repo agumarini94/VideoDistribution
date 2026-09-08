@@ -101,6 +101,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CLIENT_SECRET_PATH = PROJECT_ROOT / "client_secret.json"
 TOKEN_PATH = PROJECT_ROOT / "token.json"
 
+# Separate from CLIENT_SECRET_PATH above (Phase 29a follow-up fix): Google
+# validates redirect_uri against the OAuth Client ID's registered type, and
+# a "Desktop app" client (what CLIENT_SECRET_PATH/scripts/authorize_youtube.py
+# uses) rejects a web redirect URI outright — the in-browser flow below
+# needs its own "Web application" Client ID, downloaded to a distinct file
+# so the two never collide. Only build_authorization_url/
+# exchange_code_for_credentials read this; every other function in this
+# module (the CLI single-account fallback, playlist/Shorts logic, etc.)
+# keeps using CLIENT_SECRET_PATH.
+WEB_CLIENT_SECRET_PATH = PROJECT_ROOT / "client_secret_web.json"
+
 # HTTP 403 reasons that mean "you've hit a quota/rate limit", as opposed to
 # other 403s (e.g. terms of service violations) that are genuinely permanent.
 _QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded", "userRateLimitExceeded"}
@@ -321,22 +332,23 @@ def build_authorization_url(redirect_uri: str, state: str) -> str:
     Builds the Google OAuth consent-screen URL for a web-based (browser
     redirect) authorization flow — used by dashboard/api.py's in-browser
     "Connect YouTube" self-service flow (Phase 29a), as opposed to
-    scripts/authorize_youtube.py's local-server InstalledAppFlow. Uses the
-    same client_secret.json/SCOPES this module already owns, but requires
-    it be an OAuth "Web application" Client ID (not "Desktop app") — Google
-    validates redirect_uri against the type registered for the client.
+    scripts/authorize_youtube.py's local-server InstalledAppFlow. Uses
+    WEB_CLIENT_SECRET_PATH/SCOPES — a distinct "Web application" OAuth
+    Client ID from CLIENT_SECRET_PATH's "Desktop app" one (see
+    WEB_CLIENT_SECRET_PATH above for why) — Google validates redirect_uri
+    against the type registered for the client.
 
     `state` is opaque here (round-tripped to redirect_uri verbatim by
     Google) — the caller is responsible for it being tamper-evident (see
     app/auth.py::create_oauth_state_token), since this module has no
     concept of a Client/session to encode into it.
     """
-    if not CLIENT_SECRET_PATH.exists():
+    if not WEB_CLIENT_SECRET_PATH.exists():
         raise PermanentError(
-            f"YouTube self-service connect is not configured (missing {CLIENT_SECRET_PATH.name} "
+            f"YouTube self-service connect is not configured (missing {WEB_CLIENT_SECRET_PATH.name} "
             "at the project root)."
         )
-    flow = Flow.from_client_secrets_file(str(CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
+    flow = Flow.from_client_secrets_file(str(WEB_CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
     # access_type=offline gets a refresh token; prompt=consent forces Google
     # to re-issue one even if this Google account already granted access
     # before — same reasoning as scripts/authorize_youtube.py's flow.
@@ -353,12 +365,12 @@ def exchange_code_for_credentials(code: str, redirect_uri: str) -> dict:
     to the one passed to build_authorization_url for the same flow, per
     OAuth2's spec.
     """
-    if not CLIENT_SECRET_PATH.exists():
+    if not WEB_CLIENT_SECRET_PATH.exists():
         raise PermanentError(
-            f"YouTube self-service connect is not configured (missing {CLIENT_SECRET_PATH.name} "
+            f"YouTube self-service connect is not configured (missing {WEB_CLIENT_SECRET_PATH.name} "
             "at the project root)."
         )
-    flow = Flow.from_client_secrets_file(str(CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
+    flow = Flow.from_client_secrets_file(str(WEB_CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
     try:
         flow.fetch_token(code=code)
     except Exception as exc:

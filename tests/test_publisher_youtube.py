@@ -191,17 +191,21 @@ class _FakeFlow:
 class TestWebOAuthFlow:
     """Phase 29a — build_authorization_url/exchange_code_for_credentials, the
     web-flow (browser redirect) equivalent of scripts/authorize_youtube.py's
-    InstalledAppFlow, used by dashboard/api.py's /api/oauth/youtube/* routes."""
+    InstalledAppFlow, used by dashboard/api.py's /api/oauth/youtube/* routes.
+    Reads WEB_CLIENT_SECRET_PATH, not CLIENT_SECRET_PATH — a distinct "Web
+    application" OAuth Client ID file from the CLI script's "Desktop app"
+    one (Phase 29a follow-up fix, see WEB_CLIENT_SECRET_PATH's docstring in
+    app/publishers/youtube.py)."""
 
     def test_build_authorization_url_missing_client_secret_raises(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(youtube_publisher, "CLIENT_SECRET_PATH", tmp_path / "missing.json")
+        monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", tmp_path / "missing.json")
         with pytest.raises(PermanentError):
             youtube_publisher.build_authorization_url("http://localhost/callback", "state123")
 
     def test_build_authorization_url_happy_path(self, monkeypatch, tmp_path):
-        secret_path = tmp_path / "client_secret.json"
+        secret_path = tmp_path / "client_secret_web.json"
         secret_path.write_text("{}")
-        monkeypatch.setattr(youtube_publisher, "CLIENT_SECRET_PATH", secret_path)
+        monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", secret_path)
 
         fake_flow = _FakeFlow()
         monkeypatch.setattr(youtube_publisher.Flow, "from_client_secrets_file", staticmethod(lambda *a, **kw: fake_flow))
@@ -214,14 +218,14 @@ class TestWebOAuthFlow:
         assert fake_flow.authorization_url_calls[0]["prompt"] == "consent"
 
     def test_exchange_code_for_credentials_missing_client_secret_raises(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(youtube_publisher, "CLIENT_SECRET_PATH", tmp_path / "missing.json")
+        monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", tmp_path / "missing.json")
         with pytest.raises(PermanentError):
             youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback")
 
     def test_exchange_code_for_credentials_returns_parsed_json(self, monkeypatch, tmp_path):
-        secret_path = tmp_path / "client_secret.json"
+        secret_path = tmp_path / "client_secret_web.json"
         secret_path.write_text("{}")
-        monkeypatch.setattr(youtube_publisher, "CLIENT_SECRET_PATH", secret_path)
+        monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", secret_path)
 
         fake_flow = _FakeFlow(credentials_json=json.dumps({"token": "abc", "refresh_token": "xyz"}))
         monkeypatch.setattr(youtube_publisher.Flow, "from_client_secrets_file", staticmethod(lambda *a, **kw: fake_flow))
@@ -232,9 +236,9 @@ class TestWebOAuthFlow:
         assert fake_flow.fetch_token_calls[0]["code"] == "auth-code"
 
     def test_exchange_code_for_credentials_wraps_failure_as_permanent_error(self, monkeypatch, tmp_path):
-        secret_path = tmp_path / "client_secret.json"
+        secret_path = tmp_path / "client_secret_web.json"
         secret_path.write_text("{}")
-        monkeypatch.setattr(youtube_publisher, "CLIENT_SECRET_PATH", secret_path)
+        monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", secret_path)
 
         class _FailingFlow(_FakeFlow):
             def fetch_token(self, **kwargs):
