@@ -10,6 +10,7 @@ middleware wiring); this module only knows about passwords and tokens, the
 same "pure helper, caller owns policy" split as app/publishers/*.py.
 """
 
+import base64
 import logging
 import secrets
 
@@ -80,6 +81,40 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
+def _is_canonical_base64url(segment: str) -> bool:
+    """
+    True iff `segment` is the *canonical* URL-safe base64 encoding (no
+    padding) of the bytes it decodes to, i.e. re-encoding those bytes
+    reproduces `segment` exactly.
+
+    Needed because itsdangerous signs with HMAC-SHA1 (a 20-byte digest) and
+    base64url-encodes each token segment the standard way
+    (base64.urlsafe_b64encode(...).rstrip(b"=")). 20 isn't a multiple of 3,
+    so the final base64 group encodes only 4 real bits in its last
+    character, alongside 2 bits that the encoder always sets to zero but
+    that Python's base64 decoder never validates on the way back in — it
+    just discards them. That means several distinct last characters decode
+    to byte-identical output, so several distinct *token strings* carry the
+    exact same signature bytes. It's not an HMAC forgery (nobody can derive
+    a valid signature for different content this way), but it does mean a
+    single-character tamper of a token's trailing character isn't
+    guaranteed to change what it decodes to, so itsdangerous's signature
+    check can't be relied on alone to reject it. Rejecting any non-canonical
+    encoding up front closes that gap.
+    """
+    padded = segment + "=" * (-len(segment) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (ValueError, TypeError):
+        return False
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") == segment
+
+
+def _has_canonical_encoding(token: str) -> bool:
+    """Every dot-separated segment of a token must be canonically encoded — see _is_canonical_base64url."""
+    return bool(token) and all(_is_canonical_base64url(part) for part in token.split("."))
+
+
 def create_session_token(user_id: int) -> str:
     """Signed, timestamped token encoding which User this session belongs to."""
     return _serializer.dumps({"user_id": user_id})
@@ -93,6 +128,8 @@ def verify_session_token(token: str) -> int | None:
     rather than raising, since the caller (dashboard/api.py's auth
     middleware) always wants a clean fallback to anonymous.
     """
+    if not _has_canonical_encoding(token):
+        return None
     try:
         data = _serializer.loads(token, max_age=SESSION_MAX_AGE_SECONDS)
     except (BadSignature, SignatureExpired):
@@ -116,6 +153,8 @@ def verify_oauth_state_token(token: str) -> dict | None:
     OAuth callback route) always wants to treat a tampered/expired/malformed
     state as a rejected request, not a 500.
     """
+    if not _has_canonical_encoding(token):
+        return None
     try:
         data = _oauth_state_serializer.loads(token, max_age=OAUTH_STATE_MAX_AGE_SECONDS)
     except (BadSignature, SignatureExpired):
