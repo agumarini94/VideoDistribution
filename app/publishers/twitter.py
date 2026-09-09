@@ -74,15 +74,22 @@ Payload contract (unchanged since Phase 17):
   - Result dict: external_id is the first tweet's id; threads additionally
     return "tweet_ids" (every tweet's id, in order).
 
-Media upload (Phase 21, replaces Phase 17's v1.1 upload.twitter.com flow):
-single endpoint https://api.x.com/2/media/upload, multipart/form-data,
-Bearer auth, command=INIT|APPEND|FINALIZE + a GET ...?command=STATUS poll —
-same INIT/APPEND/FINALIZE/STATUS shape as v1.1 conceptually, different host
-and request encoding. media_category stays "tweet_image"/"tweet_gif"/
-"tweet_video" (unchanged). Attaching the uploaded media_id to a tweet is
-unchanged: tweepy's create_tweet(media_ids=[...]) already sends it nested
-as {"media": {"media_ids": [...]}} in the v2 tweet body, which is the shape
-docs.x.com documents for POST /2/tweets.
+Media upload (Phase 21, replaces Phase 17's v1.1 upload.twitter.com flow;
+endpoint shapes corrected this session — see the "API shape change" note
+below and CLAUDE.md Phase 21): three separate RESTful endpoints, not a
+single command=INIT|APPEND|FINALIZE endpoint —
+POST /2/media/upload/initialize (JSON body) -> POST
+/2/media/upload/{media_id}/append (multipart, media_id in the path) ->
+POST /2/media/upload/{media_id}/finalize (empty body, media_id in the
+path). Only the STATUS check stayed on the old shape: GET
+/2/media/upload?command=STATUS&media_id=... (media_id as a query param,
+not a path segment) — confirmed against current docs.x.com, not assumed
+to have moved just because the other three did. media_category stays
+"tweet_image"/"tweet_gif"/"tweet_video" (unchanged). Attaching the
+uploaded media_id to a tweet is unchanged: tweepy's
+create_tweet(media_ids=[...]) already sends it nested as {"media":
+{"media_ids": [...]}} in the v2 tweet body, which is the shape docs.x.com
+documents for POST /2/tweets.
 """
 
 import mimetypes
@@ -99,8 +106,15 @@ from app.exceptions import PermanentError, PublishError, TokenExpiredError, Tran
 
 _MAX_TWEET_LENGTH = 280
 
-_MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
-_MEDIA_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB, within docs.x.com's ~1-4 MB per-chunk guidance
+# Base path for the three chunked-upload endpoints (initialize/append/
+# finalize each append their own suffix, media_id in the path for
+# append/finalize — see _media_init/_media_append/_media_finalize below).
+# _media_status is the one exception: it's the older, still-current
+# GET .../2/media/upload?command=STATUS&media_id=... shape, not
+# path-based — verified against current docs.x.com this session, not
+# guessed by extrapolating from the other three endpoints moving.
+_MEDIA_UPLOAD_BASE_URL = "https://api.x.com/2/media/upload"
+_MEDIA_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB, within docs.x.com's ~1-5 MB per-chunk guidance
 _MAX_IMAGES_PER_TWEET = 4
 _MAX_VIDEOS_PER_TWEET = 1
 _MEDIA_CATEGORY_BY_KIND = {"image": "tweet_image", "gif": "tweet_gif", "video": "tweet_video"}
@@ -322,41 +336,60 @@ def _multipart_fields(fields: dict) -> dict:
     # requests only encodes a request as multipart/form-data when the
     # `files` argument is used — wrapping plain string fields as (None,
     # value) forces multipart encoding for them too, which is what
-    # docs.x.com specifies for INIT/APPEND/FINALIZE even for fields that
-    # carry no binary data.
+    # docs.x.com specifies for the append endpoint's non-binary fields
+    # (e.g. segment_index) alongside the binary media chunk.
     return {key: (None, str(value)) for key, value in fields.items()}
 
 
 def _media_init(access_token: str, mime: str | None, total_bytes: int, media_category: str) -> str:
-    fields = _multipart_fields(
-        {"command": "INIT", "media_type": mime or "application/octet-stream", "total_bytes": total_bytes, "media_category": media_category}
+    payload = {
+        "media_type": mime or "application/octet-stream",
+        "total_bytes": total_bytes,
+        "media_category": media_category,
+    }
+    response = requests.post(
+        f"{_MEDIA_UPLOAD_BASE_URL}/initialize",
+        headers={**_auth_headers(access_token), "Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
     )
-    response = requests.post(_MEDIA_UPLOAD_URL, headers=_auth_headers(access_token), files=fields, timeout=30)
     body = _raise_for_media_error(response, "initializing media upload")
 
     media_id = (body.get("data") or {}).get("id")
     if not media_id:
-        raise PermanentError(f"X media INIT response is missing data.id: {body}")
+        raise PermanentError(f"X media initialize response is missing data.id: {body}")
     return str(media_id)
 
 
 def _media_append(access_token: str, media_id: str, segment_index: int, filename: str, chunk: bytes) -> None:
-    fields = _multipart_fields({"command": "APPEND", "media_id": media_id, "segment_index": segment_index})
+    fields = _multipart_fields({"segment_index": segment_index})
     files = {**fields, "media": (filename, chunk, "application/octet-stream")}
-    response = requests.post(_MEDIA_UPLOAD_URL, headers=_auth_headers(access_token), files=files, timeout=120)
+    response = requests.post(
+        f"{_MEDIA_UPLOAD_BASE_URL}/{media_id}/append",
+        headers=_auth_headers(access_token),
+        files=files,
+        timeout=120,
+    )
     _raise_for_media_error(response, f"uploading media chunk {segment_index}")
 
 
 def _media_finalize(access_token: str, media_id: str) -> dict | None:
-    fields = _multipart_fields({"command": "FINALIZE", "media_id": media_id})
-    response = requests.post(_MEDIA_UPLOAD_URL, headers=_auth_headers(access_token), files=fields, timeout=30)
+    response = requests.post(
+        f"{_MEDIA_UPLOAD_BASE_URL}/{media_id}/finalize",
+        headers=_auth_headers(access_token),
+        timeout=30,
+    )
     body = _raise_for_media_error(response, "finalizing media upload")
     return (body.get("data") or {}).get("processing_info")
 
 
 def _media_status(access_token: str, media_id: str) -> dict | None:
+    # Unlike initialize/append/finalize, STATUS did NOT move to a
+    # path-based URL — this stays the older GET .../2/media/upload
+    # shape with media_id as a query param (confirmed against current
+    # docs.x.com, see the module docstring).
     response = requests.get(
-        _MEDIA_UPLOAD_URL,
+        _MEDIA_UPLOAD_BASE_URL,
         headers=_auth_headers(access_token),
         params={"command": "STATUS", "media_id": media_id},
         timeout=30,

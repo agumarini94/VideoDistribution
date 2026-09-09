@@ -947,19 +947,51 @@ unit-tested without Redis or a worker running.
     reactive refresh before the env var goes stale, so real accounts should
     get an `Account` row via `scripts/add_account.py` rather than relying
     on env vars long-term.
-  - **Media upload migrated to X API v2**: single endpoint
-    `https://api.x.com/2/media/upload` (a different host than tweet
-    creation, which stays on `api.twitter.com`), multipart/form-data,
-    Bearer auth, `command=INIT|APPEND|FINALIZE` + a `GET
-    ...?command=STATUS` poll — conceptually the same INIT/APPEND/FINALIZE/
-    STATUS shape as Phase 17's v1.1 flow, different host/encoding.
-    Implemented directly with `requests` rather than tweepy (tweepy predates
-    this v2 endpoint). `media_category` values (`tweet_image`/`tweet_gif`/
-    `tweet_video`), the 4-images-or-1-video-never-mixed pre-flight cap, and
-    attaching the uploaded `media_id` to a tweet via
-    `create_tweet(media_ids=[...])` are all unchanged from Phase 17 — X's v2
-    tweet body nests this as `{"media": {"media_ids": [...]}}`, which is
-    what tweepy already sent regardless of auth scheme.
+  - **Media upload migrated to X API v2**, a different host than tweet
+    creation (`api.x.com`, not `api.twitter.com`), Bearer auth, same
+    `media_category` values (`tweet_image`/`tweet_gif`/`tweet_video`), the
+    4-images-or-1-video-never-mixed pre-flight cap, and attaching the
+    uploaded `media_id` to a tweet via `create_tweet(media_ids=[...])`, all
+    unchanged from Phase 17 — X's v2 tweet body nests this as `{"media":
+    {"media_ids": [...]}}`, which is what tweepy already sent regardless of
+    auth scheme. Implemented directly with `requests` rather than tweepy
+    (tweepy predates this v2 endpoint).
+    - **Endpoint shape corrected 2026-09-09** (this session, discovered via
+      a real 400 `"Missing media field in JSON"` from a live account — the
+      first real X API traffic this project has sent). Phase 21 originally
+      built this as a single endpoint,
+      `https://api.x.com/2/media/upload`, with a
+      `command=INIT|APPEND|FINALIZE` form field (mirroring the v1.1 shape
+      from Phase 17), because that's what was assumed by analogy to v1.1
+      rather than read off docs.x.com for v2. The real v2 shape (confirmed
+      against current docs.x.com) is **three separate RESTful endpoints**:
+      - `POST /2/media/upload/initialize` — JSON body
+        (`{"media_type", "total_bytes", "media_category"}`), not
+        multipart/form-data.
+      - `POST /2/media/upload/{media_id}/append` — multipart/form-data
+        (`segment_index` + the binary `media` field), but `media_id` is now
+        in the URL path, not a form field.
+      - `POST /2/media/upload/{media_id}/finalize` — empty body, `media_id`
+        in the URL path.
+      **STATUS did NOT move** — it's still `GET
+      /2/media/upload?command=STATUS&media_id=...`, `media_id` as a query
+      param, not a path segment — verified independently rather than
+      assumed to have moved just because the other three did.
+      `_media_init`/`_media_append`/`_media_finalize`/`_media_status` in
+      `app/publishers/twitter.py` (and the base URL constant, renamed
+      `_MEDIA_UPLOAD_BASE_URL`) were updated to match; the endpoint-shape
+      mocks in `tests/test_publisher_twitter_media.py` (`_mock_media_upload`)
+      were updated to register the new per-step URLs, plus a new
+      `TestChunkedMediaUpload::test_request_shapes_match_current_docs_x_com`
+      asserting the JSON body on initialize, the path-based `media_id` on
+      append/finalize, and the query-param `media_id` on STATUS, so a
+      future regression back to the wrong shape fails a test instead of
+      only surfacing against a live account again. This bug was invisible
+      to the mocked test suite the whole time Phase 21 stood — the mocks
+      matched the (wrong) shape the code assumed, so tests were internally
+      consistent but wrong about the real API; this is the first time any
+      of `twitter.py`'s untested-against-a-live-account caveats (see the
+      module docstring) actually got exercised against X's real servers.
   - **`TokenExpiredError`** (`app/exceptions.py`) — a new `TransientError`
     subclass. `twitter.py` raises it instead of a plain `PermanentError`
     when X answers 401 with `WWW-Authenticate: Bearer error="invalid_token"`

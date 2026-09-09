@@ -1,15 +1,20 @@
 """
 Tests for app/publishers/twitter.py's chunked media upload (Phase 21: X API
-v2, single endpoint https://api.x.com/2/media/upload, INIT -> APPEND ->
-FINALIZE -> STATUS, Bearer auth), media-cap pre-flight validation, and
-thread posting (sequential replies, whole-thread pre-flight validation,
-partial-thread failure reporting). All HTTP is mocked with `responses` —
-nothing here talks to the real X API.
+v2; endpoint shapes corrected this session, see CLAUDE.md Phase 21 —
+initialize/append/finalize are three separate RESTful endpoints
+(POST /2/media/upload/initialize, POST /2/media/upload/{id}/append, POST
+/2/media/upload/{id}/finalize), while STATUS stayed on the older GET
+/2/media/upload?command=STATUS&media_id=... shape, Bearer auth), media-cap
+pre-flight validation, and thread posting (sequential replies, whole-thread
+pre-flight validation, partial-thread failure reporting). All HTTP is
+mocked with `responses` — nothing here talks to the real X API.
 
 See tests/test_publisher_twitter.py for credential resolution, the 280-char
 guard, tweet-creation error classification (incl. TokenExpiredError), and
 token-refresh coverage, unchanged in spirit by this phase.
 """
+
+import json
 
 import pytest
 import responses
@@ -18,7 +23,7 @@ from app.exceptions import PermanentError, TransientError
 from app.publishers import twitter as twitter_publisher
 
 _TWEETS_URL = "https://api.twitter.com/2/tweets"
-_MEDIA_URL = "https://api.x.com/2/media/upload"
+_MEDIA_BASE_URL = "https://api.x.com/2/media/upload"
 
 ACCOUNT_CREDENTIALS = {
     "client_id": "client-id",
@@ -65,27 +70,30 @@ def _mock_tweet(tweet_id="1"):
 
 def _mock_media_upload(media_id="111", append_calls=1, processing_states=None):
     """
-    Registers INIT -> APPEND (x append_calls) -> FINALIZE (all POST) and
-    optional STATUS poll(s) (GET), all against the same
-    api.x.com/2/media/upload endpoint — `responses` replays registrations
-    in order per method+URL, so registration order here must match the
-    publisher's actual call order.
+    Registers initialize -> append (x append_calls) -> finalize, each on
+    its own path-based URL (media_id in the path for append/finalize), plus
+    optional STATUS poll(s) (GET .../2/media/upload?command=STATUS&
+    media_id=..., which stayed on the old non-path-based shape) —
+    `responses` replays registrations in order per method+URL, so
+    registration order here must match the publisher's actual call order.
     """
-    responses.add(responses.POST, _MEDIA_URL, json={"data": {"id": media_id}}, status=200)  # INIT
+    responses.add(responses.POST, f"{_MEDIA_BASE_URL}/initialize", json={"data": {"id": media_id}}, status=200)
     for _ in range(append_calls):
-        responses.add(responses.POST, _MEDIA_URL, status=204)  # APPEND (empty body)
+        responses.add(responses.POST, f"{_MEDIA_BASE_URL}/{media_id}/append", status=204)  # empty body
 
     finalize_data = {"id": media_id}
     if processing_states:
         finalize_data["processing_info"] = processing_states[0]
-    responses.add(responses.POST, _MEDIA_URL, json={"data": finalize_data}, status=201)  # FINALIZE
+    responses.add(responses.POST, f"{_MEDIA_BASE_URL}/{media_id}/finalize", json={"data": finalize_data}, status=201)
 
     for state in (processing_states or [])[1:]:
-        responses.add(responses.GET, _MEDIA_URL, json={"data": {"id": media_id, "processing_info": state}}, status=200)
+        responses.add(
+            responses.GET, _MEDIA_BASE_URL, json={"data": {"id": media_id, "processing_info": state}}, status=200
+        )
 
 
 def _media_calls():
-    return [c for c in responses.calls if c.request.url.startswith(_MEDIA_URL)]
+    return [c for c in responses.calls if c.request.url.startswith(_MEDIA_BASE_URL)]
 
 
 class TestMediaCapValidation:
@@ -212,10 +220,43 @@ class TestChunkedMediaUpload:
 
     @responses.activate
     def test_media_init_http_500_is_transient(self, image_file):
-        responses.add(responses.POST, _MEDIA_URL, status=500)
+        responses.add(responses.POST, f"{_MEDIA_BASE_URL}/initialize", status=500)
 
         with pytest.raises(TransientError):
             twitter_publisher.publish("twitter", {"text": "hi", "media_paths": [str(image_file)]}, ACCOUNT_CREDENTIALS)
+
+    @responses.activate
+    def test_request_shapes_match_current_docs_x_com(self, image_file):
+        # Regression test for the endpoint-shape bug found live this
+        # session: initialize/append/finalize are separate path-based
+        # endpoints with a JSON body for initialize/finalize and media_id
+        # in the URL for append/finalize, while STATUS is the one call that
+        # did NOT move — it's still a GET with media_id as a query param,
+        # not a path segment. See CLAUDE.md Phase 21.
+        _mock_media_upload(
+            media_id="888",
+            append_calls=1,
+            processing_states=[{"state": "in_progress", "check_after_secs": 0}, {"state": "succeeded"}],
+        )
+        _mock_tweet("1")
+
+        twitter_publisher.publish("twitter", {"text": "a photo", "media_paths": [str(image_file)]}, ACCOUNT_CREDENTIALS)
+
+        init_call, append_call, finalize_call, status_call = _media_calls()
+
+        assert init_call.request.url == f"{_MEDIA_BASE_URL}/initialize"
+        assert init_call.request.headers["Content-Type"] == "application/json"
+        init_body = json.loads(init_call.request.body)
+        assert init_body["media_category"] == "tweet_image"
+        assert "total_bytes" in init_body
+
+        assert append_call.request.url == f"{_MEDIA_BASE_URL}/888/append"
+        assert finalize_call.request.url == f"{_MEDIA_BASE_URL}/888/finalize"
+
+        assert status_call.request.url.startswith(_MEDIA_BASE_URL)
+        assert "/888/" not in status_call.request.url
+        assert "media_id=888" in status_call.request.url
+        assert "command=STATUS" in status_call.request.url
 
 
 class TestThreadValidation:
