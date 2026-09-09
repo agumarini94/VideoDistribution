@@ -663,15 +663,24 @@ def youtube_oauth_start(request: Request = None):
     resulting Account under the caller's own client_id, encoded (signed)
     into the OAuth "state" param below since Google's callback redirect
     carries no session cookie to read it from otherwise.
+
+    Google's Flow object auto-generates PKCE by default, so the
+    authorization request always carries a code_challenge — the verifier
+    has to survive the round trip to be usable at exchange time. Like
+    Twitter's/TikTok's flows, the verifier rides inside the signed
+    oauth-state token alongside client_id/user_id (see
+    app/publishers/youtube.py's module docstring "PKCE" note for why this
+    was previously missing and broke the exchange).
     """
     auth = _get_auth(request)
     if auth.role != "client_user":
         raise HTTPException(status_code=403, detail="YouTube self-service connect is only available to a client account.")
 
     redirect_uri = str(request.url_for("youtube_oauth_callback"))
-    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id})
+    code_verifier, code_challenge = _generate_pkce_pair()
+    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id, "code_verifier": code_verifier})
     try:
-        authorization_url = youtube_publisher.build_authorization_url(redirect_uri, state)
+        authorization_url = youtube_publisher.build_authorization_url(redirect_uri, state, code_challenge)
     except PermanentError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return RedirectResponse(authorization_url)
@@ -701,6 +710,12 @@ def youtube_oauth_callback(
     full-page browser navigation, not a fetch() call, so errors are reported
     via a query string the frontend reads and displays rather than an HTTP
     error status the browser would render as a bare error page.
+
+    The PKCE code_verifier generated in youtube_oauth_start is pulled back
+    out of state (it never reaches Google's callback redirect on its own)
+    and passed to exchange_code_for_credentials, which Google uses to
+    verify this exchange belongs to the same flow that sent the
+    code_challenge.
     """
     if error:
         return RedirectResponse(f"/?screen=accounts&youtube_connect=error&reason={quote(error)}")
@@ -711,6 +726,10 @@ def youtube_oauth_callback(
     if state_data is None:
         return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=invalid_or_expired_state")
 
+    code_verifier = state_data.get("code_verifier")
+    if not code_verifier:
+        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=missing_pkce_verifier")
+
     client_id = state_data.get("client_id")
     client = db.get(Client, client_id) if client_id is not None else None
     if client is None:
@@ -718,7 +737,7 @@ def youtube_oauth_callback(
 
     redirect_uri = str(request.url_for("youtube_oauth_callback"))
     try:
-        credentials = youtube_publisher.exchange_code_for_credentials(code, redirect_uri)
+        credentials = youtube_publisher.exchange_code_for_credentials(code, redirect_uri, code_verifier)
     except PermanentError as exc:
         logger.warning("YouTube OAuth code exchange failed for client %s: %s", client_id, exc)
         return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=exchange_failed")
@@ -732,11 +751,13 @@ def youtube_oauth_callback(
 
 def _generate_pkce_pair() -> tuple[str, str]:
     """
-    Standard RFC 7636 PKCE pair for X's OAuth 2.0 authorize flow (Phase
-    29b): code_challenge = BASE64URL(SHA256(verifier)), no padding. Unlike
-    scripts/authorize_tiktok.py's _generate_pkce_pair (TikTok's deliberate
-    hex-digest deviation), X follows the RFC exactly — do not copy that
-    trick here.
+    Standard RFC 7636 PKCE pair: code_challenge = BASE64URL(SHA256(verifier)),
+    no padding. Originally added for X's OAuth 2.0 authorize flow (Phase
+    29b); also used by youtube_oauth_start since Google's Flow object
+    requires PKCE too (see app/publishers/youtube.py's module docstring
+    "PKCE" note). Unlike scripts/authorize_tiktok.py's _generate_pkce_pair
+    (TikTok's deliberate hex-digest deviation), both X and Google follow the
+    RFC exactly — do not copy that trick here.
     """
     verifier = secrets.token_urlsafe(64)  # ~86 chars, within RFC 7636's 43-128 range
     digest = hashlib.sha256(verifier.encode("ascii")).digest()

@@ -62,6 +62,21 @@ of running a CLI script. Same client_secret.json/SCOPES, but the OAuth
 Client ID registered in Google Cloud Console must be a "Web application"
 type (not "Desktop app") with the callback route's URL registered as an
 authorized redirect URI.
+
+PKCE (post-29a fix): google_auth_oauthlib.flow.Flow auto-generates its own
+code_verifier per instance by default (autogenerate_code_verifier=True) and
+folds a matching code_challenge into authorization_url()'s query params —
+but build_authorization_url() and exchange_code_for_credentials() each
+build a fresh, short-lived Flow object, so the verifier generated inside
+the first call's Flow was never available to the second call's Flow,
+causing Google's token endpoint to reject the exchange with
+"(invalid_grant) Missing code verifier". Fixed the same way
+app/publishers/twitter.py's PKCE flow already works: both functions now
+take an explicit code_challenge/code_verifier from the caller
+(dashboard/api.py generates the pair and round-trips the verifier through
+the signed OAuth state token, same as Twitter's/TikTok's flows), and
+construct their Flow with autogenerate_code_verifier=False so the instance
+never generates one of its own to conflict with the caller-supplied value.
 """
 
 import json
@@ -327,7 +342,7 @@ def refresh_stored_credentials(credentials: dict) -> dict:
     return json.loads(creds.to_json())
 
 
-def build_authorization_url(redirect_uri: str, state: str) -> str:
+def build_authorization_url(redirect_uri: str, state: str, code_challenge: str) -> str:
     """
     Builds the Google OAuth consent-screen URL for a web-based (browser
     redirect) authorization flow — used by dashboard/api.py's in-browser
@@ -342,37 +357,65 @@ def build_authorization_url(redirect_uri: str, state: str) -> str:
     Google) — the caller is responsible for it being tamper-evident (see
     app/auth.py::create_oauth_state_token), since this module has no
     concept of a Client/session to encode into it.
+
+    `code_challenge` (PKCE, RFC 7636 S256 — see module docstring's "PKCE"
+    note): the caller generates the verifier/challenge pair and must
+    round-trip the verifier itself (e.g. inside the signed `state` token,
+    same as app/publishers/twitter.py::build_authorization_url) since this
+    module has no session/state concept to stash it in, and Google's
+    callback never echoes it back on its own. autogenerate_code_verifier is
+    disabled so this Flow instance never generates a verifier of its own
+    that would silently override the caller-supplied challenge.
     """
     if not WEB_CLIENT_SECRET_PATH.exists():
         raise PermanentError(
             f"YouTube self-service connect is not configured (missing {WEB_CLIENT_SECRET_PATH.name} "
             "at the project root)."
         )
-    flow = Flow.from_client_secrets_file(str(WEB_CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
+    flow = Flow.from_client_secrets_file(
+        str(WEB_CLIENT_SECRET_PATH),
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+        autogenerate_code_verifier=False,
+    )
     # access_type=offline gets a refresh token; prompt=consent forces Google
     # to re-issue one even if this Google account already granted access
     # before — same reasoning as scripts/authorize_youtube.py's flow.
-    authorization_url, _ = flow.authorization_url(access_type="offline", prompt="consent", state=state)
+    authorization_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
+    )
     return authorization_url
 
 
-def exchange_code_for_credentials(code: str, redirect_uri: str) -> dict:
+def exchange_code_for_credentials(code: str, redirect_uri: str, code_verifier: str) -> dict:
     """
     Exchanges an OAuth authorization code (from the callback Google redirects
     the browser to after build_authorization_url's consent screen) for
     credentials JSON — same shape as Credentials.to_json(), see the module
     docstring's "Credentials JSON shape". redirect_uri must be byte-identical
     to the one passed to build_authorization_url for the same flow, per
-    OAuth2's spec.
+    OAuth2's spec. code_verifier must be the PKCE verifier paired with the
+    code_challenge sent to build_authorization_url for this same flow —
+    Google rejects the exchange if it doesn't hash to the challenge it
+    received earlier (see module docstring's "PKCE" note).
     """
     if not WEB_CLIENT_SECRET_PATH.exists():
         raise PermanentError(
             f"YouTube self-service connect is not configured (missing {WEB_CLIENT_SECRET_PATH.name} "
             "at the project root)."
         )
-    flow = Flow.from_client_secrets_file(str(WEB_CLIENT_SECRET_PATH), scopes=SCOPES, redirect_uri=redirect_uri)
+    flow = Flow.from_client_secrets_file(
+        str(WEB_CLIENT_SECRET_PATH),
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+        autogenerate_code_verifier=False,
+    )
     try:
-        flow.fetch_token(code=code)
+        flow.fetch_token(code=code, code_verifier=code_verifier)
     except Exception as exc:
         raise PermanentError(f"Failed to exchange the YouTube authorization code for a token: {exc}") from exc
     return json.loads(flow.credentials.to_json())

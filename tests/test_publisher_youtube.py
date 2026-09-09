@@ -200,7 +200,7 @@ class TestWebOAuthFlow:
     def test_build_authorization_url_missing_client_secret_raises(self, monkeypatch, tmp_path):
         monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", tmp_path / "missing.json")
         with pytest.raises(PermanentError):
-            youtube_publisher.build_authorization_url("http://localhost/callback", "state123")
+            youtube_publisher.build_authorization_url("http://localhost/callback", "state123", "challenge123")
 
     def test_build_authorization_url_happy_path(self, monkeypatch, tmp_path):
         secret_path = tmp_path / "client_secret_web.json"
@@ -208,19 +208,33 @@ class TestWebOAuthFlow:
         monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", secret_path)
 
         fake_flow = _FakeFlow()
-        monkeypatch.setattr(youtube_publisher.Flow, "from_client_secrets_file", staticmethod(lambda *a, **kw: fake_flow))
+        from_client_secrets_file_calls = []
 
-        url = youtube_publisher.build_authorization_url("http://localhost/callback", "state123")
+        def fake_from_client_secrets_file(*args, **kwargs):
+            from_client_secrets_file_calls.append(kwargs)
+            return fake_flow
+
+        monkeypatch.setattr(
+            youtube_publisher.Flow, "from_client_secrets_file", staticmethod(fake_from_client_secrets_file)
+        )
+
+        url = youtube_publisher.build_authorization_url("http://localhost/callback", "state123", "challenge123")
 
         assert url == "https://accounts.google.com/o/oauth2/auth?fake=1"
         assert fake_flow.authorization_url_calls[0]["state"] == "state123"
         assert fake_flow.authorization_url_calls[0]["access_type"] == "offline"
         assert fake_flow.authorization_url_calls[0]["prompt"] == "consent"
+        assert fake_flow.authorization_url_calls[0]["code_challenge"] == "challenge123"
+        assert fake_flow.authorization_url_calls[0]["code_challenge_method"] == "S256"
+        # autogenerate_code_verifier=False so this Flow instance never generates
+        # its own verifier that would conflict with the caller-supplied challenge
+        # (this was the root cause of the "Missing code verifier" bug).
+        assert from_client_secrets_file_calls[0]["autogenerate_code_verifier"] is False
 
     def test_exchange_code_for_credentials_missing_client_secret_raises(self, monkeypatch, tmp_path):
         monkeypatch.setattr(youtube_publisher, "WEB_CLIENT_SECRET_PATH", tmp_path / "missing.json")
         with pytest.raises(PermanentError):
-            youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback")
+            youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
 
     def test_exchange_code_for_credentials_returns_parsed_json(self, monkeypatch, tmp_path):
         secret_path = tmp_path / "client_secret_web.json"
@@ -230,10 +244,11 @@ class TestWebOAuthFlow:
         fake_flow = _FakeFlow(credentials_json=json.dumps({"token": "abc", "refresh_token": "xyz"}))
         monkeypatch.setattr(youtube_publisher.Flow, "from_client_secrets_file", staticmethod(lambda *a, **kw: fake_flow))
 
-        creds = youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback")
+        creds = youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
 
         assert creds == {"token": "abc", "refresh_token": "xyz"}
         assert fake_flow.fetch_token_calls[0]["code"] == "auth-code"
+        assert fake_flow.fetch_token_calls[0]["code_verifier"] == "verifier123"
 
     def test_exchange_code_for_credentials_wraps_failure_as_permanent_error(self, monkeypatch, tmp_path):
         secret_path = tmp_path / "client_secret_web.json"
@@ -249,4 +264,4 @@ class TestWebOAuthFlow:
         )
 
         with pytest.raises(PermanentError):
-            youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback")
+            youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")

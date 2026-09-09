@@ -11,6 +11,13 @@ Google's OAuth endpoints are never actually called: app/publishers/youtube.py's
 build_authorization_url/exchange_code_for_credentials are monkeypatched, same
 spirit as every other publisher in this suite being exercised only against
 mocked HTTP.
+
+PKCE (post-29a fix): Google's Flow object requires PKCE too (auto-generates
+its own code_verifier per Flow instance by default, which broke the
+exchange when build_authorization_url and exchange_code_for_credentials
+each built a separate, short-lived Flow — see app/publishers/youtube.py's
+module docstring "PKCE" note). The state param now also carries a
+code_verifier, same pattern as tests/test_dashboard_twitter_oauth.py.
 """
 
 import pytest
@@ -80,16 +87,17 @@ class TestStartRoute:
         resp = client.get("/api/oauth/youtube/start", auth=ADMIN_AUTH, follow_redirects=False)
         assert resp.status_code == 403
 
-    def test_client_user_redirects_to_google_authorize_url(self, client, db_session, monkeypatch):
+    def test_client_user_redirects_to_google_authorize_url_with_pkce(self, client, db_session, monkeypatch):
         c = _make_client(db_session)
         _make_client_user(db_session, c)
         _login(client, "user@acme.test", "password123")
 
         captured = {}
 
-        def fake_build_authorization_url(redirect_uri, state):
+        def fake_build_authorization_url(redirect_uri, state, code_challenge):
             captured["redirect_uri"] = redirect_uri
             captured["state"] = state
+            captured["code_challenge"] = code_challenge
             return _FAKE_AUTH_URL
 
         monkeypatch.setattr(dashboard_api.youtube_publisher, "build_authorization_url", fake_build_authorization_url)
@@ -98,13 +106,26 @@ class TestStartRoute:
         assert resp.status_code in (302, 307)
         assert resp.headers["location"] == _FAKE_AUTH_URL
         assert captured["redirect_uri"].endswith("/api/oauth/youtube/callback")
+        assert captured["code_challenge"]  # a non-empty PKCE challenge was generated
 
-        # The state param encodes this client_user's own client_id — verified
+        # The state param encodes this client_user's own client_id AND the
+        # PKCE verifier paired with the challenge above — verified
         # independently via the same helper the callback route uses.
         from app.auth import verify_oauth_state_token
 
         decoded = verify_oauth_state_token(captured["state"])
         assert decoded["client_id"] == c.id
+        assert decoded["code_verifier"]
+
+        # The challenge sent to Google must actually be derived from the
+        # verifier stashed in state (standard RFC 7636 S256), not some
+        # unrelated value.
+        import base64
+        import hashlib
+
+        digest = hashlib.sha256(decoded["code_verifier"].encode("ascii")).digest()
+        expected_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        assert captured["code_challenge"] == expected_challenge
 
 
 class TestCallbackRoute:
@@ -127,8 +148,23 @@ class TestCallbackRoute:
         )
         assert "reason=invalid_or_expired_state" in resp.headers["location"]
 
+    def test_state_missing_pkce_verifier_redirects_with_reason(self, client, db_session):
+        # A validly-signed state token that happens not to carry a
+        # code_verifier (e.g. an old-format token) — distinct from a
+        # tampered/expired signature, and distinct from Google rejecting a
+        # verifier/challenge mismatch at the token endpoint (that's the
+        # "exchange_failed" case below).
+        c = _make_client(db_session)
+        state = create_oauth_state_token({"client_id": c.id, "user_id": 1})
+        resp = client.get(
+            "/api/oauth/youtube/callback",
+            params={"code": "auth-code", "state": state},
+            follow_redirects=False,
+        )
+        assert "reason=missing_pkce_verifier" in resp.headers["location"]
+
     def test_state_for_nonexistent_client_redirects_with_reason(self, client):
-        state = create_oauth_state_token({"client_id": 999999, "user_id": 1})
+        state = create_oauth_state_token({"client_id": 999999, "user_id": 1, "code_verifier": "verifier123"})
         resp = client.get(
             "/api/oauth/youtube/callback",
             params={"code": "auth-code", "state": state},
@@ -138,13 +174,14 @@ class TestCallbackRoute:
 
     def test_happy_path_creates_account_scoped_to_client(self, client, db_session, monkeypatch):
         c = _make_client(db_session, name="Bloom Studio")
-        state = create_oauth_state_token({"client_id": c.id, "user_id": 1})
+        state = create_oauth_state_token({"client_id": c.id, "user_id": 1, "code_verifier": "verifier123"})
 
         captured = {}
 
-        def fake_exchange(code, redirect_uri):
+        def fake_exchange(code, redirect_uri, code_verifier):
             captured["code"] = code
             captured["redirect_uri"] = redirect_uri
+            captured["code_verifier"] = code_verifier
             return dict(_FAKE_CREDENTIALS)
 
         monkeypatch.setattr(dashboard_api.youtube_publisher, "exchange_code_for_credentials", fake_exchange)
@@ -157,6 +194,7 @@ class TestCallbackRoute:
         assert resp.status_code in (302, 307)
         assert "youtube_connect=success" in resp.headers["location"]
         assert captured["code"] == "auth-code-123"
+        assert captured["code_verifier"] == "verifier123"
         assert captured["redirect_uri"].endswith("/api/oauth/youtube/callback")
 
         account = db_session.query(Account).filter(Account.platform == "youtube", Account.client_id == c.id).one()
@@ -165,18 +203,23 @@ class TestCallbackRoute:
 
     def test_reconnecting_rotates_existing_account_instead_of_duplicating(self, client, db_session, monkeypatch):
         c = _make_client(db_session, name="Bloom Studio")
-        state = create_oauth_state_token({"client_id": c.id, "user_id": 1})
 
+        state1 = create_oauth_state_token({"client_id": c.id, "user_id": 1, "code_verifier": "verifier-1"})
         monkeypatch.setattr(
-            dashboard_api.youtube_publisher, "exchange_code_for_credentials", lambda code, redirect_uri: dict(_FAKE_CREDENTIALS)
+            dashboard_api.youtube_publisher,
+            "exchange_code_for_credentials",
+            lambda code, redirect_uri, code_verifier: dict(_FAKE_CREDENTIALS),
         )
-        client.get("/api/oauth/youtube/callback", params={"code": "first-code", "state": state}, follow_redirects=False)
+        client.get("/api/oauth/youtube/callback", params={"code": "first-code", "state": state1}, follow_redirects=False)
 
+        state2 = create_oauth_state_token({"client_id": c.id, "user_id": 1, "code_verifier": "verifier-2"})
         rotated_credentials = {**_FAKE_CREDENTIALS, "token": "rotated-access-token"}
         monkeypatch.setattr(
-            dashboard_api.youtube_publisher, "exchange_code_for_credentials", lambda code, redirect_uri: rotated_credentials
+            dashboard_api.youtube_publisher,
+            "exchange_code_for_credentials",
+            lambda code, redirect_uri, code_verifier: rotated_credentials,
         )
-        client.get("/api/oauth/youtube/callback", params={"code": "second-code", "state": state}, follow_redirects=False)
+        client.get("/api/oauth/youtube/callback", params={"code": "second-code", "state": state2}, follow_redirects=False)
 
         accounts = db_session.query(Account).filter(Account.platform == "youtube", Account.client_id == c.id).all()
         assert len(accounts) == 1
@@ -184,11 +227,11 @@ class TestCallbackRoute:
 
     def test_exchange_failure_redirects_with_reason(self, client, db_session, monkeypatch):
         c = _make_client(db_session, name="Bloom Studio")
-        state = create_oauth_state_token({"client_id": c.id, "user_id": 1})
+        state = create_oauth_state_token({"client_id": c.id, "user_id": 1, "code_verifier": "verifier123"})
 
         from app.exceptions import PermanentError
 
-        def fake_exchange(code, redirect_uri):
+        def fake_exchange(code, redirect_uri, code_verifier):
             raise PermanentError("token endpoint rejected the code")
 
         monkeypatch.setattr(dashboard_api.youtube_publisher, "exchange_code_for_credentials", fake_exchange)
