@@ -57,6 +57,7 @@ in app/tasks.py::_TOKEN_REFRESH_MODULES_BY_PLATFORM.
 
 import os
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 import requests
 
@@ -147,6 +148,27 @@ def _compute_expiry(expires_in) -> str | None:
     if not expires_in:
         return None
     return (datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))).isoformat()
+
+
+def build_authorization_url(redirect_uri: str, state: str) -> str:
+    """
+    Step 1 of the OAuth chain, browser-redirect form (Phase 29d — the
+    in-browser counterpart to scripts/authorize_meta.py's same GET
+    .../dialog/oauth call it opens in a webbrowser tab). Unlike Google's/X's/
+    TikTok's equivalents (youtube.py/twitter.py/tiktok.py::
+    build_authorization_url), Meta's OAuth dialog needs no PKCE — just
+    client_id + redirect_uri + state + scope. Reads META_APP_ID from the
+    environment (app-level, no Account row exists yet at this point in the
+    flow — same reasoning as twitter.py/tiktok.py reading their own
+    CLIENT_ID/CLIENT_KEY directly); raises PermanentError if unset (or if
+    META_APP_SECRET is also unset, via _app_credentials() — the secret isn't
+    used here, but requiring both up front matches every other credential
+    check in this module and fails clearly before a redirect that would
+    later dead-end at the token exchange anyway).
+    """
+    app_id, _app_secret = _app_credentials()
+    query = urlencode({"client_id": app_id, "redirect_uri": redirect_uri, "state": state, "scope": SCOPES})
+    return f"{AUTHORIZE_URL}?{query}"
 
 
 def exchange_code_for_user_token(code: str, redirect_uri: str) -> dict:

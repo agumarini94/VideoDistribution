@@ -2030,6 +2030,18 @@ unit-tested without Redis or a worker running.
   rotating the same `Account` instead of duplicating it, a simulated
   verifier/challenge mismatch at the token endpoint, and a generic exchange
   failure — both of the latter two leaving no `Account` behind.
+- **Post-launch fix: `media.write` scope missing** — connecting via this
+  flow worked and text-only tweets posted fine, but any post with
+  `media_paths` failed with `HTTP 403 Forbidden` on X's
+  `POST /2/media/upload` INIT call. Cause: `tweet.write` covers tweet
+  creation but not the v2 media upload endpoint, which checks its own
+  `media.write` scope. Fix: `_OAUTH_SCOPES` in `app/publishers/twitter.py`
+  now requests `tweet.read tweet.write users.read offline.access
+  media.write` (was missing `media.write`). **Accounts connected before
+  this fix only hold the original four scopes and must reconnect** ("Connect
+  X/Twitter" again on the Connected Accounts screen) to pick up
+  `media.write` — there's no way to add a scope to an already-issued
+  access/refresh token pair short of a fresh authorization.
 
   **Local dev setup — register this exact redirect URI in the X Developer
   Portal** (OAuth 2.0 app settings — same confidential client Phase 21 set
@@ -2179,6 +2191,120 @@ unit-tested without Redis or a worker running.
   `redirect_uri` from the incoming request either way, so it always matches
   whatever's actually registered as long as that's what the forwarder page
   (locally) or the browser (in production) ultimately hits.
+
+### Phase 29d (current)
+- **In-browser Facebook + Instagram OAuth for client self-service** — same
+  pattern as Phase 29a/b/c, extended to Meta. Scoped narrowly the same way:
+  `role="client_user"` sessions only, always creates the resulting
+  Account(s) under the caller's own `client_id`. **The one structural
+  difference from every prior 29x phase**: a single Meta authorization can
+  yield *more than one* `Account` — one `facebook` + optionally one
+  `instagram` Account *per Page* the user manages — since Meta's OAuth model
+  grants access to every Page at once rather than one target account per
+  authorization the way YouTube/X/TikTok do. Meta also needs no separate
+  app-type credentials the way Google's Web/Desktop split does (Phase 29a)
+  — the same `META_APP_ID`/`META_APP_SECRET` already in `.env` since Phase
+  23 work for a browser redirect flow, only a new redirect URI needs
+  registering in the Meta App Dashboard (see below). No PKCE either, unlike
+  X's/TikTok's flows — Meta's OAuth dialog doesn't require it.
+- **`app/publishers/meta.py`** gained one new pure function,
+  `build_authorization_url(redirect_uri, state)` — mirrors
+  `youtube.py`/`twitter.py`/`tiktok.py`'s `build_authorization_url` shape,
+  but with no `code_challenge` parameter (no PKCE): builds Meta's
+  `AUTHORIZE_URL` (the same `.../dialog/oauth` endpoint
+  `scripts/authorize_meta.py` already opens in a browser) with
+  `client_id`/`redirect_uri`/`state`/`scope=SCOPES`. Reads `META_APP_ID`
+  (and requires `META_APP_SECRET` to also be set, via the existing
+  `_app_credentials()` helper, even though the secret isn't used in this
+  particular call — consistent with every other credential check in this
+  module, and fails clearly before a redirect that would otherwise dead-end
+  at the token exchange). **No new `exchange_code_for_credentials`
+  wrapper** — unlike Phase 29a/b/c, the dashboard callback route (below)
+  calls Meta's existing OAuth-chain functions directly
+  (`exchange_code_for_user_token` -> `exchange_long_lived_token` ->
+  `list_pages` -> `get_instagram_business_account` per Page), since a
+  single exchange has to fan out into a list of Pages rather than resolve
+  to one credentials dict.
+- **`dashboard/api.py`**: two new routes mirroring
+  `youtube_oauth_start`/`youtube_oauth_callback` (Phase 29a) in shape,
+  registered as `client_user`-only / public respectively:
+  - `GET /api/oauth/meta/start` — signs `{"client_id", "user_id"}` into
+    `state` (no PKCE verifier, unlike Twitter's/TikTok's state — same shape
+    as YouTube's) and redirects to Meta's authorize URL.
+  - `GET /api/oauth/meta/callback` (public — added to `_PUBLIC_API_PATHS`,
+    same reasoning as every other platform's callback: Meta's redirect
+    carries no session cookie) — verifies `state`, then runs the full
+    exchange chain (code -> short-lived token -> long-lived token ->
+    `list_pages()`), and **for every Page returned**: upserts a `facebook`
+    Account scoped to the verified `client_id`, and — only if
+    `get_instagram_business_account(page_id, page_token)` finds one — also
+    upserts an `instagram` Account for that same Page. **No picker**,
+    unlike `scripts/authorize_meta.py`'s interactive `_choose_page` — a
+    self-service `client_user` is expected to manage only their own Page(s),
+    so every Page found is connected. **Account naming departs from
+    Phase 29a/b/c's `"<Client name> (self-service)"`** (which assumes at
+    most one Account per platform per client): here it's
+    `"<Client name> - <Page name> (self-service)"`, since a client can have
+    multiple Pages and `upsert_account` matches on platform+name —
+    reconnecting the same Page for the same client rotates that Page's
+    Account(s) in place, a genuinely new Page gets new ones. **Whole-exchange
+    transaction**: every Page is processed in one loop, one `db.commit()` at
+    the end — any `PublishError` (`TransientError` or `PermanentError`, from
+    any step, for any Page) rolls back the whole thing and redirects with
+    `reason=exchange_failed`, rather than leaving some Pages connected and
+    others not from a single authorization. A `0`-Page result (user manages
+    no Facebook Pages) redirects with `reason=no_pages` instead of silently
+    "succeeding" with nothing connected. On success, redirects with
+    `?meta_connect=success&facebook=<n>&instagram=<m>` — counts in the query
+    string, since (unlike every other 29x phase) there's no single Account
+    to describe.
+- **Frontend** (`dashboard/static/index.html`): a single "Connect Facebook &
+  Instagram" button alongside the other three on the Connected Accounts
+  screen (`client_user`-only, plain `<a href="/api/oauth/meta/start">`
+  navigation) — one click covers both platforms, matching Meta's actual
+  OAuth model rather than offering two separate buttons. `state.metaConnectNotice`
+  mirrors the other three; `consumeOauthRedirectParams()` additionally reads
+  `?meta_connect=success|error&reason=...&facebook=<n>&instagram=<m>` and
+  renders a summary ("Connected: 2 Facebook Pages, 1 Instagram account.") on
+  success.
+- **Tests**: `tests/test_publisher_meta.py::TestBuildAuthorizationUrl`
+  (missing `META_APP_ID`/`_SECRET` raises `PermanentError`; the built URL
+  has the right `client_id`/`state`/`redirect_uri`/scopes, no PKCE
+  params). `tests/test_dashboard_meta_oauth.py` (FastAPI `TestClient`,
+  modeled on `tests/test_dashboard_twitter_oauth.py` minus every PKCE-
+  specific case, since Meta needs none): `/start` 401 anonymous / 403 admin
+  / redirects a `client_user` to the (mocked) Meta URL with a verifiable
+  signed state (`client_id` only, no `code_verifier` key); `/callback`
+  handles Meta's `error` param, missing code/state, a tampered state, a
+  state naming a nonexistent client, a single-Page happy path (both
+  `facebook`+`instagram` Accounts created, scoped to the right `client_id`),
+  a Page with no linked Instagram creating only the `facebook` Account, a
+  multi-Page authorization connecting multiple distinct Accounts (verifying
+  each Page gets its own distinctly-named Account and only the Page with a
+  linked IG account gets an `instagram` Account), a zero-Pages result
+  (`reason=no_pages`), reconnecting rotating the same Page's Account(s)
+  in place rather than duplicating them, and both a `PermanentError` and a
+  `TransientError` raised partway through a multi-Page loop leaving **no**
+  Account behind (whole-transaction rollback, not partial).
+
+  **Local dev setup — register this exact redirect URI in the Meta App
+  Dashboard** (Facebook Login product's Valid OAuth Redirect URIs — the
+  same app `META_APP_ID`/`META_APP_SECRET` already point at since Phase 23,
+  no separate app-type credentials needed the way Google's Web/Desktop
+  split required):
+  ```
+  http://localhost:8000/api/oauth/meta/callback
+  ```
+  (Adjust the host/port if the dashboard runs elsewhere locally —
+  `/api/oauth/meta/start` derives `redirect_uri` from the incoming request,
+  so it always matches whatever's actually registered as long as that's
+  what's typed into the browser. Per `scripts/authorize_meta.py`'s existing
+  note, Meta's App Dashboard is documented to allow `http://localhost`
+  redirect URIs for an app still in Development mode — **unverified against
+  a real App yet**, same caveat as Phase 23's.) In production this needs the
+  real deployed origin's equivalent
+  (`https://<fly-app>.fly.dev/api/oauth/meta/callback` or a custom domain)
+  added as an additional Valid OAuth Redirect URI once deployed.
 
 ## Monitoring dashboard (extra, not in the spec)
 

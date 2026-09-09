@@ -48,6 +48,29 @@ class TestMissingAppCredentials:
             meta_publisher.exchange_long_lived_token("short-token")
 
 
+class TestBuildAuthorizationUrl:
+    """
+    Phase 29d: the in-browser connect flow's step 1 (dashboard/api.py's
+    /api/oauth/meta/start). Unlike YouTube's/X's/TikTok's equivalents, no
+    PKCE is involved here — just client_id/redirect_uri/state/scope.
+    """
+
+    def test_requires_app_credentials(self, monkeypatch):
+        monkeypatch.delenv("META_APP_ID", raising=False)
+        monkeypatch.delenv("META_APP_SECRET", raising=False)
+        with pytest.raises(PermanentError):
+            meta_publisher.build_authorization_url("https://example.com/callback", "state123")
+
+    def test_builds_expected_url(self):
+        url = meta_publisher.build_authorization_url("https://example.com/callback", "state123")
+        assert url.startswith(meta_publisher.AUTHORIZE_URL + "?")
+        assert f"client_id={APP_ID}" in url
+        assert "state=state123" in url
+        assert "redirect_uri=https%3A%2F%2Fexample.com%2Fcallback" in url
+        for scope in meta_publisher.SCOPES.split(","):
+            assert scope in url
+
+
 class TestOAuthChain:
     @responses.activate
     def test_exchange_code_for_user_token(self):

@@ -43,8 +43,9 @@ from app.auth import (
     verify_session_token,
 )
 from app.db import SessionLocal
-from app.exceptions import PermanentError, StorageNotConfiguredError
+from app.exceptions import PermanentError, PublishError, StorageNotConfiguredError
 from app.models import Account, Client, Job, JobStatus, User, WebhookEvent
+from app.publishers import meta as meta_publisher
 from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
@@ -114,14 +115,15 @@ _DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
 # checks "am I logged in?" on load without forcing a 401 round trip.
 #
 # /api/oauth/youtube/callback (Phase 29a), /api/oauth/twitter/callback
-# (Phase 29b) and /api/oauth/tiktok/callback (Phase 29c, same reasoning) are
-# the other public ones: the platform redirects the browser here with no
-# session cookie at all, so all three have to be public too — their own
-# security comes from verifying the signed "state" param (see
-# youtube_oauth_callback/twitter_oauth_callback/tiktok_oauth_callback
-# below), not from enforce_auth. Their sibling /start routes are
-# deliberately NOT here — those still require a real client_user session,
-# gated normally.
+# (Phase 29b), /api/oauth/tiktok/callback (Phase 29c) and
+# /api/oauth/meta/callback (Phase 29d, same reasoning) are the other public
+# ones: the platform redirects the browser here with no session cookie at
+# all, so all four have to be public too — their own security comes from
+# verifying the signed "state" param (see
+# youtube_oauth_callback/twitter_oauth_callback/tiktok_oauth_callback/
+# meta_oauth_callback below), not from enforce_auth. Their sibling /start
+# routes are deliberately NOT here — those still require a real client_user
+# session, gated normally.
 _PUBLIC_API_PATHS = {
     "/api/auth/register",
     "/api/auth/login",
@@ -130,6 +132,7 @@ _PUBLIC_API_PATHS = {
     "/api/oauth/youtube/callback",
     "/api/oauth/twitter/callback",
     "/api/oauth/tiktok/callback",
+    "/api/oauth/meta/callback",
 }
 
 
@@ -956,6 +959,147 @@ def tiktok_oauth_callback(
     db.commit()
 
     return RedirectResponse("/?screen=accounts&tiktok_connect=success")
+
+
+@app.get("/api/oauth/meta/start")
+def meta_oauth_start(request: Request = None):
+    """
+    Starts the in-browser Facebook + Instagram connect flow (Phase 29d),
+    mirroring youtube_oauth_start/twitter_oauth_start/tiktok_oauth_start —
+    client_user-only, since this flow always creates the resulting
+    Account(s) under the caller's own client_id.
+
+    Unlike Google/X/TikTok, Meta's OAuth dialog needs no PKCE (see
+    app/publishers/meta.py::build_authorization_url), so state only carries
+    client_id/user_id, same shape as YouTube's.
+
+    One click covers both platforms per Meta's actual OAuth model: a single
+    consent grant yields a user token that lists every Page the user
+    manages (and, per Page, its linked Instagram Business account, if any)
+    — see meta_oauth_callback below, which connects all of them rather than
+    prompting for a single choice the way scripts/authorize_meta.py's CLI
+    flow does (a client_user is expected to manage their own Page(s) only,
+    so no picker is needed for self-service).
+    """
+    auth = _get_auth(request)
+    if auth.role != "client_user":
+        raise HTTPException(
+            status_code=403, detail="Facebook/Instagram self-service connect is only available to a client account."
+        )
+
+    redirect_uri = str(request.url_for("meta_oauth_callback"))
+    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id})
+    try:
+        authorization_url = meta_publisher.build_authorization_url(redirect_uri, state)
+    except PermanentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(authorization_url)
+
+
+@app.get("/api/oauth/meta/callback")
+def meta_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public callback Meta redirects the browser back to after the consent
+    dialog from meta_oauth_start above — mirrors youtube_oauth_callback's
+    shape (see its docstring for why this must stay public and
+    redirect-only), but reuses app/publishers/meta.py's existing OAuth-chain
+    functions directly (exchange_code_for_user_token ->
+    exchange_long_lived_token -> list_pages -> get_instagram_business_account
+    per Page) rather than a single exchange_code_for_credentials wrapper,
+    since one authorization can yield more than one Account.
+
+    Connects every Page the user manages (no picker, unlike
+    scripts/authorize_meta.py's interactive _choose_page — see
+    meta_oauth_start's docstring for why that's fine for self-service): each
+    Page upserts a facebook Account, and — only if that Page has a linked
+    Instagram Business account — an instagram Account too. Account names are
+    "<Client name> - <Page name> (self-service)" rather than just
+    "<Client name> (self-service)" (YouTube's/Twitter's/TikTok's shape),
+    since a client can have more than one Page and upsert_account matches on
+    platform+name — reconnecting the same Page for the same client rotates
+    that Page's Account(s) in place; a genuinely new Page gets new ones.
+
+    Any PublishError (Transient or Permanent) anywhere in the exchange chain
+    redirects with reason=exchange_failed and leaves no Account behind (a
+    single db.commit() at the end, not per-Page) — same one-shot,
+    human-driven-retry contract as the other three platforms' callbacks,
+    even though meta.py's chain functions (unlike youtube.py's/twitter.py's/
+    tiktok.py's exchange_code_for_credentials) don't themselves normalize
+    Transient/Permanent, since nothing here needs to distinguish them for
+    the Beat-task's benefit the way refresh_stored_credentials does.
+    """
+    if error:
+        return RedirectResponse(f"/?screen=accounts&meta_connect=error&reason={quote(error)}")
+    if not code or not state:
+        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=missing_code_or_state")
+
+    state_data = verify_oauth_state_token(state)
+    if state_data is None:
+        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=invalid_or_expired_state")
+
+    client_id = state_data.get("client_id")
+    client = db.get(Client, client_id) if client_id is not None else None
+    if client is None:
+        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=unknown_client")
+
+    redirect_uri = str(request.url_for("meta_oauth_callback"))
+    try:
+        short_lived = meta_publisher.exchange_code_for_user_token(code, redirect_uri)
+        long_lived = meta_publisher.exchange_long_lived_token(short_lived["access_token"])
+        user_token = long_lived["access_token"]
+        user_token_expires_at = long_lived["expires_at"]
+        pages = meta_publisher.list_pages(user_token)
+
+        facebook_count = 0
+        instagram_count = 0
+        for page in pages:
+            page_id = page.get("id")
+            page_token = page.get("access_token")
+            if not page_id or not page_token:
+                continue
+            page_name = page.get("name", "")
+            account_name = f"{client.name} - {page_name or page_id} (self-service)"
+
+            facebook_credentials = {
+                "page_id": page_id,
+                "page_token": page_token,
+                "page_name": page_name,
+                "user_token": user_token,
+                "user_token_expires_at": user_token_expires_at,
+            }
+            fb_account, _action = upsert_account(db, "facebook", account_name, facebook_credentials)
+            fb_account.client_id = client.id
+            facebook_count += 1
+
+            ig_user_id = meta_publisher.get_instagram_business_account(page_id, page_token)
+            if ig_user_id:
+                instagram_credentials = {
+                    "ig_user_id": ig_user_id,
+                    "page_id": page_id,
+                    "page_token": page_token,
+                    "user_token": user_token,
+                    "user_token_expires_at": user_token_expires_at,
+                }
+                ig_account, _action = upsert_account(db, "instagram", account_name, instagram_credentials)
+                ig_account.client_id = client.id
+                instagram_count += 1
+    except PublishError as exc:
+        db.rollback()
+        logger.warning("Meta OAuth code exchange failed for client %s: %s", client_id, exc)
+        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=exchange_failed")
+
+    if facebook_count == 0:
+        db.rollback()
+        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=no_pages")
+
+    db.commit()
+    return RedirectResponse(f"/?screen=accounts&meta_connect=success&facebook={facebook_count}&instagram={instagram_count}")
 
 
 @app.get("/api/admin/users/pending", response_model=list[PendingUserOut])

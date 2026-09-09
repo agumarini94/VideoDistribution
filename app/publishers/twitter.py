@@ -117,8 +117,17 @@ _FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
 # X's OAuth 2.0 Authorization Code + PKCE consent screen — used only by
 # build_authorization_url() below (Phase 29b, dashboard/api.py's in-browser
 # "Connect X/Twitter" self-service flow), never by publish() itself.
+#
+# media.write (added post-29b): tweet.write does NOT cover POST
+# /2/media/upload — X's v2 media upload endpoint checks for its own
+# media.write scope, and without it the INIT call 403s even though tweet
+# creation works fine (that's why text-only posts succeeded through 29b
+# while any post with media_paths failed at media init). Accounts connected
+# before this scope was added only hold the four original scopes and must
+# reconnect (Connect X/Twitter again) to pick up media.write — there's no
+# way to add a scope to an already-issued token/refresh_token pair.
 AUTHORIZE_URL = "https://twitter.com/i/oauth2/authorize"
-_OAUTH_SCOPES = "tweet.read tweet.write users.read offline.access"
+_OAUTH_SCOPES = "tweet.read tweet.write users.read offline.access media.write"
 
 # error codes from the OAuth 2.0 token endpoint worth retrying (transient on
 # X's side); everything else (e.g. invalid_grant for a revoked/expired or
