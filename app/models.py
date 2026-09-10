@@ -48,6 +48,16 @@ class Client(Base):
     # third kind shouldn't require a migration.
     kind: Mapped[str] = mapped_column(String(20), nullable=False, default="client")
 
+    # Lets an admin retire a client workspace (Phase 32) without deleting it
+    # or any of its Accounts/Users/Jobs — the flag is flipped, nothing
+    # cascades. A deactivated workspace's client_user logins are blocked
+    # (see dashboard/api.py::login and _resolve_auth). Same
+    # additive-column-with-a-default pattern as Account.is_active and every
+    # prior additive column (account_id, external_id, ...): on an existing
+    # Neon database init_db()'s create_all won't add this to the clients
+    # table — see CLAUDE.md Phase 32 for the manual ALTER TABLE.
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

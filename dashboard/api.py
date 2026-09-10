@@ -253,16 +253,29 @@ async def _resolve_auth(request: Request) -> AuthContext:
     db = SessionLocal()
     try:
         user = db.get(User, user_id)
+        # Re-checked live (not encoded in the token) so a since-rejected/
+        # deleted account loses access on its very next request, not just the
+        # next time it happens to re-authenticate.
+        if user is None or not user.is_approved:
+            return ANONYMOUS_AUTH
+        # Phase 32: a client_user whose workspace was deactivated drops to
+        # anonymous immediately — not just blocked at the next login — so
+        # deactivation actually severs access to every scoped route at once.
+        client_inactive = (
+            user.role == "client_user"
+            and user.client_id is not None
+            and _client_is_inactive(db, user.client_id)
+        )
+        auth = AuthContext(role=user.role, client_id=user.client_id, user_id=user.id, email=user.email)
     finally:
         db.close()
 
-    # Re-checked live (not encoded in the token) so a since-rejected/
-    # deleted account loses access on its very next request, not just the
-    # next time it happens to re-authenticate.
-    if user is None or not user.is_approved:
-        return ANONYMOUS_AUTH
+    return ANONYMOUS_AUTH if client_inactive else auth
 
-    return AuthContext(role=user.role, client_id=user.client_id, user_id=user.id, email=user.email)
+
+def _client_is_inactive(db: Session, client_id: int) -> bool:
+    client = db.get(Client, client_id)
+    return client is not None and not client.is_active
 
 
 def _get_auth(request: Request | None) -> AuthContext:
@@ -484,15 +497,33 @@ class ClientOut(BaseModel):
     id: int
     name: str
     kind: str
+    is_active: bool
     created_at: str
+    # Per-client aggregates (Phase 32) for the Clients management screen —
+    # computed with grouped queries, not per-row. account_count is every
+    # Account for the client (active or not); user_count is only *approved*
+    # client_users; job_count is every Job ever created for the client.
+    account_count: int = 0
+    user_count: int = 0
+    job_count: int = 0
 
     @staticmethod
-    def from_client(client: Client) -> "ClientOut":
+    def from_client(
+        client: Client,
+        *,
+        account_count: int = 0,
+        user_count: int = 0,
+        job_count: int = 0,
+    ) -> "ClientOut":
         return ClientOut(
             id=client.id,
             name=client.name,
             kind=client.kind,
+            is_active=client.is_active,
             created_at=client.created_at.isoformat(),
+            account_count=account_count,
+            user_count=user_count,
+            job_count=job_count,
         )
 
 
@@ -631,6 +662,16 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     if not user.is_approved:
         raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
+    if user.role == "client_user" and user.client_id is not None:
+        client_row = db.get(Client, user.client_id)
+        if client_row is not None and not client_row.is_active:
+            # Phase 32: a deactivated workspace blocks its users' logins with
+            # a clear message (recommended in the phase brief). This does
+            # reveal the workspace state to a would-be user, accepted the
+            # same way login's pending-approval 403 is — a smaller,
+            # deliberate exception to the no-enumeration rule, for a usable
+            # error message.
+            raise HTTPException(status_code=403, detail="This client workspace has been deactivated. Contact your administrator.")
 
     token = create_session_token(user.id)
     client_name = None
@@ -1413,6 +1454,34 @@ def list_accounts(
     return [AccountOut.from_account(account, client_names.get(account.client_id)) for account in accounts]
 
 
+def _aggregate_client_counts(db: Session) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+    """
+    (account_counts, user_counts, job_counts) keyed by client_id, each from
+    a single grouped query — used to enrich GET /api/clients (Phase 32)
+    without a per-client round trip. user_counts is *approved* client_users
+    only; account_counts and job_counts count every row for the client.
+    """
+    account_counts = dict(
+        db.query(Account.client_id, func.count(Account.id))
+        .filter(Account.client_id.isnot(None))
+        .group_by(Account.client_id)
+        .all()
+    )
+    user_counts = dict(
+        db.query(User.client_id, func.count(User.id))
+        .filter(User.client_id.isnot(None), User.is_approved.is_(True))
+        .group_by(User.client_id)
+        .all()
+    )
+    job_counts = dict(
+        db.query(Job.client_id, func.count(Job.id))
+        .filter(Job.client_id.isnot(None))
+        .group_by(Job.client_id)
+        .all()
+    )
+    return account_counts, user_counts, job_counts
+
+
 @app.get("/api/clients", response_model=list[ClientOut])
 def list_clients(request: Request = None, db: Session = Depends(get_db)):
     """
@@ -1421,10 +1490,68 @@ def list_clients(request: Request = None, db: Session = Depends(get_db)):
     though it's not explicitly called out in the phase brief — the same
     "must never see another client's data" principle extends naturally to
     the client list itself.
+
+    Phase 32: each row also carries connected-account / approved-user /
+    total-job counts and is_active, for the Clients management screen.
     """
     _require_admin(request)
     clients = db.query(Client).order_by(Client.name).all()
-    return [ClientOut.from_client(client) for client in clients]
+    account_counts, user_counts, job_counts = _aggregate_client_counts(db)
+    return [
+        ClientOut.from_client(
+            client,
+            account_count=account_counts.get(client.id, 0),
+            user_count=user_counts.get(client.id, 0),
+            job_count=job_counts.get(client.id, 0),
+        )
+        for client in clients
+    ]
+
+
+@app.post("/api/clients/{client_id}/deactivate", response_model=ClientOut)
+def deactivate_client(client_id: int, request: Request = None, db: Session = Depends(get_db)):
+    """
+    Retires a client workspace (Phase 32). Admin-only. Flips is_active=False
+    and nothing else — Accounts, Users and Jobs belonging to the client are
+    left completely untouched (no cascade delete). The visible effects: the
+    workspace is greyed out in the Clients screen, and its client_user
+    logins are blocked with a clear "workspace deactivated" message (see
+    login / _resolve_auth) — an already-signed-in client_user also drops to
+    anonymous on their very next request. Reversible via /reactivate below.
+    """
+    _require_admin(request)
+    client = db.get(Client, client_id)
+    if client is None:
+        raise HTTPException(status_code=404, detail=f"Client {client_id} not found")
+    client.is_active = False
+    db.commit()
+    db.refresh(client)
+    account_counts, user_counts, job_counts = _aggregate_client_counts(db)
+    return ClientOut.from_client(
+        client,
+        account_count=account_counts.get(client.id, 0),
+        user_count=user_counts.get(client.id, 0),
+        job_count=job_counts.get(client.id, 0),
+    )
+
+
+@app.post("/api/clients/{client_id}/reactivate", response_model=ClientOut)
+def reactivate_client(client_id: int, request: Request = None, db: Session = Depends(get_db)):
+    """Reverses deactivate_client (Phase 32) — admin-only, flips is_active back to True."""
+    _require_admin(request)
+    client = db.get(Client, client_id)
+    if client is None:
+        raise HTTPException(status_code=404, detail=f"Client {client_id} not found")
+    client.is_active = True
+    db.commit()
+    db.refresh(client)
+    account_counts, user_counts, job_counts = _aggregate_client_counts(db)
+    return ClientOut.from_client(
+        client,
+        account_count=account_counts.get(client.id, 0),
+        user_count=user_counts.get(client.id, 0),
+        job_count=job_counts.get(client.id, 0),
+    )
 
 
 @app.post("/api/clients", response_model=ClientOut, status_code=201)

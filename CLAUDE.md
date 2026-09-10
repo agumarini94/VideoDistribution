@@ -2422,6 +2422,88 @@ unit-tested without Redis or a worker running.
   the job-outcome ones; the others would just re-expose `/api/jobs` +
   `/api/accounts` counts already visible elsewhere).
 
+### Phase 32 (current)
+- **Clients management screen** — the fifth scheduler-UI screen wired to a
+  real backend (after Calendar/Queue in Phase 26, the Connected-accounts
+  connect buttons in Phase 29x, and Analytics in Phase 30), replacing the
+  "isn't built yet" placeholder in `dashboard/static/index.html`. Admin-only,
+  in both directions: a `client_user` never sees the nav item (filtered out
+  of `navItems()` the same way the Admin item is) and the screen router
+  falls back to the placeholder for them, while every new/changed endpoint
+  goes through `_require_admin`.
+- **`app/models.py::Client.is_active`** (new column, `Boolean`,
+  `nullable=False`, `default=True`) — lets an admin retire a client
+  workspace without deleting it or cascading to any of its
+  `Account`/`User`/`Job` rows; the flag is flipped, nothing else changes.
+  Same additive-column-with-a-default shape as `Account.is_active`.
+  - **Manual schema step**, same pattern as every prior additive column
+    (`account_id` Phase 6, `external_id` Phase 10b, `last_stall_alert_at`
+    Phase 14, the Phase 26 `client_id` columns): `init_db()`'s `create_all`
+    creates whole new tables but never `ALTER`s an existing one, so on an
+    existing Neon database this does **not** add `is_active` to the
+    `clients` table. Run once, by hand, against Neon:
+    ```sql
+    ALTER TABLE clients ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE;
+    ```
+    The `DEFAULT TRUE` backfills every existing row in the same statement.
+- **`dashboard/api.py`**:
+  - `GET /api/clients` (existing admin-only route) now also returns
+    `is_active` and three per-client aggregates — `account_count` (every
+    `Account` for the client, active or not), `user_count` (**approved**
+    `client_user`s only), `job_count` (every `Job` ever created for the
+    client). Computed by `_aggregate_client_counts(db)` with **three
+    grouped queries total** (one per table, `GROUP BY client_id`), not a
+    per-client round trip. `ClientOut` / `ClientOut.from_client` gained the
+    four fields; the counts default to `0` so `create_client` (a brand-new
+    workspace) and any other caller stay valid without passing them.
+  - `POST /api/clients/{id}/deactivate` and
+    `POST /api/clients/{id}/reactivate` (both new, admin-only, `404` on an
+    unknown id) — flip `is_active` and nothing else, returning the enriched
+    `ClientOut`. No cascade: Accounts/Users/Jobs are deliberately left
+    untouched (deactivation is reversible and shouldn't destroy history).
+  - **A deactivated workspace blocks its `client_user`s' logins** (the
+    recommended behavior from the phase brief): `login` returns a
+    distinctly-worded `403` ("This client workspace has been deactivated.
+    Contact your administrator.") — the same kind of small, deliberate
+    no-enumeration exception already made for the pending-approval `403`.
+    **It also severs an existing session**: `_resolve_auth` re-checks the
+    workspace's `is_active` live (one extra `db.get(Client, ...)` by PK for
+    a `client_user` token) and drops the request to `ANONYMOUS_AUTH` if the
+    workspace is inactive — so deactivation takes effect on the very next
+    request, not just at the next login, and every scoped route `401`s for
+    them immediately. An **admin** `User` (`client_id=None`) is unaffected
+    by any client's deactivation.
+- **Frontend** (`dashboard/static/index.html`): `renderClients()` replaces
+  `renderPlaceholder("Clients")` in the content router (guarded by
+  `isAdmin()`). Grid of workspace cards against the Phase 26 design tokens
+  — initial badge, name, kind (Individual/Client), an
+  Accounts/Users/Jobs count strip, an Active/Inactive status pill, and a
+  Deactivate (with confirm) / Reactivate button — plus a dashed "Add client
+  workspace" tile that reuses the **unchanged** top-bar switcher
+  `addClientWorkspace()`. New state (`clientsLoading` / `clientsError`);
+  `loadClients()` (already the switcher's loader, admin-only) now tracks
+  load/error state and is also fired on entering the `clients` screen and
+  after a deactivate/reactivate (`setClientActive`). The "Clients" nav item
+  is filtered out of `navItems()` for a `client_user` session, keeping its
+  design position (last base item, before the appended Admin item) for an
+  admin.
+- **Tests** — `tests/test_dashboard_clients.py` (FastAPI `TestClient`, same
+  reasoning as `tests/test_dashboard_auth.py`/`_analytics.py`: middleware +
+  route-level behavior). Covers aggregate-count correctness (inactive
+  accounts still counted, pending users excluded, client-less rows
+  excluded, zeroes for an empty workspace, `create_client`'s response
+  shape), deactivate/reactivate flipping the flag and not touching
+  Accounts/Users/Jobs, `404` on an unknown id, admin-only enforcement
+  (`client_user` `403`, anonymous `401` on both actions and the list),
+  deactivated-workspace login block + clear message + login working again
+  after reactivation, an existing session dropping to anonymous on
+  deactivation, and an admin session being unaffected. Whole suite green
+  (`.venv/bin/python -m pytest -q` -> 372 passed).
+- **Not built** (out of scope, follow-up candidates): editing a client's
+  name/kind, deleting a workspace, and any client-scoped self-service view
+  of "my own workspace" for a `client_user` (this screen is purely the
+  agency-admin roster).
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)
