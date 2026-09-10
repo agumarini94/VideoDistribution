@@ -220,6 +220,25 @@
   .placeholder .heading { font-size: 18px; margin-bottom: 8px; color: var(--ink); }
   .placeholder p { font-size: 13.5px; margin: 0; }
 
+  /* ---------------- Analytics ---------------- */
+  .stat-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 28px; }
+  .stat-card { position: relative; border: 1px solid var(--border); padding: 16px; }
+  .stat-card .stat-label {
+    font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-dark); margin-bottom: 6px;
+  }
+  .stat-card .stat-value { font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 30px; line-height: 1; }
+  .analytics-section { margin-bottom: 28px; }
+  .analytics-section-label { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .bar-chart {
+    display: flex; align-items: flex-end; gap: 4px; height: 140px;
+    border-bottom: 1px solid var(--border); padding-bottom: 6px;
+  }
+  .bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 6px; height: 100%; min-width: 0; }
+  .bar-fill { width: 100%; background: var(--accent); min-height: 1px; }
+  .bar-fill.empty { background: var(--border); }
+  .bar-axis { display: flex; gap: 4px; margin-top: 6px; }
+  .bar-axis > div { flex: 1; text-align: center; font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   /* Basic accounts list */
   .accounts-list { display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); }
   .account-row { display: flex; align-items: center; gap: 14px; padding: 13px 14px; border-bottom: 1px solid var(--border-soft); }
@@ -405,6 +424,9 @@ const state = {
   accounts: [],
   accountsLoading: false,
   accountsError: null,
+  analytics: null, // AnalyticsSummaryOut | null
+  analyticsLoading: false,
+  analyticsError: null,
   youtubeConnectNotice: null, // { ok, text } | null — set from ?youtube_connect=... on boot (Phase 29a)
   twitterConnectNotice: null, // { ok, text } | null — set from ?twitter_connect=... on boot (Phase 29b)
   tiktokConnectNotice: null, // { ok, text } | null — set from ?tiktok_connect=... on boot (Phase 29c)
@@ -540,6 +562,22 @@ async function loadAccounts() {
   renderAll();
 }
 
+async function loadAnalytics() {
+  state.analyticsLoading = true;
+  state.analyticsError = null;
+  renderAll();
+  const params = new URLSearchParams();
+  if (state.activeClientId != null) params.set("client_id", state.activeClientId);
+  const qs = params.toString();
+  try {
+    state.analytics = await fetchJson("/api/analytics/summary" + (qs ? "?" + qs : ""));
+  } catch (e) {
+    state.analyticsError = e.message;
+  }
+  state.analyticsLoading = false;
+  renderAll();
+}
+
 async function loadComposerAccounts() {
   const c = state.composer;
   c.accountsLoading = true;
@@ -609,6 +647,7 @@ async function addClientWorkspace() {
     renderAll();
     if (state.screen === "calendar" || state.screen === "queue") loadJobs();
     if (state.screen === "accounts") loadAccounts();
+    if (state.screen === "analytics") loadAnalytics();
   } catch (e) {
     alert(`Could not create client workspace: ${e.message}`);
   }
@@ -620,6 +659,7 @@ function selectClient(id) {
   renderAll();
   if (state.screen === "calendar" || state.screen === "queue") loadJobs();
   if (state.screen === "accounts") loadAccounts();
+  if (state.screen === "analytics") loadAnalytics();
 }
 
 function toggleClientMenu() {
@@ -635,6 +675,7 @@ function goScreen(id) {
     loadJobs();
   }
   if (id === "accounts") loadAccounts();
+  if (id === "analytics") loadAnalytics();
   if (id === "admin" && isAdmin()) loadAdminData();
 }
 
@@ -1467,6 +1508,97 @@ function renderAdmin() {
 }
 
 // ---------------------------------------------------------------------
+// Render: Analytics (Phase 30) — all derived from GET /api/analytics/summary
+// ---------------------------------------------------------------------
+
+function renderAnalytics() {
+  if (state.analyticsError) {
+    return `<div class="error-state">Failed to load analytics: ${escapeHtml(state.analyticsError)}</div>`;
+  }
+  const a = state.analytics;
+  if (!a) {
+    return `<div class="empty-state">Loading…</div>`;
+  }
+
+  const rated = a.published + a.failed;
+  const successLabel = rated === 0 ? "—" : (a.success_rate * 100).toFixed(1) + "%";
+  const cards = [
+    { label: "Total jobs", value: a.total },
+    { label: "Published", value: a.published },
+    { label: "Failed", value: a.failed },
+    { label: "Success rate", value: successLabel },
+  ];
+  const cardsHtml = cards
+    .map(
+      (c) => `
+      <div class="stat-card">
+        <span class="reg-mark reg-tl"></span><span class="reg-mark reg-tr"></span>
+        <span class="reg-mark reg-bl"></span><span class="reg-mark reg-br"></span>
+        <div class="stat-label">${escapeHtml(c.label)}</div>
+        <div class="stat-value">${escapeHtml(c.value)}</div>
+      </div>`
+    )
+    .join("");
+
+  const series = a.time_series || [];
+  const maxCount = series.reduce((m, p) => Math.max(m, p.count), 0);
+  const barsHtml = series
+    .map((p) => {
+      const h = maxCount === 0 || p.count === 0 ? 0 : Math.max(4, Math.round((p.count / maxCount) * 120));
+      return `<div class="bar-col" title="${escapeHtml(p.date)}: ${p.count}"><div class="bar-fill ${
+        p.count === 0 ? "empty" : ""
+      }" style="height:${h}px;"></div></div>`;
+    })
+    .join("");
+  const axisHtml = series
+    .map((p, i) => `<div>${i % 5 === 0 ? escapeHtml(fmtDateLabel(p.date)) : ""}</div>`)
+    .join("");
+
+  const rows = a.platform_breakdown || [];
+  const rowsHtml =
+    rows.length === 0
+      ? `<tr><td colspan="5" class="empty-state">No jobs yet.</td></tr>`
+      : rows
+          .map(
+            (r) => `
+        <tr>
+          <td><div class="platform-box" title="${escapeHtml(platformLabel(r.platform))}">${escapeHtml(
+              platformLetter(r.platform)
+            )}</div></td>
+          <td>${r.total}</td>
+          <td>${r.published}</td>
+          <td>${r.failed}</td>
+          <td class="muted">${
+            r.last_activity
+              ? escapeHtml(fmtDateLabel(r.last_activity)) + " · " + escapeHtml(fmtTimeLabel(r.last_activity))
+              : "—"
+          }</td>
+        </tr>`
+          )
+          .join("");
+
+  return `
+    <div class="stat-cards">${cardsHtml}</div>
+
+    <div class="analytics-section">
+      <div class="analytics-section-label">Jobs created, last ${series.length} days</div>
+      <div class="bar-chart">${barsHtml}</div>
+      <div class="bar-axis">${axisHtml}</div>
+    </div>
+
+    <div class="analytics-section">
+      <div class="analytics-section-label">By platform</div>
+      <table class="data-table">
+        <thead>
+          <tr><th>Platform</th><th>Total</th><th>Published</th><th>Failed</th><th>Last activity</th></tr>
+        </thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+// ---------------------------------------------------------------------
 // Render: placeholder screens (not built yet)
 // ---------------------------------------------------------------------
 
@@ -1509,7 +1641,7 @@ function renderContent() {
       el.innerHTML = renderPlaceholder("Approvals");
       break;
     case "analytics":
-      el.innerHTML = renderPlaceholder("Analytics");
+      el.innerHTML = renderAnalytics();
       break;
     case "media":
       el.innerHTML = renderPlaceholder("Media library");
@@ -1777,6 +1909,7 @@ async function boot() {
       loadClients();
       loadJobs();
       if (state.screen === "accounts") loadAccounts();
+      if (state.screen === "analytics") loadAnalytics();
       return;
     }
   } catch (e) {

@@ -20,7 +20,7 @@ import os
 import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -420,6 +420,30 @@ class JobOut(BaseModel):
 class StatsOut(BaseModel):
     total: int
     by_status: dict[str, int]
+
+
+class AnalyticsTimePoint(BaseModel):
+    date: str  # YYYY-MM-DD, UTC
+    count: int
+
+
+class AnalyticsPlatformRow(BaseModel):
+    platform: str
+    total: int
+    published: int
+    failed: int
+    last_activity: str | None  # ISO8601 of the most recent updated_at for the platform
+
+
+class AnalyticsSummaryOut(BaseModel):
+    total: int
+    published: int
+    failed: int
+    success_rate: float  # published / (published + failed); 0.0 when neither exists
+    by_status: dict[str, int]
+    by_platform: dict[str, int]
+    time_series: list[AnalyticsTimePoint]  # one point per day, last 30 days, gaps filled with 0
+    platform_breakdown: list[AnalyticsPlatformRow]
 
 
 class RetryOut(BaseModel):
@@ -1230,6 +1254,116 @@ def stats(client_id: int | None = None, request: Request = None, db: Session = D
     counts = dict(query.group_by(Job.status).all())
     by_status = {s.value: counts.get(s, 0) for s in JobStatus}
     return StatsOut(total=sum(by_status.values()), by_status=by_status)
+
+
+# Width of the /api/analytics/summary time series, in days (inclusive of today).
+_ANALYTICS_TIME_SERIES_DAYS = 30
+
+
+def _isoformat_or_none(value) -> str | None:
+    """
+    func.max(Job.updated_at) comes back as a datetime under Postgres but can
+    surface as a raw ISO string under SQLite (the test DB) depending on how
+    SQLAlchemy carries the DateTime type through the aggregate — accept both.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
+
+
+@app.get("/api/analytics/summary", response_model=AnalyticsSummaryOut)
+def analytics_summary(client_id: int | None = None, request: Request = None, db: Session = Depends(get_db)):
+    """
+    Aggregate job metrics for the scheduler UI's Analytics screen (Phase 30).
+    Everything here is derived from the existing Job table — counts grouped
+    by platform and by status, a 30-day daily time series of jobs created,
+    and a per-platform published/failed/last-activity breakdown. No schema
+    changes, no new columns.
+
+    Scoped exactly like GET /api/stats: a client_user is silently confined
+    to their own client_id, and an explicit different client_id is a 403 —
+    this can never surface another client's numbers.
+    """
+    auth = _get_auth(request)
+    if auth.role == "client_user":
+        if client_id is not None and client_id != auth.client_id:
+            raise HTTPException(status_code=403, detail="Cannot access another client's analytics.")
+        client_id = auth.client_id
+
+    def _scoped(query):
+        return query.filter(Job.client_id == client_id) if client_id is not None else query
+
+    # Counts by status.
+    status_counts = dict(_scoped(db.query(Job.status, func.count(Job.id))).group_by(Job.status).all())
+    by_status = {s.value: status_counts.get(s, 0) for s in JobStatus}
+    total = sum(by_status.values())
+    published = by_status[JobStatus.PUBLISHED.value]
+    failed = by_status[JobStatus.FAILED.value]
+    denom = published + failed
+    success_rate = round(published / denom, 4) if denom else 0.0
+
+    # Counts by (platform, status) -> feeds both by_platform and the breakdown.
+    platform_status_rows = (
+        _scoped(db.query(Job.platform, Job.status, func.count(Job.id)))
+        .group_by(Job.platform, Job.status)
+        .all()
+    )
+    by_platform: dict[str, int] = {}
+    per_platform: dict[str, dict[str, int]] = {}
+    for platform, status, count in platform_status_rows:
+        by_platform[platform] = by_platform.get(platform, 0) + count
+        bucket = per_platform.setdefault(platform, {"published": 0, "failed": 0})
+        if status == JobStatus.PUBLISHED:
+            bucket["published"] += count
+        elif status == JobStatus.FAILED:
+            bucket["failed"] += count
+
+    last_activity = dict(
+        _scoped(db.query(Job.platform, func.max(Job.updated_at))).group_by(Job.platform).all()
+    )
+
+    platform_breakdown = [
+        AnalyticsPlatformRow(
+            platform=platform,
+            total=by_platform[platform],
+            published=per_platform.get(platform, {}).get("published", 0),
+            failed=per_platform.get(platform, {}).get("failed", 0),
+            last_activity=_isoformat_or_none(last_activity.get(platform)),
+        )
+        for platform in sorted(by_platform)
+    ]
+
+    # Daily time series: jobs created per UTC day, last _ANALYTICS_TIME_SERIES_DAYS
+    # days, with every day present (zero-filled) so the frontend chart has a
+    # fixed-width x-axis regardless of gaps.
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=_ANALYTICS_TIME_SERIES_DAYS - 1)
+    start_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc)
+    buckets = {
+        (start_date + timedelta(days=i)).isoformat(): 0
+        for i in range(_ANALYTICS_TIME_SERIES_DAYS)
+    }
+    created_rows = _scoped(db.query(Job.created_at)).filter(Job.created_at >= start_dt).all()
+    for (created,) in created_rows:
+        if created is None:
+            continue
+        key = created.date().isoformat()
+        if key in buckets:
+            buckets[key] += 1
+    time_series = [AnalyticsTimePoint(date=key, count=buckets[key]) for key in sorted(buckets)]
+
+    return AnalyticsSummaryOut(
+        total=total,
+        published=published,
+        failed=failed,
+        success_rate=success_rate,
+        by_status=by_status,
+        by_platform=by_platform,
+        time_series=time_series,
+        platform_breakdown=platform_breakdown,
+    )
 
 
 @app.post("/api/jobs/{job_id}/retry", response_model=RetryOut)

@@ -2338,6 +2338,90 @@ unit-tested without Redis or a worker running.
   (`https://<fly-app>.fly.dev/api/oauth/meta/callback` or a custom domain)
   added as an additional Valid OAuth Redirect URI once deployed.
 
+### Phase 30 (current)
+- **Analytics screen** — the fourth scheduler-UI screen wired to a real
+  backend (after Calendar/Queue in Phase 26 and the Connected-accounts
+  connect buttons in Phase 29x), replacing the "isn't built yet"
+  placeholder in `dashboard/static/index.html`. No schema changes — every
+  number is aggregated from the existing `Job` table.
+- **`GET /api/analytics/summary`** (`dashboard/api.py`) — one read-only
+  endpoint, scoped **exactly like `GET /api/stats`**: an admin (Basic-Auth
+  "ops" or an admin `User` session) sees everything or filters with an
+  optional `?client_id=`; a `client_user` is silently confined to their own
+  `client_id`, and an explicit *different* `client_id` is a `403` (same
+  `_get_auth` / role-check pattern every scoped route in Phase 28 uses —
+  the route takes `request: Request | None = None` so it stays directly
+  callable in tests, resolving to `ADMIN_AUTH` when there's no request).
+  Response (`AnalyticsSummaryOut`):
+  - `total`, `published`, `failed` — job counts (`published`/`failed` are
+    just the matching `by_status` entries, surfaced at top level for the
+    stat cards).
+  - `success_rate` — `published / (published + failed)` as a 0–1 float
+    rounded to 4 dp; **`0.0` when neither a published nor a failed job
+    exists** (no division, and the frontend renders `"—"` for that case
+    rather than a misleading `0.0%`).
+  - `by_status` — `{JobStatus value: count}` for **every** status
+    (zero-filled), identical shape/semantics to `/api/stats`.
+  - `by_platform` — `{platform: total count}`, only platforms that have at
+    least one job.
+  - `time_series` — exactly 30 entries, `{"date": "YYYY-MM-DD", "count":
+    n}`, ascending, **every day present (zero-filled)** so the frontend
+    bar chart has a fixed-width x-axis. Counts **jobs created per UTC day**
+    (`Job.created_at`) — there is no `published_at` column, and
+    `created_at` is the only stable per-job timestamp (`updated_at` moves
+    on any write), so "jobs created" is the honest metric rather than an
+    `updated_at`-based approximation of "published". The 30-day window is
+    `_ANALYTICS_TIME_SERIES_DAYS` (a module constant). Bucketing is done
+    in Python (pull `created_at` values `>= start_dt`, count into a dict)
+    rather than a SQL `date()`/`date_trunc` — portable across SQLite (test
+    DB) and Postgres without dialect branching, and the same
+    aware-UTC-vs-naive comparison the SQL-side `>= start_dt` filter relies
+    on is the one Phase 20's `dispatch_due_jobs` already established works
+    on both engines.
+  - `platform_breakdown` — a list (sorted by platform name) of
+    `{platform, total, published, failed, last_activity}` for the design's
+    per-platform table. `last_activity` is `max(Job.updated_at)` for that
+    platform as an ISO string (or `null`); `_isoformat_or_none` accepts
+    both a `datetime` (Postgres) and a raw ISO string (how SQLite can
+    surface `func.max` over a `DateTime` column) so the endpoint doesn't
+    break under the test DB.
+- **Frontend** (`dashboard/static/index.html`) — `renderAnalytics()`
+  replaces `renderPlaceholder("Analytics")` in the content router. Renders
+  against the Phase 26 design tokens (`design_handoff_scheduler/`'s
+  Analytics screen): 4 stat cards (Total jobs / Published / Failed /
+  Success rate) with the blueprint corner registration marks (reusing the
+  existing global `.reg-mark` classes), a zero-filled 30-bar chart of jobs
+  created per day (`.bar-chart` — flat accent bars, hairline baseline, a
+  sparse date axis labelling every 5th bar, `title` tooltip per bar), and
+  the by-platform breakdown `data-table`. New state (`analytics` /
+  `analyticsLoading` / `analyticsError`); `loadAnalytics()` fires on
+  entering the screen, on client switch (`selectClient` /
+  `addClientWorkspace`), and on `boot()` if the screen is restored to
+  `analytics` — same wiring pattern as `loadAccounts()`. It sends
+  `?client_id=` only when a workspace is active, matching `loadJobs()`.
+- **Tests** — `tests/test_dashboard_analytics.py` (FastAPI `TestClient`,
+  same reasoning as `tests/test_dashboard_auth.py`: the client-scoping
+  behavior is middleware + route-level, not a pure helper). Covers the
+  empty-data shape (30 zero days, ascending, correct first/last date;
+  every `by_status` key present and 0; `success_rate == 0.0`), grouping
+  (known per-platform/per-status fixture counts -> `by_platform`,
+  `by_status`, `platform_breakdown` sorted with correct
+  published/failed/`last_activity`, `success_rate` maths), the
+  no-terminal-jobs `success_rate == 0.0` branch, time-series bucketing
+  (today's bucket, a 5-day-old bucket, and a 45-day-old job correctly
+  excluded), and full client scoping (`client_user` sees only their own
+  numbers / `403` on another `client_id` / OK on their own; admin
+  unscoped sees all, admin `?client_id=` filters). Whole suite green
+  (`.venv/bin/python -m pytest -q` -> 360 passed).
+- **Not built** (out of scope, follow-up candidates): a real
+  published-per-day series (needs a `published_at` column or a status-
+  transition audit trail — neither exists), per-day breakdown by platform
+  or status (the series is a single total line), any date-range picker
+  (the window is a fixed 30 days), and the design's "scheduled this week"
+  / "connected accounts" stat-card variants (the four cards shipped are
+  the job-outcome ones; the others would just re-expose `/api/jobs` +
+  `/api/accounts` counts already visible elsewhere).
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)
