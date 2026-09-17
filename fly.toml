@@ -1,45 +1,42 @@
-# Fly.io deploy config — READY BUT UNUSED. The Fly.io account belongs to
-# the client; nothing here has been deployed. Replace the placeholder app
-# name once that account exists, then follow the checklist in README.md /
-# CLAUDE.md (Phase 9) to deploy.
+# fly.toml app configuration file generated for distribution-engine on 2026-09-15T13:03:29+03:00
 #
-# No secrets go in this file. REDIS_URL, DATABASE_URL, ALERT_WEBHOOK_URL,
-# X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET,
-# R2_* etc. must all be set with `fly secrets set NAME=value` against the
-# real app once it exists.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "distribution-engine"
-primary_region = "gru"
+app = 'distribution-engine'
+primary_region = 'gru'
 
 [build]
-
-# Single-machine mode, deliberate: the NEW JOB upload flow
-# (dashboard/api.py::create_job) writes files to local disk under uploads/,
-# so whichever process later reads that path (the worker) must share a
-# filesystem with whichever process wrote it (the api process) — meaning
-# they must run on the same machine, not as separate Fly processes/machines.
-# scripts/start_all.sh starts the worker and beat in the background and
-# execs uvicorn in the foreground. Split this back into separate
-# worker/beat/api [processes] entries once R2 storage (see CLAUDE.md
-# Phase 3) is wired into the upload flow and uploads no longer live on
-# local disk.
 [processes]
-app = "scripts/start_all.sh"
+  app = 'scripts/start_all.sh'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[services]]
-processes = ["app"]
-internal_port = 8000
-protocol = "tcp"
+  protocol = 'tcp'
+  internal_port = 8000
+  processes = ['app']
 
   [[services.ports]]
-  handlers = ["http"]
-  port = 80
+    port = 80
+    handlers = ['http']
 
   [[services.ports]]
-  handlers = ["tls", "http"]
-  port = 443
+    port = 443
+    handlers = ['tls', 'http']
 
   [[services.http_checks]]
-  path = "/health"
-  interval = "30s"
-  timeout = "5s"
+    interval = '30s'
+    timeout = '5s'
+    path = '/health'
+
+[[vm]]
+  memory = '1gb'
+  cpus = 1
+  memory_mb = 1024

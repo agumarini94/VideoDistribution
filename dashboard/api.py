@@ -51,11 +51,23 @@ from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
 from app.tasks import handle_tiktok_webhook_event, publish_job
 from app.webhooks import tiktok as tiktok_webhooks
+from public_pages import public_router
 from scripts.add_account import upsert_account
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Distribution Engine Dashboard")
+
+# Arscor's public marketing site ("/", "/terms", "/privacy") — see
+# public_pages.py. Registered early (order doesn't actually matter for these
+# three paths specifically, since nothing else in this file claims them, but
+# doing it here keeps every route the app exposes declared before the
+# catch-all StaticFiles mount at the bottom, which is the rule that *does*
+# matter — see that mount's comment). These are unauthenticated by
+# construction: they're not under /api/, /docs/redoc/openapi, or the
+# operator dashboard, so _is_protected's default "not protected" applies —
+# no entry needed in _NO_AUTH_PATHS/_PUBLIC_API_PATHS.
+app.include_router(public_router)
 
 # TIKTOK_WEBHOOK_SKIP_SIGNATURE=1 is a local-curl-testing-only escape hatch
 # (see app/webhooks/tiktok.py) — it must never be set in production, so
@@ -786,35 +798,35 @@ def youtube_oauth_callback(
     code_challenge.
     """
     if error:
-        return RedirectResponse(f"/?screen=accounts&youtube_connect=error&reason={quote(error)}")
+        return RedirectResponse(f"/dashboard/?screen=accounts&youtube_connect=error&reason={quote(error)}")
     if not code or not state:
-        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=missing_code_or_state")
+        return RedirectResponse("/dashboard/?screen=accounts&youtube_connect=error&reason=missing_code_or_state")
 
     state_data = verify_oauth_state_token(state)
     if state_data is None:
-        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=invalid_or_expired_state")
+        return RedirectResponse("/dashboard/?screen=accounts&youtube_connect=error&reason=invalid_or_expired_state")
 
     code_verifier = state_data.get("code_verifier")
     if not code_verifier:
-        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=missing_pkce_verifier")
+        return RedirectResponse("/dashboard/?screen=accounts&youtube_connect=error&reason=missing_pkce_verifier")
 
     client_id = state_data.get("client_id")
     client = db.get(Client, client_id) if client_id is not None else None
     if client is None:
-        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=unknown_client")
+        return RedirectResponse("/dashboard/?screen=accounts&youtube_connect=error&reason=unknown_client")
 
     redirect_uri = str(request.url_for("youtube_oauth_callback"))
     try:
         credentials = youtube_publisher.exchange_code_for_credentials(code, redirect_uri, code_verifier)
     except PermanentError as exc:
         logger.warning("YouTube OAuth code exchange failed for client %s: %s", client_id, exc)
-        return RedirectResponse("/?screen=accounts&youtube_connect=error&reason=exchange_failed")
+        return RedirectResponse("/dashboard/?screen=accounts&youtube_connect=error&reason=exchange_failed")
 
     account, _action = upsert_account(db, "youtube", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
     db.commit()
 
-    return RedirectResponse("/?screen=accounts&youtube_connect=success")
+    return RedirectResponse("/dashboard/?screen=accounts&youtube_connect=success")
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -905,35 +917,35 @@ def twitter_oauth_callback(
     belongs to the same flow that sent the code_challenge.
     """
     if error:
-        return RedirectResponse(f"/?screen=accounts&twitter_connect=error&reason={quote(error)}")
+        return RedirectResponse(f"/dashboard/?screen=accounts&twitter_connect=error&reason={quote(error)}")
     if not code or not state:
-        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=missing_code_or_state")
+        return RedirectResponse("/dashboard/?screen=accounts&twitter_connect=error&reason=missing_code_or_state")
 
     state_data = verify_oauth_state_token(state)
     if state_data is None:
-        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=invalid_or_expired_state")
+        return RedirectResponse("/dashboard/?screen=accounts&twitter_connect=error&reason=invalid_or_expired_state")
 
     code_verifier = state_data.get("code_verifier")
     if not code_verifier:
-        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=missing_pkce_verifier")
+        return RedirectResponse("/dashboard/?screen=accounts&twitter_connect=error&reason=missing_pkce_verifier")
 
     client_id = state_data.get("client_id")
     client = db.get(Client, client_id) if client_id is not None else None
     if client is None:
-        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=unknown_client")
+        return RedirectResponse("/dashboard/?screen=accounts&twitter_connect=error&reason=unknown_client")
 
     redirect_uri = str(request.url_for("twitter_oauth_callback"))
     try:
         credentials = twitter_publisher.exchange_code_for_credentials(code, redirect_uri, code_verifier)
     except PermanentError as exc:
         logger.warning("X OAuth code exchange failed for client %s: %s", client_id, exc)
-        return RedirectResponse("/?screen=accounts&twitter_connect=error&reason=exchange_failed")
+        return RedirectResponse("/dashboard/?screen=accounts&twitter_connect=error&reason=exchange_failed")
 
     account, _action = upsert_account(db, "twitter", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
     db.commit()
 
-    return RedirectResponse("/?screen=accounts&twitter_connect=success")
+    return RedirectResponse("/dashboard/?screen=accounts&twitter_connect=success")
 
 
 def _generate_tiktok_pkce_pair() -> tuple[str, str]:
@@ -995,35 +1007,35 @@ def tiktok_oauth_callback(
     this exchange belongs to the same flow that sent the code_challenge.
     """
     if error:
-        return RedirectResponse(f"/?screen=accounts&tiktok_connect=error&reason={quote(error)}")
+        return RedirectResponse(f"/dashboard/?screen=accounts&tiktok_connect=error&reason={quote(error)}")
     if not code or not state:
-        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=missing_code_or_state")
+        return RedirectResponse("/dashboard/?screen=accounts&tiktok_connect=error&reason=missing_code_or_state")
 
     state_data = verify_oauth_state_token(state)
     if state_data is None:
-        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=invalid_or_expired_state")
+        return RedirectResponse("/dashboard/?screen=accounts&tiktok_connect=error&reason=invalid_or_expired_state")
 
     code_verifier = state_data.get("code_verifier")
     if not code_verifier:
-        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=missing_pkce_verifier")
+        return RedirectResponse("/dashboard/?screen=accounts&tiktok_connect=error&reason=missing_pkce_verifier")
 
     client_id = state_data.get("client_id")
     client = db.get(Client, client_id) if client_id is not None else None
     if client is None:
-        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=unknown_client")
+        return RedirectResponse("/dashboard/?screen=accounts&tiktok_connect=error&reason=unknown_client")
 
     redirect_uri = str(request.url_for("tiktok_oauth_callback"))
     try:
         credentials = tiktok_publisher.exchange_code_for_credentials(code, redirect_uri, code_verifier)
     except PermanentError as exc:
         logger.warning("TikTok OAuth code exchange failed for client %s: %s", client_id, exc)
-        return RedirectResponse("/?screen=accounts&tiktok_connect=error&reason=exchange_failed")
+        return RedirectResponse("/dashboard/?screen=accounts&tiktok_connect=error&reason=exchange_failed")
 
     account, _action = upsert_account(db, "tiktok", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
     db.commit()
 
-    return RedirectResponse("/?screen=accounts&tiktok_connect=success")
+    return RedirectResponse("/dashboard/?screen=accounts&tiktok_connect=success")
 
 
 @app.get("/api/oauth/meta/start")
@@ -1100,18 +1112,18 @@ def meta_oauth_callback(
     the Beat-task's benefit the way refresh_stored_credentials does.
     """
     if error:
-        return RedirectResponse(f"/?screen=accounts&meta_connect=error&reason={quote(error)}")
+        return RedirectResponse(f"/dashboard/?screen=accounts&meta_connect=error&reason={quote(error)}")
     if not code or not state:
-        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=missing_code_or_state")
+        return RedirectResponse("/dashboard/?screen=accounts&meta_connect=error&reason=missing_code_or_state")
 
     state_data = verify_oauth_state_token(state)
     if state_data is None:
-        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=invalid_or_expired_state")
+        return RedirectResponse("/dashboard/?screen=accounts&meta_connect=error&reason=invalid_or_expired_state")
 
     client_id = state_data.get("client_id")
     client = db.get(Client, client_id) if client_id is not None else None
     if client is None:
-        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=unknown_client")
+        return RedirectResponse("/dashboard/?screen=accounts&meta_connect=error&reason=unknown_client")
 
     redirect_uri = str(request.url_for("meta_oauth_callback"))
     try:
@@ -1157,14 +1169,14 @@ def meta_oauth_callback(
     except PublishError as exc:
         db.rollback()
         logger.warning("Meta OAuth code exchange failed for client %s: %s", client_id, exc)
-        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=exchange_failed")
+        return RedirectResponse("/dashboard/?screen=accounts&meta_connect=error&reason=exchange_failed")
 
     if facebook_count == 0:
         db.rollback()
-        return RedirectResponse("/?screen=accounts&meta_connect=error&reason=no_pages")
+        return RedirectResponse("/dashboard/?screen=accounts&meta_connect=error&reason=no_pages")
 
     db.commit()
-    return RedirectResponse(f"/?screen=accounts&meta_connect=success&facebook={facebook_count}&instagram={instagram_count}")
+    return RedirectResponse(f"/dashboard/?screen=accounts&meta_connect=success&facebook={facebook_count}&instagram={instagram_count}")
 
 
 @app.get("/api/admin/users/pending", response_model=list[PendingUserOut])
@@ -1856,7 +1868,19 @@ async def tiktok_webhook(request: Request, db: Session = Depends(get_db)):
     return {"status": "received", "webhook_event_id": event.id}
 
 
-# Mounted last so it never shadows the /api/* routes above. html=True serves
-# index.html for "/" (and for unmatched paths), so this stays a single-page app.
+# Mounted last so it never shadows the /api/* routes (or public_router's "/",
+# "/terms", "/privacy") above. html=True serves index.html for "/dashboard"
+# (and for unmatched sub-paths), so this stays a single-page app.
+#
+# Moved from "/" to "/dashboard" when Arscor's public marketing site
+# (public_router above) took over the root — the operator/client SPA now
+# lives at "/dashboard" instead of "/". This only changes what's served at
+# the root path itself: every route the SPA calls is an absolute "/api/..."
+# path (see dashboard/static/index.html), so nothing inside the SPA needed
+# to change for it to keep working from its new mount point. The one thing
+# that DID need to change is server-side: the OAuth callback routes above
+# (youtube/twitter/tiktok/meta) redirect the browser back into the SPA with
+# "/dashboard/?screen=accounts&..." rather than "/?screen=accounts&...",
+# since "/" is no longer the SPA.
 _STATIC_DIR = Path(__file__).parent / "static"
-app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static")
+app.mount("/dashboard", StaticFiles(directory=_STATIC_DIR, html=True), name="static")

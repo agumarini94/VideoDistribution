@@ -20,6 +20,24 @@
     --muted: rgba(29, 31, 32, 0.55);
   }
 
+  /* Dark variant — same custom properties, remapped. The steel-blue accent
+     is lightened just enough to hold contrast against the dark ground while
+     staying the same hue; --accent-dark/--accent-deep (used as text colours
+     on light surfaces in the light theme) become light blues here so they
+     stay legible on --bg. Toggled via data-theme="dark" on <html>. */
+  :root[data-theme="dark"] {
+    --bg: #1b1d1e;
+    --surface: #26292b;
+    --ink: #ececed;
+    --accent: #6f97bf;
+    --accent-hover: #7ea4c8;
+    --accent-dark: #a9c4de;
+    --accent-deep: #c6dbec;
+    --border: rgba(236, 236, 237, 0.20);
+    --border-soft: rgba(236, 236, 237, 0.10);
+    --muted: rgba(236, 236, 237, 0.55);
+  }
+
   * { box-sizing: border-box; }
 
   body {
@@ -128,6 +146,13 @@
   }
   .btn-secondary:hover { background: var(--border-soft); }
   .btn-secondary svg { width: 13px; height: 13px; }
+
+  .theme-toggle {
+    flex: none; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); background: var(--bg); color: var(--ink); cursor: pointer;
+  }
+  .theme-toggle:hover { background: var(--border-soft); }
+  .theme-toggle svg { width: 15px; height: 15px; }
 
   .content { padding: 24px; flex: 1; overflow: auto; }
 
@@ -352,6 +377,7 @@
     <div class="topbar">
       <div class="client-switch" id="client-switch"></div>
       <div class="screen-title" id="screen-title"></div>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode"></button>
       <button class="btn-primary" id="new-post-btn">
         <i data-lucide="plus"></i> New post
       </button>
@@ -440,6 +466,8 @@ const WEEKDAY_LABELS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const state = {
   auth: null, // null while boot() hasn't resolved yet; else { authenticated, role, client_id, client_name, email }
   authForm: { mode: "login", error: null, success: null, submitting: false },
+  theme: "light", // "light" | "dark" — in-memory only (no localStorage, per project conventions); resets on hard reload
+
   admin: { pendingUsers: [], approvedUsers: [], clientsForAssign: [], loading: false, error: null },
   screen: "calendar",
   calendarView: "month",
@@ -874,6 +902,32 @@ function renderClientSwitch() {
 function renderTopbar() {
   document.getElementById("screen-title").textContent = SCREEN_TITLES[state.screen] || "";
   renderClientSwitch();
+  renderThemeToggle();
+}
+
+// ---------------------------------------------------------------------
+// Theme toggle (light / dark). In-memory only — no localStorage (see the
+// browser-storage note in this project's conventions); the choice resets
+// on a hard reload. data-theme lives on <html> so it covers both the app
+// shell and the auth screen.
+// ---------------------------------------------------------------------
+
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", state.theme);
+}
+
+function toggleTheme() {
+  state.theme = state.theme === "dark" ? "light" : "dark";
+  applyTheme();
+  renderAll();
+}
+
+function renderThemeToggle() {
+  const btn = document.getElementById("theme-toggle");
+  if (!btn) return;
+  const dark = state.theme === "dark";
+  btn.innerHTML = `<i data-lucide="${dark ? "moon" : "sun"}"></i>`;
+  btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
 }
 
 // ---------------------------------------------------------------------
@@ -2021,6 +2075,23 @@ function consumeOauthRedirectParams() {
   }
 }
 
+// Reads ?auth=signup, left by the public marketing site's (public_pages.py)
+// "Sign up" buttons, which all point at "/dashboard?auth=signup" rather than
+// a separate backend page — this SPA's own Login/Register screens (Phase 28)
+// are the only ones that exist. Pre-selects the Register form so a "Sign up"
+// click doesn't land an anonymous visitor on the Login form by default
+// (requiring an extra "Request access" click to get where they meant to go).
+// Only called from boot()'s anonymous branch, so this never fires once a
+// session exists. Same read-then-strip-via-replaceState pattern as
+// consumeOauthRedirectParams above.
+function consumeAuthModeParam() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("auth") === "signup") {
+    state.authForm = { mode: "register", error: null, success: null, submitting: false };
+    window.history.replaceState({}, "", window.location.pathname);
+  }
+}
+
 async function boot() {
   try {
     const me = await fetchJson("/api/auth/me");
@@ -2040,11 +2111,13 @@ async function boot() {
     // Falls through to the anonymous/login-screen path below.
   }
   state.auth = { authenticated: false };
+  consumeAuthModeParam();
   showAuth();
   renderAuthScreen();
 }
 
 document.getElementById("new-post-btn").addEventListener("click", openComposer);
+document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
 
 // Close the client dropdown when clicking outside it.
 document.addEventListener("click", (e) => {
@@ -2055,6 +2128,7 @@ document.addEventListener("click", (e) => {
   }
 });
 
+applyTheme();
 boot();
 </script>
 </body>

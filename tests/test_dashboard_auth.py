@@ -63,7 +63,10 @@ def _login(client, email, password):
 
 class TestPublicPaths:
     def test_static_shell_is_public(self, client):
-        resp = client.get("/")
+        # The operator/client SPA moved from "/" to "/dashboard" when
+        # Arscor's public marketing site (public_pages.py) took over the
+        # root — see tests/test_public_pages.py for "/"/"/terms"/"/privacy".
+        resp = client.get("/dashboard")
         assert resp.status_code == 200
 
     def test_me_is_public_and_reports_anonymous(self, client):
