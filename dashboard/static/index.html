@@ -676,7 +676,17 @@ async function loadComposerAccounts() {
     c.accounts = [];
     c.accountsError = e.message;
   }
-  if (!c.accounts.some((a) => String(a.id) === c.accountId)) c.accountId = "";
+  if (!c.accounts.some((a) => String(a.id) === c.accountId)) {
+    // Default to the first available account for platforms with no single-account
+    // fallback (tiktok/facebook/instagram) — their <select> has no "no account"
+    // option, so with exactly one account the browser auto-selects it visually
+    // even though a "change" event never fires to update this state. Without
+    // this, submission reads an empty accountId and blocks with a misleading
+    // "none selected" error despite the UI showing an account chosen.
+    c.accountId = ACCOUNT_REQUIRED_PLATFORMS.has(c.platform) && c.accounts.length > 0
+      ? String(c.accounts[0].id)
+      : "";
+  }
   c.accountsLoading = false;
   renderAll();
 }
