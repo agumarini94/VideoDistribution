@@ -10,6 +10,7 @@ never the business logic.
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -19,6 +20,43 @@ from dotenv import load_dotenv
 # (Fly.io) the real environment variables are set directly and this call
 # is a no-op if no .env file exists.
 load_dotenv()
+
+
+# --- Materialize YouTube OAuth client-secret files from env (Fly.io) -------
+#
+# app/publishers/youtube.py's CLIENT_SECRET_PATH / WEB_CLIENT_SECRET_PATH
+# (client_secret.json / client_secret_web.json at the project root) are
+# gitignored and .dockerignore'd — they never ship in the image, so on Fly
+# they don't exist on disk. Locally, a developer places them there by hand
+# (see the Phase 2b/29a setup notes) and the env vars below are unset, so
+# this is a no-op in local dev: an existing file always wins over the env
+# var, and an empty/unset env var writes nothing.
+#
+# This lives here, not in scripts/start_all.sh, so it applies no matter
+# which process/entrypoint imports app.config first (worker, beat, or the
+# dashboard api — every one of them imports this module, directly or
+# transitively, before touching app.publishers.youtube), rather than only
+# covering the single-machine start_all.sh path.
+#
+# Path mirrors app/publishers/youtube.py::PROJECT_ROOT (computed
+# independently here, same as that module does, to avoid this config module
+# importing a publisher).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _materialize_client_secret_from_env(path: Path, env_var: str) -> None:
+    if path.exists():
+        return
+    content = os.getenv(env_var, "").strip()
+    if not content:
+        return
+    path.write_text(content)
+
+
+_materialize_client_secret_from_env(_PROJECT_ROOT / "client_secret.json", "GOOGLE_CLIENT_SECRET_JSON")
+_materialize_client_secret_from_env(
+    _PROJECT_ROOT / "client_secret_web.json", "GOOGLE_CLIENT_SECRET_WEB_JSON"
+)
 
 
 @dataclass(frozen=True)
