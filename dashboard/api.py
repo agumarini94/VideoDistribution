@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app import storage
 from app.auth import (
@@ -350,6 +351,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Fly.io terminates TLS at its edge and forwards every request to this
+# process over Fly's internal private network as plain http, adding
+# X-Forwarded-Proto: https on the way in. Without this middleware,
+# scope["scheme"] stays "http" here, so every request.url_for(...) call
+# below (the redirect_uri built by each OAuth start route -
+# youtube/twitter/tiktok/meta) produces an http:// URL, which fails the
+# provider's exact-match redirect_uri check once deployed even though
+# https://.../callback is what's actually registered in each developer
+# portal. ProxyHeadersMiddleware ships with uvicorn[standard] (already a
+# dependency, see requirements.txt) and rewrites scope["scheme"] (and
+# scope["client"]) from the X-Forwarded-Proto/X-Forwarded-For headers.
+# trusted_hosts="*" because the only thing that can ever open a connection
+# to this process is Fly's own edge proxy on its private network (fly.toml
+# exposes no other path in) - there's no untrusted direct client that could
+# spoof these headers here, unlike a process reachable straight from the
+# public internet. Added last (after CORSMiddleware above) so it's the
+# outermost layer, per this project's "last-added-is-outermost" middleware
+# ordering rule (see enforce_auth's comment) - the scheme must be corrected
+# before anything else (auth, CORS, route handlers) reads it.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 
 def get_db():
