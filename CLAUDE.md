@@ -2504,6 +2504,74 @@ unit-tested without Redis or a worker running.
   of "my own workspace" for a `client_user` (this screen is purely the
   agency-admin roster).
 
+### Phase 33 (current)
+- **Self-service "Disconnect" on Connected Accounts** — the counterpart to
+  Phase 29a-d's "Connect ..." buttons: a `client_user` can now disconnect
+  one of their own connected accounts from the dashboard, no CLI/DB access
+  needed.
+- **`POST /api/accounts/{account_id}/disconnect`** (`dashboard/api.py`) —
+  `client_user`-only (`403` for the admin path, Basic-Auth or an admin
+  `User` session alike — an admin isn't scoped to any one `Client`, same
+  posture as every `/api/oauth/*/start` route), and scoped to Accounts
+  belonging to the caller's own `client_id` (`403` on someone else's or an
+  unscoped `client_id=None` row, `404` on an unknown id). Anonymous gets
+  the usual `401` from `enforce_auth` — this route isn't in
+  `_PUBLIC_API_PATHS`.
+  - **Deactivates and clears credentials, never deletes the row** — same
+    "reversible, no cascade" posture as `deactivate_client` (Phase 32):
+    sets `is_active=False` and `credentials={}` (an empty dict, not
+    `None` — `Account.credentials` is a non-nullable JSON column), commits,
+    and returns the updated `AccountOut` (which, as before, never
+    serializes `credentials` to the browser regardless).
+  - **Existing `Job` rows are untouched** — nothing here touches the `Job`
+    table, so `Job.account_id`/`status`/`payload` history survives a
+    disconnect exactly as-is. A job still queued against a disconnected
+    Account fails clearly instead of silently using stale/cleared
+    credentials, since `_resolve_account_credentials` (`app/tasks.py`,
+    Phase 6) already raises `PermanentError` for `is_active=False`.
+  - **Reconnecting rotates the same row in place** — no new mechanism
+    needed: the Phase 29a-d OAuth callback routes already upsert by
+    platform+name (`scripts/add_account.py::upsert_account`), and the
+    self-service naming convention
+    (`"<Client name> (self-service)"`, or
+    `"<Client name> - <Page name> (self-service)"` for Meta) means clicking
+    "Connect ..." again after a disconnect matches this exact row,
+    overwrites `credentials`, and flips `is_active` back to `True` — the
+    same account, not a duplicate.
+- **Frontend** (`dashboard/static/index.html`): a "Disconnect" button next
+  to each **active** connected account in `renderAccounts()`'s account-row
+  list, shown only for a `client_user` session (reusing the same
+  `canConnectPlatforms` check the "Connect ..." buttons already use) — an
+  already-inactive account has nothing left to disconnect, so the button
+  is omitted for those rows (its "Inactive" status pill already reflects
+  the disconnected state). `disconnectAccount(id)` prompts
+  `window.confirm(...)` before firing `POST /api/accounts/{id}/disconnect`,
+  then reloads the list via `loadAccounts()`, mirroring `setClientActive`'s
+  confirm-then-refresh shape (Phase 32). **No change was needed to make
+  "Connect ..." available again after a disconnect** — those four buttons
+  in `renderAccounts()` are unconditional (not hidden based on whether an
+  account already exists for that platform), so they're already always
+  clickable; disconnecting just means the next click reconnects instead of
+  connecting fresh.
+- **Tests** — `tests/test_dashboard_accounts_disconnect.py` (FastAPI
+  `TestClient`, same reasoning as `tests/test_dashboard_clients.py`:
+  ownership scoping is middleware + route-level behavior). Covers: the
+  happy path (`is_active` flips, `credentials` cleared to `{}` on the DB
+  row, the response never carries a `credentials` field), ownership
+  enforcement (a `client_user` `403`s on another client's account and on
+  an unscoped one, an admin — Basic-Auth or an admin `User` session —
+  `403`s outright, anonymous `401`s, an unknown id `404`s), reconnecting
+  after disconnect upserting the same `Account` row in place via
+  `scripts.add_account.upsert_account` (not a duplicate), and an existing
+  `Job` keeping its `account_id`/`status`/`payload` unchanged after its
+  Account is disconnected. Whole suite green
+  (`.venv/bin/python -m pytest -q` -> 387 passed).
+- **Not built** (out of scope, follow-up candidate): letting an admin
+  disconnect an account on a client's behalf (today only the owning
+  `client_user` can) — would need its own `_require_admin`-style route or
+  parameter, not added here since the phase brief scoped this to
+  self-service only.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

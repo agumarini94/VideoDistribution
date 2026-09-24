@@ -603,6 +603,28 @@ async function setClientActive(id, active) {
   }
 }
 
+async function disconnectAccount(id) {
+  // client_user-only (Phase 33), scoped server-side to the caller's own
+  // accounts — see dashboard/api.py::disconnect_account. Deactivates and
+  // clears stored credentials rather than deleting the row; the matching
+  // "Connect ..." button above stays available to reconnect afterward
+  // (it always renders regardless of existing accounts — see connectHtml
+  // in renderAccounts — and reconnecting upserts this same row in place).
+  if (
+    !window.confirm(
+      "Disconnect this account? It will stop being usable for new posts until reconnected."
+    )
+  ) {
+    return;
+  }
+  try {
+    await fetchJson(`/api/accounts/${id}/disconnect`, { method: "POST" });
+    await loadAccounts();
+  } catch (e) {
+    alert(`Could not disconnect account: ${e.message}`);
+  }
+}
+
 async function logout() {
   try {
     await fetchJson("/api/auth/logout", { method: "POST" });
@@ -1174,6 +1196,11 @@ function renderAccounts() {
               <div class="account-sub">${escapeHtml(a.client_name || "No client workspace")}</div>
             </div>
             <div class="status-pill" style="background:${a.is_active ? "#eef6ff" : "#f5e7e7"};color:${a.is_active ? "#2c455d" : "#7a3030"};">${a.is_active ? "Active" : "Inactive"}</div>
+            ${
+              canConnectPlatforms && a.is_active
+                ? `<button type="button" class="btn-secondary" data-disconnect-account="${a.id}" style="color:#7a3030;margin-left:10px;">Disconnect</button>`
+                : ""
+            }
           </div>`
           )
           .join("")}
@@ -1810,6 +1837,9 @@ function renderContent() {
       break;
     case "accounts":
       el.innerHTML = renderAccounts();
+      el.querySelectorAll("[data-disconnect-account]").forEach((btn) => {
+        btn.addEventListener("click", () => disconnectAccount(Number(btn.getAttribute("data-disconnect-account"))));
+      });
       break;
     case "approvals":
       el.innerHTML = renderPlaceholder("Approvals");

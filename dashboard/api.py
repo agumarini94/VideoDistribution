@@ -1488,6 +1488,54 @@ def list_accounts(
     return [AccountOut.from_account(account, client_names.get(account.client_id)) for account in accounts]
 
 
+@app.post("/api/accounts/{account_id}/disconnect", response_model=AccountOut)
+def disconnect_account(account_id: int, request: Request = None, db: Session = Depends(get_db)):
+    """
+    Lets a client_user disconnect one of their own connected accounts
+    (Phase 33) — the self-service counterpart to the /api/oauth/*/start
+    "Connect ..." buttons (Phase 29a-d). client_user-only, and scoped to
+    Accounts belonging to the caller's own client_id (403 on someone
+    else's) — not offered to the admin path (Basic-Auth or an admin User
+    session) at all, since an admin isn't scoped to any one Client, same
+    posture as youtube_oauth_start/twitter_oauth_start/etc.
+
+    Deactivates (is_active=False) and clears the stored credentials
+    (tokens) rather than deleting the row:
+    - Existing Jobs that reference this Account (Job.account_id) keep
+      their full history untouched — nothing here touches the Job table,
+      same "never cascade-delete" posture as deactivate_client (Phase 32).
+    - _resolve_account_credentials (app/tasks.py) already raises
+      PermanentError for an inactive Account, so any job still queued
+      against this one fails clearly instead of using stale/cleared
+      credentials.
+    - Reconnecting via the matching "Connect ..." button upserts by
+      platform+name (scripts/add_account.py::upsert_account) — the
+      self-service Account naming convention
+      ("<Client name> (self-service)", or
+      "<Client name> - <Page name> (self-service)" for Meta, Phase
+      29a-d) means reconnecting the same platform/page matches this exact
+      row and overwrites credentials + flips is_active back to True in
+      place, rather than creating a duplicate row.
+    """
+    auth = _get_auth(request)
+    if auth.role != "client_user":
+        raise HTTPException(status_code=403, detail="Only a client account can disconnect an account.")
+
+    account = db.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+    if account.client_id != auth.client_id:
+        raise HTTPException(status_code=403, detail="Cannot disconnect another client's account.")
+
+    account.is_active = False
+    account.credentials = {}
+    db.commit()
+    db.refresh(account)
+
+    client_name = db.get(Client, account.client_id).name if account.client_id is not None else None
+    return AccountOut.from_account(account, client_name)
+
+
 def _aggregate_client_counts(db: Session) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
     """
     (account_counts, user_counts, job_counts) keyed by client_id, each from
