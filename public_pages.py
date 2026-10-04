@@ -11,16 +11,34 @@
 # Los botones "Log in" / "Sign up" apuntan a /login y /signup:
 # cambialos abajo (BASE_HEAD -> nav) si tus rutas se llaman distinto.
 
+from pathlib import Path
+
 from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 public_router = APIRouter()
+
+# App icon: the same 1024x1024 PNG uploaded to the TikTok developer portal
+# (red "A" on a violet background), served from the project root so it's
+# reachable at a stable, public URL — used both as the site favicon
+# (BASE_HEAD below) and inline next to the "arscor" wordmark in the nav.
+# Not under the /api/ or /docs prefixes and not the dashboard SPA mount, so
+# dashboard/api.py's enforce_auth leaves it unprotected by default (same
+# reasoning as "/", "/terms", "/privacy" below) — no auth-path entry needed.
+_ICON_PATH = Path(__file__).parent / "app_icon.png"
+
+
+@public_router.get("/app_icon.png", include_in_schema=False)
+def app_icon() -> FileResponse:
+    return FileResponse(_ICON_PATH, media_type="image/png")
 
 # ---------------------------------------------------------------- estilos ---
 
 BASE_HEAD = """
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/app_icon.png">
+<link rel="apple-touch-icon" href="/app_icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
@@ -45,8 +63,9 @@ BASE_HEAD = """
   /* ------- nav ------- */
   header{border-bottom:3px solid var(--ink);background:var(--paper)}
   .nav{display:flex;align-items:center;justify-content:space-between;padding:18px 0}
-  .logo{font-family:"IBM Plex Mono",monospace;font-weight:700;font-size:1.35rem;
-        text-decoration:none;letter-spacing:-0.5px}
+  .logo{display:flex;align-items:center;gap:9px;font-family:"IBM Plex Mono",monospace;
+        font-weight:700;font-size:1.35rem;text-decoration:none;letter-spacing:-0.5px}
+  .logo img{width:28px;height:28px;border:2px solid var(--ink);display:block}
   .logo span{color:var(--violet)}
   .nav-actions{display:flex;gap:12px}
   .btn{display:inline-block;font-family:"IBM Plex Mono",monospace;font-weight:700;
@@ -91,7 +110,7 @@ def _page(title: str, body: str) -> str:
 <body>
 <header>
   <div class="wrap nav">
-    <a class="logo" href="/">arscor<span>.</span></a>
+    <a class="logo" href="/"><img src="/app_icon.png" alt="Arscor" width="28" height="28">arscor<span>.</span></a>
     <div class="nav-actions">
       <a class="btn" href="/dashboard">Log in</a>
       <a class="btn btn-primary" href="/dashboard?auth=signup">Sign up</a>
@@ -344,3 +363,7 @@ def terms() -> str:
 @public_router.get("/privacy", response_class=HTMLResponse, include_in_schema=False)
 def privacy() -> str:
     return _page("Privacy Policy — Arscor", PRIVACY_BODY)
+
+@public_router.get("/tiktokBTLx2SuOCsPrban8ikaPbH6ZA552iQ4k.txt", response_class=PlainTextResponse, include_in_schema=False)
+def tiktok_site_verification() -> str:
+    return "tiktok-developers-site-verification=BTLx2SuOCsPrban8ikaPbH6ZA552iQ4k"
