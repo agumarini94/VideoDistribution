@@ -357,3 +357,83 @@ class TestCreateJobR2Integration:
 
         assert excinfo.value.status_code == 400
         assert dispatched == []
+
+    def _make_threads_account(self, db_session):
+        account = Account(platform="threads", name="Main account", credentials={}, is_active=True)
+        db_session.add(account)
+        db_session.commit()
+        db_session.refresh(account)
+        return account
+
+    def test_threads_text_only_needs_no_r2(self, db_session, dispatched, monkeypatch):
+        def _should_not_be_called(path):
+            raise AssertionError("R2 staging should not be attempted for a text-only Threads post")
+
+        monkeypatch.setattr(dashboard_api.storage, "upload_file", _should_not_be_called)
+        account = self._make_threads_account(db_session)
+
+        result = _run_create_job(db_session, platform="threads", account_id=account.id, text="hello world")
+
+        job = db_session.get(Job, result.id)
+        assert job.payload == {"text": "hello world"}
+        assert dispatched == [job.id]
+
+    def test_threads_media_attaches_media_public_url_no_local_path(self, db_session, dispatched, monkeypatch):
+        monkeypatch.setattr(
+            dashboard_api.storage,
+            "upload_file",
+            lambda path: {"key": "k", "public_url": "https://pub.example/2026/09/02/abc.jpg"},
+        )
+        account = self._make_threads_account(db_session)
+
+        result = _run_create_job(
+            db_session,
+            platform="threads",
+            account_id=account.id,
+            text="a caption",
+            media_files=[_upload_file("photo.jpg")],
+        )
+
+        job = db_session.get(Job, result.id)
+        assert job.payload["media_public_url"] == "https://pub.example/2026/09/02/abc.jpg"
+        assert job.payload["text"] == "a caption"
+        assert "media_paths" not in job.payload
+        assert dispatched == [job.id]
+
+    def test_threads_rejects_job_when_r2_not_configured_for_media(self, db_session, dispatched, monkeypatch):
+        def _raise(path):
+            raise StorageNotConfiguredError("R2 not configured")
+
+        monkeypatch.setattr(dashboard_api.storage, "upload_file", _raise)
+        account = self._make_threads_account(db_session)
+
+        with pytest.raises(HTTPException) as excinfo:
+            _run_create_job(
+                db_session,
+                platform="threads",
+                account_id=account.id,
+                media_files=[_upload_file("photo.jpg")],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "R2" in excinfo.value.detail
+        assert dispatched == []
+
+    def test_threads_without_text_or_media_is_rejected(self, db_session, dispatched):
+        account = self._make_threads_account(db_session)
+
+        with pytest.raises(HTTPException) as excinfo:
+            _run_create_job(db_session, platform="threads", account_id=account.id)
+
+        assert excinfo.value.status_code == 400
+        assert dispatched == []
+
+    def test_threads_without_account_is_rejected(self, db_session, dispatched):
+        # No single-account/env-var fallback — text alone is otherwise
+        # valid, so this exercises the generic _ACCOUNT_REQUIRED_PLATFORMS
+        # check in create_job, not threads-specific validation.
+        with pytest.raises(HTTPException) as excinfo:
+            _run_create_job(db_session, platform="threads", text="hello world")
+
+        assert excinfo.value.status_code == 400
+        assert dispatched == []

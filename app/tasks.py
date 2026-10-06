@@ -31,6 +31,7 @@ from app.publishers import fake as fake_publisher
 from app.publishers import instagram as instagram_publisher
 from app.publishers import meta as meta_publisher
 from app.publishers import pinterest as pinterest_publisher
+from app.publishers import threads as threads_publisher
 from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
@@ -49,6 +50,7 @@ _PUBLISHERS_BY_PLATFORM = {
     "facebook": facebook_publisher.publish,
     "instagram": instagram_publisher.publish,
     "pinterest": pinterest_publisher.publish,
+    "threads": threads_publisher.publish,
 }
 
 # Platforms whose publisher module exposes the proactive-refresh helpers
@@ -57,7 +59,10 @@ _PUBLISHERS_BY_PLATFORM = {
 # facebook; Phase 25, instagram) the reactive TokenExpiredError -> refresh
 # -> retry path in publish_job below. Both facebook and instagram point at
 # the same meta.py module (Phase 23) since both platforms share the same
-# credential shape and refresh mechanics.
+# credential shape and refresh mechanics. threads (Phase 29f) points at its
+# own module — despite sharing meta.py's error-shape classifier, it has its
+# own separate app/OAuth/refresh mechanics (see app/publishers/threads.py's
+# module docstring), so it isn't folded into meta_publisher here.
 _TOKEN_REFRESH_MODULES_BY_PLATFORM = {
     "youtube": youtube_publisher,
     "tiktok": tiktok_publisher,
@@ -65,6 +70,7 @@ _TOKEN_REFRESH_MODULES_BY_PLATFORM = {
     "facebook": meta_publisher,
     "instagram": meta_publisher,
     "pinterest": pinterest_publisher,
+    "threads": threads_publisher,
 }
 
 # Human-readable re-authorization instructions per platform, named in the
@@ -95,6 +101,10 @@ _REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM = {
         'have the client re-click "Connect Pinterest" on the dashboard\'s Connected Accounts screen '
         '(client_user session) to re-authorize account "{name}" — Pinterest has no CLI authorize script'
     ),
+    "threads": (
+        'have the client re-click "Connect Threads" on the dashboard\'s Connected Accounts screen '
+        '(client_user session) to re-authorize account "{name}" — Threads has no CLI authorize script'
+    ),
 }
 
 # How far ahead of actual expiry refresh_expiring_tokens proactively
@@ -113,6 +123,11 @@ _TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM = {
     # Pinterest access tokens last 30 days (Phase 29e point 2) — wider than
     # the 45-minute default, but not wide enough to need Meta's 7-day window.
     "pinterest": 24 * 60 * 60,
+    # Threads long-lived access tokens last ~60 days, same order of
+    # magnitude as Meta's — same 7-day window, comfortably past the
+    # "token must be >=24h old to refresh" constraint documented in
+    # app/publishers/threads.py::refresh_stored_credentials.
+    "threads": 7 * 24 * 60 * 60,
 }
 
 

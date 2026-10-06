@@ -433,17 +433,19 @@ const SCREEN_TITLES = {
   admin: "Admin",
 };
 
-const PLATFORM_LETTERS = { youtube: "Y", tiktok: "T", twitter: "X", facebook: "F", instagram: "I", pinterest: "P" };
-const PLATFORM_LABELS = { youtube: "YouTube", tiktok: "TikTok", twitter: "X (Twitter)", facebook: "Facebook", instagram: "Instagram", pinterest: "Pinterest" };
+const PLATFORM_LETTERS = { youtube: "Y", tiktok: "T", twitter: "X", facebook: "F", instagram: "I", pinterest: "P", threads: "@" };
+const PLATFORM_LABELS = { youtube: "YouTube", tiktok: "TikTok", twitter: "X (Twitter)", facebook: "Facebook", instagram: "Instagram", pinterest: "Pinterest", threads: "Threads" };
 
 // Composer platform set and per-platform rules, mirroring dashboard/api.py's
 // create_job exactly (_VIDEO_UPLOAD_PLATFORMS / _ACCOUNT_REQUIRED_PLATFORMS).
-// Pinterest (Phase 29e) now has a real publisher (app/publishers/pinterest.py)
-// and is included here too.
-const COMPOSER_PLATFORMS = ["youtube", "tiktok", "twitter", "facebook", "instagram", "pinterest"];
+// Pinterest (Phase 29e) and Threads (Phase 29f) now have real publishers
+// (app/publishers/pinterest.py, app/publishers/threads.py) and are included
+// here too.
+const COMPOSER_PLATFORMS = ["youtube", "tiktok", "twitter", "facebook", "instagram", "pinterest", "threads"];
 const VIDEO_UPLOAD_PLATFORMS = new Set(["youtube", "tiktok"]);
-const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram", "pinterest"]);
+const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram", "pinterest", "threads"]);
 const TWITTER_CHAR_LIMIT = 280;
+const THREADS_CHAR_LIMIT = 500;
 
 const STATUS_STYLE = {
   scheduled: { bg: "#eef6ff", color: "#2c455d", label: "Scheduled" },
@@ -493,6 +495,7 @@ const state = {
   tiktokConnectNotice: null, // { ok, text } | null — set from ?tiktok_connect=... on boot (Phase 29c)
   metaConnectNotice: null, // { ok, text } | null — set from ?meta_connect=... on boot (Phase 29d)
   pinterestConnectNotice: null, // { ok, text } | null — set from ?pinterest_connect=... on boot (Phase 29e)
+  threadsConnectNotice: null, // { ok, text } | null — set from ?threads_connect=... on boot (Phase 29f)
   composer: {
     platform: "youtube",
     accounts: [],
@@ -1202,9 +1205,10 @@ function renderQueue() {
 
 function renderAccounts() {
   // Self-service connect (Phase 29a YouTube, Phase 29b Twitter/X, Phase 29c
-  // TikTok, Phase 29d Facebook + Instagram) is client_user-only — an admin
-  // isn't scoped to any one Client, so the backend routes
-  // (dashboard/api.py's /api/oauth/{youtube,twitter,tiktok,meta}/start) 403
+  // TikTok, Phase 29d Facebook + Instagram, Phase 29e Pinterest, Phase 29f
+  // Threads) is client_user-only — an admin isn't scoped to any one Client,
+  // so the backend routes (dashboard/api.py's
+  // /api/oauth/{youtube,twitter,tiktok,meta,pinterest,threads}/start) 403
   // it too; hiding the buttons for admin is UI convenience on top of that
   // real boundary, same convention as the Admin nav item being hidden for a
   // client_user.
@@ -1216,6 +1220,7 @@ function renderAccounts() {
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/tiktok/start">Connect TikTok</a>
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/meta/start">Connect Facebook & Instagram</a>
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/pinterest/start">Connect Pinterest</a>
+        <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/threads/start">Connect Threads</a>
       </div>`
     : "";
 
@@ -1260,7 +1265,8 @@ function renderAccounts() {
     renderNotice(state.twitterConnectNotice) +
     renderNotice(state.tiktokConnectNotice) +
     renderNotice(state.metaConnectNotice) +
-    renderNotice(state.pinterestConnectNotice);
+    renderNotice(state.pinterestConnectNotice) +
+    renderNotice(state.threadsConnectNotice);
   return `
     <div style="font-size:13px;color:var(--muted);margin-bottom:16px;">Connected platforms for ${escapeHtml(activeClientLabel().name)}</div>
     ${noticeHtml}
@@ -1361,6 +1367,22 @@ function renderComposerPlatformFields(platform) {
       <div class="form-group">
         <div class="form-label">Caption (optional)</div>
         <textarea id="composer-text" class="form-input composer-textarea" placeholder="Write a caption…"></textarea>
+      </div>
+    `;
+  }
+  if (platform === "threads") {
+    return `
+      <div class="form-group">
+        <div class="form-label">Text (optional — up to 500 characters)</div>
+        <textarea id="composer-text" class="form-input composer-textarea" placeholder="What's on your mind?"></textarea>
+      </div>
+      <div class="form-group">
+        <div class="form-label">Media (optional — one image or video)</div>
+        <div class="dropzone">
+          <i data-lucide="upload" style="width:18px;height:18px;"></i>
+          <input type="file" id="composer-media-file" accept="image/*,video/*" />
+        </div>
+        <div class="form-hint">At least one of text or media is required. Media needs a publicly accessible URL (Meta downloads it at publish time) — the server stages it to Cloudflare R2 automatically; if that fails, job creation fails with a clear error below. No carousels here — one image or one video.</div>
       </div>
     `;
   }
@@ -1491,6 +1513,10 @@ function updateComposerPreview() {
     const len = textEl ? textEl.value.length : 0;
     const over = len > TWITTER_CHAR_LIMIT;
     counterHtml = `<div class="char-counter${over ? " over" : ""}">${len}/${TWITTER_CHAR_LIMIT}</div>`;
+  } else if (c.platform === "threads") {
+    const len = textEl ? textEl.value.length : 0;
+    const over = len > THREADS_CHAR_LIMIT;
+    counterHtml = `<div class="char-counter${over ? " over" : ""}">${len}/${THREADS_CHAR_LIMIT}</div>`;
   }
 
   preview.innerHTML = `
@@ -1572,8 +1598,7 @@ async function submitComposer(e) {
     fd.append("media_files", file);
     const text = document.getElementById("composer-text").value.trim();
     if (text) fd.append("text", text);
-  } else {
-    // pinterest
+  } else if (platform === "pinterest") {
     const fileEl = document.getElementById("composer-media-file");
     const file = fileEl && fileEl.files[0];
     if (!file) {
@@ -1597,6 +1622,17 @@ async function submitComposer(e) {
     fd.append("board_id", boardId);
     const text = document.getElementById("composer-text").value.trim();
     if (text) fd.append("text", text);
+  } else {
+    // threads
+    const text = document.getElementById("composer-text").value.trim();
+    const fileEl = document.getElementById("composer-media-file");
+    const file = fileEl && fileEl.files[0];
+    if (!text && !file) {
+      setComposerError("Add text and/or a media file.");
+      return;
+    }
+    if (text) fd.append("text", text);
+    if (file) fd.append("media_files", file);
   }
 
   c.submitting = true;
@@ -2182,13 +2218,14 @@ async function submitRegister(e) {
 // Reads ?screen=...&youtube_connect=success|error&reason=... (Phase 29a),
 // ?twitter_connect=success|error&reason=... (Phase 29b),
 // ?tiktok_connect=success|error&reason=... (Phase 29c),
-// ?meta_connect=success|error&reason=...&facebook=N&instagram=M (Phase 29d) or
-// ?pinterest_connect=success|error&reason=... (Phase 29e) left by the
-// /api/oauth/{youtube,twitter,tiktok,meta,pinterest}/callback redirect — a
-// full-page browser navigation, so this is how those routes report their
-// outcome back into the SPA instead of a fetch() response — and strips them
-// from the URL via history.replaceState so a page refresh doesn't re-show
-// the same notice.
+// ?meta_connect=success|error&reason=...&facebook=N&instagram=M (Phase 29d),
+// ?pinterest_connect=success|error&reason=... (Phase 29e) or
+// ?threads_connect=success|error&reason=... (Phase 29f) left by the
+// /api/oauth/{youtube,twitter,tiktok,meta,pinterest,threads}/callback
+// redirect — a full-page browser navigation, so this is how those routes
+// report their outcome back into the SPA instead of a fetch() response —
+// and strips them from the URL via history.replaceState so a page refresh
+// doesn't re-show the same notice.
 function consumeOauthRedirectParams() {
   const params = new URLSearchParams(window.location.search);
   const screen = params.get("screen");
@@ -2239,7 +2276,15 @@ function consumeOauthRedirectParams() {
     state.pinterestConnectNotice = { ok: false, text: `Could not connect Pinterest (${reason}). Please try again.` };
   }
 
-  if (screen || youtubeConnect || twitterConnect || tiktokConnect || metaConnect || pinterestConnect) {
+  const threadsConnect = params.get("threads_connect");
+  if (threadsConnect === "success") {
+    state.threadsConnectNotice = { ok: true, text: "Threads account connected." };
+  } else if (threadsConnect === "error") {
+    const reason = params.get("reason") || "unknown_error";
+    state.threadsConnectNotice = { ok: false, text: `Could not connect Threads (${reason}). Please try again.` };
+  }
+
+  if (screen || youtubeConnect || twitterConnect || tiktokConnect || metaConnect || pinterestConnect || threadsConnect) {
     window.history.replaceState({}, "", window.location.pathname);
   }
 }

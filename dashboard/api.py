@@ -49,6 +49,7 @@ from app.exceptions import PermanentError, PublishError, StorageNotConfiguredErr
 from app.models import Account, Client, Job, JobStatus, User, WebhookEvent
 from app.publishers import meta as meta_publisher
 from app.publishers import pinterest as pinterest_publisher
+from app.publishers import threads as threads_publisher
 from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
@@ -131,14 +132,16 @@ _DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
 #
 # /api/oauth/youtube/callback (Phase 29a), /api/oauth/twitter/callback
 # (Phase 29b), /api/oauth/tiktok/callback (Phase 29c), /api/oauth/meta/callback
-# (Phase 29d) and /api/oauth/pinterest/callback (Phase 29e, same reasoning)
-# are the other public ones: the platform redirects the browser here with no
-# session cookie at all, so all five have to be public too — their own
-# security comes from verifying the signed "state" param (see
+# (Phase 29d), /api/oauth/pinterest/callback (Phase 29e) and
+# /api/oauth/threads/callback (Phase 29f, same reasoning) are the other
+# public ones: the platform redirects the browser here with no session
+# cookie at all, so all six have to be public too — their own security
+# comes from verifying the signed "state" param (see
 # youtube_oauth_callback/twitter_oauth_callback/tiktok_oauth_callback/
-# meta_oauth_callback/pinterest_oauth_callback below), not from enforce_auth.
-# Their sibling /start routes are deliberately NOT here — those still
-# require a real client_user session, gated normally.
+# meta_oauth_callback/pinterest_oauth_callback/threads_oauth_callback
+# below), not from enforce_auth. Their sibling /start routes are
+# deliberately NOT here — those still require a real client_user session,
+# gated normally.
 _PUBLIC_API_PATHS = {
     "/api/auth/register",
     "/api/auth/login",
@@ -149,6 +152,7 @@ _PUBLIC_API_PATHS = {
     "/api/oauth/tiktok/callback",
     "/api/oauth/meta/callback",
     "/api/oauth/pinterest/callback",
+    "/api/oauth/threads/callback",
 }
 
 
@@ -393,20 +397,21 @@ _UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 
 # Only platforms scripts/enqueue_*_test.py already know how to build a
 # payload for. Other platforms (fake, ...) aren't offered through this flow.
-_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter", "facebook", "instagram", "pinterest"}
+_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter", "facebook", "instagram", "pinterest", "threads"}
 
 # Platforms whose job payload is built from a single required video file
 # upload (video_path). Twitter (Phase 21), Facebook (Phase 24), Instagram
-# (Phase 25) and Pinterest (Phase 29e) aren't among these: their payloads are
-# text-first (twitter/facebook), media-required-but-not-local (instagram), or
-# (pinterest) media-required-but-either-local-or-not depending on image vs.
-# video — see create_job below.
+# (Phase 25), Pinterest (Phase 29e) and Threads (Phase 29f) aren't among
+# these: their payloads are text-first (twitter/facebook/threads),
+# media-required-but-not-local (instagram), or (pinterest)
+# media-required-but-either-local-or-not depending on image vs. video — see
+# create_job below.
 _VIDEO_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
 
 # Platforms with no single-account/env-var fallback (app/publishers/*.py
 # owns this rule; duplicated here only enough to give a friendlier 400
 # instead of letting the job get created and fail later in the worker).
-_ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook", "instagram", "pinterest"}
+_ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook", "instagram", "pinterest", "threads"}
 
 
 def _extract_caption(payload: dict) -> str | None:
@@ -1279,6 +1284,76 @@ def pinterest_oauth_callback(
     return RedirectResponse("/dashboard/?screen=accounts&pinterest_connect=success")
 
 
+@app.get("/api/oauth/threads/start")
+def threads_oauth_start(request: Request = None):
+    """
+    Starts the in-browser Threads connect flow (Phase 29f), mirroring
+    youtube_oauth_start/twitter_oauth_start/tiktok_oauth_start/
+    meta_oauth_start/pinterest_oauth_start — client_user-only, since this
+    flow always creates the resulting Account under the caller's own
+    client_id.
+
+    Like Meta's/Pinterest's dialogs, Threads' needs no PKCE (see
+    app/publishers/threads.py::build_authorization_url), so state only
+    carries client_id/user_id, same shape as YouTube's/Meta's/Pinterest's.
+    """
+    auth = _get_auth(request)
+    if auth.role != "client_user":
+        raise HTTPException(status_code=403, detail="Threads self-service connect is only available to a client account.")
+
+    redirect_uri = str(request.url_for("threads_oauth_callback"))
+    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id})
+    try:
+        authorization_url = threads_publisher.build_authorization_url(redirect_uri, state)
+    except PermanentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(authorization_url)
+
+
+@app.get("/api/oauth/threads/callback")
+def threads_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public callback Threads redirects the browser back to after the consent
+    screen from threads_oauth_start above — mirrors
+    youtube_oauth_callback's/pinterest_oauth_callback's shape (see
+    youtube_oauth_callback's docstring for why this must stay public and
+    redirect-only). No PKCE verifier to pull out of state, unlike Twitter's/
+    TikTok's callbacks — Threads' OAuth dialog doesn't require it.
+    """
+    if error:
+        return RedirectResponse(f"/dashboard/?screen=accounts&threads_connect=error&reason={quote(error)}")
+    if not code or not state:
+        return RedirectResponse("/dashboard/?screen=accounts&threads_connect=error&reason=missing_code_or_state")
+
+    state_data = verify_oauth_state_token(state)
+    if state_data is None:
+        return RedirectResponse("/dashboard/?screen=accounts&threads_connect=error&reason=invalid_or_expired_state")
+
+    client_id = state_data.get("client_id")
+    client = db.get(Client, client_id) if client_id is not None else None
+    if client is None:
+        return RedirectResponse("/dashboard/?screen=accounts&threads_connect=error&reason=unknown_client")
+
+    redirect_uri = str(request.url_for("threads_oauth_callback"))
+    try:
+        credentials = threads_publisher.exchange_code_for_credentials(code, redirect_uri)
+    except PermanentError as exc:
+        logger.warning("Threads OAuth code exchange failed for client %s: %s", client_id, exc)
+        return RedirectResponse("/dashboard/?screen=accounts&threads_connect=error&reason=exchange_failed")
+
+    account, _action = upsert_account(db, "threads", f"{client.name} (self-service)", credentials)
+    account.client_id = client.id
+    db.commit()
+
+    return RedirectResponse("/dashboard/?screen=accounts&threads_connect=success")
+
+
 @app.get("/api/accounts/{account_id}/boards", response_model=list[BoardOut])
 def list_account_boards(account_id: int, request: Request = None, db: Session = Depends(get_db)):
     """
@@ -1861,6 +1936,14 @@ async def create_job(
         `media_paths` entry instead (Pinterest's own 3-step upload flow
         reads the raw file, so no R2 staging happens or is needed for
         video).
+      - threads (Phase 29f): like facebook, at least one of `text`/a single
+        media file is required (neither independently). Unlike facebook,
+        when a media file IS given it must stage to R2 successfully (400 if
+        not) — app/publishers/threads.py has no local-file fallback at all
+        (Meta downloads media from a public URL at publish time for both
+        images and videos, same constraint as instagram.py), so a text-only
+        threads job is fine with no R2 involved, but a threads job WITH
+        media can never actually publish without a public URL.
 
     Phase 22: every uploaded file is also best-effort staged to R2
     (_stage_to_r2) — the local path in the payload is unchanged and stays
@@ -1905,7 +1988,7 @@ async def create_job(
             raise HTTPException(status_code=400, detail="Instagram posts require a media file (no text-only posts)")
         if len(uploaded_media_files) > 1:
             raise HTTPException(status_code=400, detail="Instagram posts support at most one media file")
-    else:  # pinterest
+    elif platform == "pinterest":
         if not uploaded_media_files:
             raise HTTPException(status_code=400, detail="Pinterest pins require a media file (no text-only posts)")
         if len(uploaded_media_files) > 1:
@@ -1914,6 +1997,11 @@ async def create_job(
             raise HTTPException(status_code=400, detail="Missing required field: title")
         if not board_id or not board_id.strip():
             raise HTTPException(status_code=400, detail="Missing required field: board_id")
+    else:  # threads
+        if not (text and text.strip()) and not uploaded_media_files:
+            raise HTTPException(status_code=400, detail="Threads posts need 'text' and/or a media file")
+        if len(uploaded_media_files) > 1:
+            raise HTTPException(status_code=400, detail="Threads posts support at most one media file")
 
     if client_id is not None and db.get(Client, client_id) is None:
         raise HTTPException(status_code=404, detail=f"Client {client_id} not found")
@@ -2000,7 +2088,7 @@ async def create_job(
         payload = {"media_public_url": public_url}
         if text and text.strip():
             payload["text"] = text.strip()
-    else:  # pinterest
+    elif platform == "pinterest":
         dest_path = await _save_upload(uploaded_media_files[0])
         mime, _ = mimetypes.guess_type(str(dest_path))
         payload = {"title": title.strip(), "board_id": board_id.strip()}
@@ -2020,6 +2108,24 @@ async def create_job(
                         "Could not stage image to Cloudflare R2 — Pinterest image Pins require a "
                         "publicly-accessible media URL. Set R2_ENDPOINT_URL/R2_ACCESS_KEY_ID/"
                         "R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME/R2_PUBLIC_BASE_URL in .env — see .env.example."
+                    ),
+                )
+            payload["media_public_url"] = public_url
+    else:  # threads
+        payload = {}
+        if text and text.strip():
+            payload["text"] = text.strip()
+        if uploaded_media_files:
+            dest_path = await _save_upload(uploaded_media_files[0])
+            public_url = _stage_to_r2(dest_path)
+            if not public_url:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Could not stage media to Cloudflare R2 — Threads requires a publicly-accessible "
+                        "media URL for both images and videos (Meta downloads it at publish time). Set "
+                        "R2_ENDPOINT_URL/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME/"
+                        "R2_PUBLIC_BASE_URL in .env — see .env.example."
                     ),
                 )
             payload["media_public_url"] = public_url

@@ -24,6 +24,14 @@ Run it from the project root with:
     python -m scripts.add_account --platform pinterest --name "Main account" \\
         access_token=xxx refresh_token=yyy expires_at=2026-11-01T14:00:00+00:00
 
+    # Threads (Phase 29f — see app/publishers/threads.py). Normally created
+    # via the dashboard's self-service "Connect Threads" button instead of
+    # by hand (Threads has no CLI authorize script, same as Pinterest).
+    # Unlike Twitter's/Pinterest's, there's no separate refresh_token field —
+    # the long-lived access_token itself gets refreshed in place:
+    python -m scripts.add_account --platform threads --name "Main account" \\
+        threads_user_id=xxx username=yyy access_token=zzz expires_at=2026-11-01T14:00:00+00:00
+
 Credentials are given as any number of key=value pairs; which keys are
 expected depends on the platform's publisher (e.g. app/publishers/twitter.py
 expects client_id / client_secret / access_token / refresh_token, plus an

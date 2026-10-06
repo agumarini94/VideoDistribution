@@ -2710,6 +2710,178 @@ unit-tested without Redis or a worker running.
      access token is rejected mid-publish, and confirm rotation persists
      correctly onto the `Account` row (`scripts/show_accounts.py`).
 
+### Phase 29f (current)
+- **Threads publisher + in-browser OAuth** (`app/publishers/threads.py`) —
+  the sixth self-service "Connect ..." platform (after YouTube/Twitter/
+  TikTok/Meta/Pinterest, Phases 29a-e), modeled on Phase 29d's (Meta)/29e's
+  (Pinterest) pattern, and the first Threads integration in this project.
+  Built "ready waiting for credentials" like every real publisher before
+  it: no real Threads API app exists yet, so everything is exercised only
+  against fully mocked HTTP (`tests/test_publisher_threads.py`,
+  `tests/test_tasks_threads_token_refresh.py`,
+  `tests/test_dashboard_threads_oauth.py`,
+  `tests/test_dashboard_media_staging.py`), not a live account.
+  - **Separate Meta app, confirmed this session (not guessed by analogy to
+    `app/publishers/meta.py`)**: despite being a Meta product, the Threads
+    API needs its own app registration ("a Meta app created with the
+    Threads use case" — "there will be 2 app IDs and app secrets... use the
+    Threads app ID", per developers.facebook.com/docs/threads) — its own
+    OAuth dialog/token endpoints, its own scopes, its own refresh mechanic.
+    `THREADS_APP_ID`/`THREADS_APP_SECRET` are read directly from the
+    environment (`_app_credentials()`, same pattern as `meta.py`'s/
+    `pinterest.py`'s), **not** reused from `META_APP_ID`/`META_APP_SECRET`.
+    Per this phase's explicit decision, both are left unset for now, same
+    as every "ready waiting for credentials" publisher before it.
+  - **What IS reused from `meta.py`**: `raise_for_graph_error` (the
+    response classifier) — Threads' endpoints live on Meta's Graph-
+    compatible infrastructure (`graph.threads.net`) and report errors in
+    the same `{"error": {...}}` shape, confirmed by community reports, not
+    an official live response yet (same caveat every other publisher's
+    error-code table in this package carries before real credentials
+    exist). This is reuse of a response-shape classifier only — Threads'
+    app/OAuth/token-refresh mechanics are entirely separate from
+    `meta.py`'s own Facebook/Instagram OAuth chain, hence its own module
+    rather than folding into `meta.py`.
+  - **Domain name deliberately flagged as unverified, per this phase's
+    explicit instruction**: developers.facebook.com's own pages disagree
+    with each other between `threads.net` and `threads.com` for the OAuth
+    dialog/token-exchange endpoints (Meta appears to be mid-rebrand). This
+    module standardizes on `.net` throughout; swapping every occurrence for
+    `.com` is the fix if a real app rejects it — flagged directly in
+    `app/publishers/threads.py`'s module docstring rather than spending
+    more time pinning it down without a live app to test against.
+  - **OAuth chain, no PKCE** (confirmed: the dialog takes only
+    `client_id`/`redirect_uri`/`scope`/`response_type`/`state`):
+    1. Browser dialog: `GET https://www.threads.net/oauth/authorize`.
+    2. Code -> short-lived token (~1h): `POST
+       https://graph.threads.net/oauth/access_token` — `client_secret` in
+       the POST body, **not** HTTP Basic auth (unlike `pinterest.py`'s/
+       `twitter.py`'s token endpoints).
+    3. Short-lived -> long-lived (~60 day) token, and also how a long-lived
+       token gets refreshed while still valid: `GET
+       https://graph.threads.net/access_token?grant_type=th_exchange_token`.
+    4. Refresh (token must be >=24h old per the docs — not specially
+       guarded, see below): `GET
+       https://graph.threads.net/refresh_access_token?grant_type=th_refresh_token`
+       — no app secret needed, unlike step 3. **No separate refresh_token
+       concept at all** (unlike Twitter's/Pinterest's rotating
+       refresh_token, or TikTok's/YouTube's distinct refresh_token): the
+       long-lived access_token itself gets refreshed/extended in place,
+       same non-rotating spirit as Meta's own tokens.
+    5. Own Threads user id (no "Pages" concept at all — one authorization
+       grants access to exactly one Threads profile, unlike Meta's
+       page-fan-out): `GET
+       https://graph.threads.net/v1.0/me?fields=id,username`.
+  - **Credentials** (`Account.credentials`, platform `"threads"`):
+    `{threads_user_id, username, access_token, expires_at}`. No env-var
+    single-account fallback (same posture as `tiktok.py`/`facebook.py`/
+    `instagram.py`/`pinterest.py`) — every `platform="threads"` job needs
+    an `Account` row.
+  - **Payload contract — explicitly no carousel support, per this phase's
+    scope decision** (text, or a single image, or a single video only):
+    `{"text": optional str (<=500 chars), "media_public_url": optional
+    str}`. At least one of the two is required (Threads has a real
+    text-only post type, unlike Instagram). Image vs. video auto-detected
+    from `media_public_url`'s guessed MIME type, same spirit as
+    `instagram.py`'s/`facebook.py`'s/`pinterest.py`'s `_media_kind`. Like
+    Instagram (and unlike Pinterest's video Pins), Meta downloads the
+    media from the public URL for **both** images and videos — no
+    local-file upload path at all, so `media_public_url` must already be
+    staged to R2.
+  - **Publish flow — two-step container/publish, confirmed against
+    developers.facebook.com/docs/threads, poll included** (a community-
+    reported race condition means firing `threads_publish` before the
+    container reaches `FINISHED` gives an opaque 400):
+    1. `POST /<THREADS_USER_ID>/threads` (`media_type=TEXT|IMAGE|VIDEO` +
+       `text`/`image_url`/`video_url`) -> `{"id": "<creation_id>"}`.
+    2. `GET /<CREATION_ID>?fields=status,error_message`, polled every
+       `_POLL_INTERVAL_SECONDS` up to `_POLL_TIMEOUT_SECONDS`. `FINISHED`
+       -> proceed; `ERROR` -> `PermanentError` (using `error_message` if
+       present); timeout -> `TransientError`. Only `FINISHED`/`ERROR`/
+       `IN_PROGRESS` were confirmed this session — unlike `instagram.py`'s
+       `status_code`, there's no confirmed `EXPIRED`-equivalent terminal
+       status here, so anything else is treated as "still processing"
+       rather than assumed terminal.
+    3. `POST /<THREADS_USER_ID>/threads_publish`, `creation_id=<id>` ->
+       `{"id": "<thread_id>"}`.
+  - **Error classification**: every publish-time call passes
+    `token_invalid_error_class=TokenExpiredError` to
+    `raise_for_graph_error`, so a `code=190` (`OAuthException`) error
+    becomes `TokenExpiredError` instead of `PermanentError` —
+    `app/tasks.py`'s existing `TokenExpiredError` -> refresh -> retry-once
+    path (`_handle_token_expired`, Phase 21) works unchanged, same as
+    facebook.py/instagram.py, now that `app/tasks.py` registers
+    `threads_publisher` in `_TOKEN_REFRESH_MODULES_BY_PLATFORM` (own entry,
+    not folded into `meta_publisher` — see "What IS reused" above). Refresh
+    window: 7 days (`_TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM["threads"]`),
+    same order of magnitude as Meta's long-lived tokens and comfortably
+    past the ">=24h old" refresh constraint. Re-authorization alert
+    (`_REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM["threads"]`) points at the
+    dashboard's "Connect Threads" button — Threads has no CLI authorize
+    script, same as Pinterest.
+  - **Dashboard OAuth routes**: `GET /api/oauth/threads/start`
+    (`client_user`-only) / `GET /api/oauth/threads/callback` (public —
+    added to `_PUBLIC_API_PATHS`), mirroring `meta_oauth_start`/
+    `pinterest_oauth_start` and their callbacks exactly in shape (no PKCE
+    verifier in `state`). Upserts an `Account`
+    (`"<Client name> (self-service)"`) via the same
+    `scripts/add_account.py::upsert_account` helper every other platform
+    uses — reconnecting rotates the same row in place.
+  - **Dashboard NEW JOB / Composer form**: `threads` added to
+    `_SUPPORTED_PLATFORMS` and `_ACCOUNT_REQUIRED_PLATFORMS`
+    (`dashboard/api.py`). `create_job`'s threads branch mirrors facebook's
+    "at least one of text/a single media file" validation, but — like
+    instagram's/pinterest's image case — a media file that's given must
+    stage to R2 successfully (400 if not); a text-only threads job needs
+    no R2 involvement at all. `dashboard/static/index.html`'s Composer
+    gained a Threads platform chip (optional text up to 500 chars + a
+    500-char counter, optional single media file) and a fifth "Connect
+    Threads" button on Connected Accounts alongside the other five
+    self-service buttons.
+- `scripts/enqueue_threads_test.py` (new, modeled on
+  `enqueue_instagram_test.py`) — `--mode text|image|video`. `--mode text`
+  needs only `--text` (no R2 involved, since Threads has a real text-only
+  post type); `--mode image`/`video` require `--file` and stage it to R2
+  themselves first (same reason `enqueue_instagram_test.py` does — Threads
+  needs `media_public_url` for both image and video, unlike Pinterest's
+  video Pins). `--account` is required (no single-account fallback).
+- Covered by `tests/test_publisher_threads.py` (credential resolution,
+  payload validation incl. the 500-char limit and the text-and/or-media
+  requirement, text/image/video happy paths, container error/timeout,
+  error classification incl. `code=190` -> `TokenExpiredError`, token
+  refresh — non-rotating, modeled on Meta's — and the OAuth build/exchange
+  functions, no PKCE assertions), `tests/test_tasks_threads_token_refresh.py`
+  (reactive retry-once and proactive Beat refresh, modeled on the Pinterest
+  equivalent), `tests/test_dashboard_threads_oauth.py` (FastAPI
+  `TestClient`, modeled on `test_dashboard_pinterest_oauth.py` minus PKCE),
+  and new cases in `tests/test_dashboard_media_staging.py` (text-only needs
+  no R2; media attaches `media_public_url` with no local path; R2 failure
+  with media present is a 400; no text/media is rejected; no account is
+  rejected). Whole suite green (`.venv/bin/python -m pytest -q` -> 519
+  passed).
+
+  **When Threads credentials arrive:**
+  1. In the Meta App Dashboard, add the Threads use case to an app (or
+     create a new one) and note its **Threads app ID/secret** — distinct
+     from the app's main Facebook app ID/secret (Phase 23's
+     `META_APP_ID`/`META_APP_SECRET`), per the docs' "2 app IDs and app
+     secrets" note above.
+  2. Register `http://localhost:8000/api/oauth/threads/callback` as a
+     redirect URI (adjust host/port for wherever the dashboard runs
+     locally). In production, add the real deployed origin's equivalent.
+  3. Set `THREADS_APP_ID`/`THREADS_APP_SECRET` in `.env`. If the real app
+     rejects the `.net` domain (see "Domain name" above), swap every
+     `threads.net` in `app/publishers/threads.py` for `threads.com`.
+  4. Test by clicking "Connect Threads" on the Connected Accounts screen
+     (as a `client_user`), then
+     `python -m scripts.enqueue_threads_test --mode text --text "Hello"
+     --account "<Client name> (self-service)"`, then `--mode image`/
+     `--mode video` once that works.
+  5. Watch a reactive refresh happen naturally the first time the stored
+     access token is rejected mid-publish, and confirm the refreshed token
+     persists correctly onto the `Account` row
+     (`scripts/show_accounts.py`).
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)
