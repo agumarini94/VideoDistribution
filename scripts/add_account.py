@@ -18,6 +18,12 @@ Run it from the project root with:
         page_id=xxx page_token=yyy page_name="Main Page" user_token=zzz \\
         user_token_expires_at=2026-11-01T14:00:00+00:00
 
+    # Pinterest (Phase 29e — see app/publishers/pinterest.py). Normally
+    # created via the dashboard's self-service "Connect Pinterest" button
+    # instead of by hand:
+    python -m scripts.add_account --platform pinterest --name "Main account" \\
+        access_token=xxx refresh_token=yyy expires_at=2026-11-01T14:00:00+00:00
+
 Credentials are given as any number of key=value pairs; which keys are
 expected depends on the platform's publisher (e.g. app/publishers/twitter.py
 expects client_id / client_secret / access_token / refresh_token, plus an

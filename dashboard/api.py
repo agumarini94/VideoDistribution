@@ -16,6 +16,7 @@ matching/alerting logic lives in app/tasks.py, not here.
 import base64
 import hashlib
 import logging
+import mimetypes
 import os
 import secrets
 import uuid
@@ -44,9 +45,10 @@ from app.auth import (
     verify_session_token,
 )
 from app.db import SessionLocal
-from app.exceptions import PermanentError, PublishError, StorageNotConfiguredError
+from app.exceptions import PermanentError, PublishError, StorageNotConfiguredError, TransientError
 from app.models import Account, Client, Job, JobStatus, User, WebhookEvent
 from app.publishers import meta as meta_publisher
+from app.publishers import pinterest as pinterest_publisher
 from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
@@ -128,15 +130,15 @@ _DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
 # checks "am I logged in?" on load without forcing a 401 round trip.
 #
 # /api/oauth/youtube/callback (Phase 29a), /api/oauth/twitter/callback
-# (Phase 29b), /api/oauth/tiktok/callback (Phase 29c) and
-# /api/oauth/meta/callback (Phase 29d, same reasoning) are the other public
-# ones: the platform redirects the browser here with no session cookie at
-# all, so all four have to be public too — their own security comes from
-# verifying the signed "state" param (see
+# (Phase 29b), /api/oauth/tiktok/callback (Phase 29c), /api/oauth/meta/callback
+# (Phase 29d) and /api/oauth/pinterest/callback (Phase 29e, same reasoning)
+# are the other public ones: the platform redirects the browser here with no
+# session cookie at all, so all five have to be public too — their own
+# security comes from verifying the signed "state" param (see
 # youtube_oauth_callback/twitter_oauth_callback/tiktok_oauth_callback/
-# meta_oauth_callback below), not from enforce_auth. Their sibling /start
-# routes are deliberately NOT here — those still require a real client_user
-# session, gated normally.
+# meta_oauth_callback/pinterest_oauth_callback below), not from enforce_auth.
+# Their sibling /start routes are deliberately NOT here — those still
+# require a real client_user session, gated normally.
 _PUBLIC_API_PATHS = {
     "/api/auth/register",
     "/api/auth/login",
@@ -146,6 +148,7 @@ _PUBLIC_API_PATHS = {
     "/api/oauth/twitter/callback",
     "/api/oauth/tiktok/callback",
     "/api/oauth/meta/callback",
+    "/api/oauth/pinterest/callback",
 }
 
 
@@ -390,19 +393,20 @@ _UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 
 # Only platforms scripts/enqueue_*_test.py already know how to build a
 # payload for. Other platforms (fake, ...) aren't offered through this flow.
-_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter", "facebook", "instagram"}
+_SUPPORTED_PLATFORMS = {"youtube", "tiktok", "twitter", "facebook", "instagram", "pinterest"}
 
 # Platforms whose job payload is built from a single required video file
-# upload (video_path). Twitter (Phase 21), Facebook (Phase 24) and Instagram
-# (Phase 25) aren't among these: their payloads are text-first (twitter/
-# facebook) or media-required-but-not-local (instagram) — see create_job
-# below.
+# upload (video_path). Twitter (Phase 21), Facebook (Phase 24), Instagram
+# (Phase 25) and Pinterest (Phase 29e) aren't among these: their payloads are
+# text-first (twitter/facebook), media-required-but-not-local (instagram), or
+# (pinterest) media-required-but-either-local-or-not depending on image vs.
+# video — see create_job below.
 _VIDEO_UPLOAD_PLATFORMS = {"youtube", "tiktok"}
 
 # Platforms with no single-account/env-var fallback (app/publishers/*.py
 # owns this rule; duplicated here only enough to give a friendlier 400
 # instead of letting the job get created and fail later in the worker).
-_ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook", "instagram"}
+_ACCOUNT_REQUIRED_PLATFORMS = {"tiktok", "facebook", "instagram", "pinterest"}
 
 
 def _extract_caption(payload: dict) -> str | None:
@@ -525,6 +529,11 @@ class AccountOut(BaseModel):
 
 class JobCreateOut(BaseModel):
     id: int
+
+
+class BoardOut(BaseModel):
+    id: str
+    name: str
 
 
 class ClientOut(BaseModel):
@@ -1201,6 +1210,110 @@ def meta_oauth_callback(
     return RedirectResponse(f"/dashboard/?screen=accounts&meta_connect=success&facebook={facebook_count}&instagram={instagram_count}")
 
 
+@app.get("/api/oauth/pinterest/start")
+def pinterest_oauth_start(request: Request = None):
+    """
+    Starts the in-browser Pinterest connect flow (Phase 29e), mirroring
+    youtube_oauth_start/twitter_oauth_start/tiktok_oauth_start/meta_oauth_start
+    — client_user-only, since this flow always creates the resulting
+    Account under the caller's own client_id.
+
+    Like Meta's dialog, Pinterest's needs no PKCE (see
+    app/publishers/pinterest.py::build_authorization_url), so state only
+    carries client_id/user_id, same shape as YouTube's/Meta's.
+    """
+    auth = _get_auth(request)
+    if auth.role != "client_user":
+        raise HTTPException(status_code=403, detail="Pinterest self-service connect is only available to a client account.")
+
+    redirect_uri = str(request.url_for("pinterest_oauth_callback"))
+    state = create_oauth_state_token({"client_id": auth.client_id, "user_id": auth.user_id})
+    try:
+        authorization_url = pinterest_publisher.build_authorization_url(redirect_uri, state)
+    except PermanentError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(authorization_url)
+
+
+@app.get("/api/oauth/pinterest/callback")
+def pinterest_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public callback Pinterest redirects the browser back to after the
+    consent screen from pinterest_oauth_start above — mirrors
+    youtube_oauth_callback's shape (see its docstring for why this must stay
+    public and redirect-only). No PKCE verifier to pull out of state, unlike
+    Twitter's/TikTok's callbacks — Pinterest's OAuth dialog doesn't require
+    it.
+    """
+    if error:
+        return RedirectResponse(f"/dashboard/?screen=accounts&pinterest_connect=error&reason={quote(error)}")
+    if not code or not state:
+        return RedirectResponse("/dashboard/?screen=accounts&pinterest_connect=error&reason=missing_code_or_state")
+
+    state_data = verify_oauth_state_token(state)
+    if state_data is None:
+        return RedirectResponse("/dashboard/?screen=accounts&pinterest_connect=error&reason=invalid_or_expired_state")
+
+    client_id = state_data.get("client_id")
+    client = db.get(Client, client_id) if client_id is not None else None
+    if client is None:
+        return RedirectResponse("/dashboard/?screen=accounts&pinterest_connect=error&reason=unknown_client")
+
+    redirect_uri = str(request.url_for("pinterest_oauth_callback"))
+    try:
+        credentials = pinterest_publisher.exchange_code_for_credentials(code, redirect_uri)
+    except PermanentError as exc:
+        logger.warning("Pinterest OAuth code exchange failed for client %s: %s", client_id, exc)
+        return RedirectResponse("/dashboard/?screen=accounts&pinterest_connect=error&reason=exchange_failed")
+
+    account, _action = upsert_account(db, "pinterest", f"{client.name} (self-service)", credentials)
+    account.client_id = client.id
+    db.commit()
+
+    return RedirectResponse("/dashboard/?screen=accounts&pinterest_connect=success")
+
+
+@app.get("/api/accounts/{account_id}/boards", response_model=list[BoardOut])
+def list_account_boards(account_id: int, request: Request = None, db: Session = Depends(get_db)):
+    """
+    Lists the Pinterest boards a connected Account can post to (Phase 29e)
+    — feeds the Composer's board picker (GET /api/accounts/{id}/boards),
+    since nobody memorizes a numeric board_id by hand. Ownership-scoped like
+    every other Account-addressed route: a client_user gets a 403 on an
+    account that isn't theirs (or has no client_id at all); an admin
+    (Basic-Auth or an admin User session) can inspect any account's boards.
+
+    Pinterest's own API errors are surfaced as a clean HTTP error rather
+    than a raw 500: PermanentError (bad/expired token, account
+    misconfigured) -> 502, TransientError (rate limited, Pinterest
+    temporarily down) -> 503 — either way the Composer shows a message and
+    falls back to manual board_id entry instead of crashing.
+    """
+    auth = _get_auth(request)
+    account = db.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+    if account.platform != "pinterest":
+        raise HTTPException(status_code=400, detail=f"Account {account_id} is a {account.platform} account, not pinterest")
+    if auth.role == "client_user" and account.client_id != auth.client_id:
+        raise HTTPException(status_code=403, detail="Cannot access another client's account.")
+
+    try:
+        boards = pinterest_publisher.list_boards(account.credentials)
+    except PermanentError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not list Pinterest boards: {exc}") from exc
+    except TransientError as exc:
+        raise HTTPException(status_code=503, detail=f"Pinterest is temporarily unavailable: {exc}") from exc
+
+    return [BoardOut(id=b["id"], name=b["name"]) for b in boards]
+
+
 @app.get("/api/admin/users/pending", response_model=list[PendingUserOut])
 def list_pending_users(request: Request = None, db: Session = Depends(get_db)):
     _require_admin(request)
@@ -1695,6 +1808,7 @@ async def create_job(
     privacy: str | None = Form(default=None),
     shorts: bool = Form(default=False),
     playlist_id: str | None = Form(default=None),
+    board_id: str | None = Form(default=None),
     request: Request = None,
     db: Session = Depends(get_db),
 ):
@@ -1735,6 +1849,18 @@ async def create_job(
         degrades to local-path-only, an instagram job with no public_url
         can never actually publish, so failing fast here beats creating a
         job that's guaranteed to dead-letter in the worker.
+      - pinterest (Phase 29e): a required `title`, a required `board_id`
+        (picked from the Composer's board dropdown — see
+        GET /api/accounts/{id}/boards — or typed by hand), and a single
+        required media file (an optional `text` caption doubles as the Pin
+        description). Unlike every other platform here, which media
+        field gets attached depends on the file's own type:
+        app/publishers/pinterest.py requires an image to arrive via
+        `media_public_url` (R2-staged, same as instagram's requirement —
+        this route 400s up front if staging fails) but a video via a local
+        `media_paths` entry instead (Pinterest's own 3-step upload flow
+        reads the raw file, so no R2 staging happens or is needed for
+        video).
 
     Phase 22: every uploaded file is also best-effort staged to R2
     (_stage_to_r2) — the local path in the payload is unchanged and stays
@@ -1774,11 +1900,20 @@ async def create_job(
             raise HTTPException(status_code=400, detail="Facebook posts need 'text' and/or a media file")
         if len(uploaded_media_files) > 1:
             raise HTTPException(status_code=400, detail="Facebook posts support at most one media file")
-    else:  # instagram
+    elif platform == "instagram":
         if not uploaded_media_files:
             raise HTTPException(status_code=400, detail="Instagram posts require a media file (no text-only posts)")
         if len(uploaded_media_files) > 1:
             raise HTTPException(status_code=400, detail="Instagram posts support at most one media file")
+    else:  # pinterest
+        if not uploaded_media_files:
+            raise HTTPException(status_code=400, detail="Pinterest pins require a media file (no text-only posts)")
+        if len(uploaded_media_files) > 1:
+            raise HTTPException(status_code=400, detail="Pinterest posts support at most one media file")
+        if not title or not title.strip():
+            raise HTTPException(status_code=400, detail="Missing required field: title")
+        if not board_id or not board_id.strip():
+            raise HTTPException(status_code=400, detail="Missing required field: board_id")
 
     if client_id is not None and db.get(Client, client_id) is None:
         raise HTTPException(status_code=404, detail=f"Client {client_id} not found")
@@ -1850,7 +1985,7 @@ async def create_job(
             public_url = _stage_to_r2(dest_path)
             if public_url:
                 payload["media_public_url"] = public_url
-    else:  # instagram
+    elif platform == "instagram":
         dest_path = await _save_upload(uploaded_media_files[0])
         public_url = _stage_to_r2(dest_path)
         if not public_url:
@@ -1865,6 +2000,29 @@ async def create_job(
         payload = {"media_public_url": public_url}
         if text and text.strip():
             payload["text"] = text.strip()
+    else:  # pinterest
+        dest_path = await _save_upload(uploaded_media_files[0])
+        mime, _ = mimetypes.guess_type(str(dest_path))
+        payload = {"title": title.strip(), "board_id": board_id.strip()}
+        if text and text.strip():
+            payload["description"] = text.strip()
+        if mime and mime.startswith("video/"):
+            # Pinterest video Pins read the raw local file through its own
+            # 3-step upload flow (app/publishers/pinterest.py) — no R2
+            # staging involved or needed.
+            payload["media_paths"] = [str(dest_path)]
+        else:
+            public_url = _stage_to_r2(dest_path)
+            if not public_url:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Could not stage image to Cloudflare R2 — Pinterest image Pins require a "
+                        "publicly-accessible media URL. Set R2_ENDPOINT_URL/R2_ACCESS_KEY_ID/"
+                        "R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME/R2_PUBLIC_BASE_URL in .env — see .env.example."
+                    ),
+                )
+            payload["media_public_url"] = public_url
 
     job = Job(
         platform=platform,

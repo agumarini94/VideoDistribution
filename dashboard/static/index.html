@@ -433,16 +433,16 @@ const SCREEN_TITLES = {
   admin: "Admin",
 };
 
-const PLATFORM_LETTERS = { youtube: "Y", tiktok: "T", twitter: "X", facebook: "F", instagram: "I" };
-const PLATFORM_LABELS = { youtube: "YouTube", tiktok: "TikTok", twitter: "X (Twitter)", facebook: "Facebook", instagram: "Instagram" };
+const PLATFORM_LETTERS = { youtube: "Y", tiktok: "T", twitter: "X", facebook: "F", instagram: "I", pinterest: "P" };
+const PLATFORM_LABELS = { youtube: "YouTube", tiktok: "TikTok", twitter: "X (Twitter)", facebook: "Facebook", instagram: "Instagram", pinterest: "Pinterest" };
 
 // Composer platform set and per-platform rules, mirroring dashboard/api.py's
-// create_job exactly (_VIDEO_UPLOAD_PLATFORMS / _ACCOUNT_REQUIRED_PLATFORMS) —
-// pinterest is in the design's platform set but has no publisher (CLAUDE.md
-// Phase 26), so it's excluded here.
-const COMPOSER_PLATFORMS = ["youtube", "tiktok", "twitter", "facebook", "instagram"];
+// create_job exactly (_VIDEO_UPLOAD_PLATFORMS / _ACCOUNT_REQUIRED_PLATFORMS).
+// Pinterest (Phase 29e) now has a real publisher (app/publishers/pinterest.py)
+// and is included here too.
+const COMPOSER_PLATFORMS = ["youtube", "tiktok", "twitter", "facebook", "instagram", "pinterest"];
 const VIDEO_UPLOAD_PLATFORMS = new Set(["youtube", "tiktok"]);
-const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram"]);
+const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram", "pinterest"]);
 const TWITTER_CHAR_LIMIT = 280;
 
 const STATUS_STYLE = {
@@ -492,12 +492,17 @@ const state = {
   twitterConnectNotice: null, // { ok, text } | null — set from ?twitter_connect=... on boot (Phase 29b)
   tiktokConnectNotice: null, // { ok, text } | null — set from ?tiktok_connect=... on boot (Phase 29c)
   metaConnectNotice: null, // { ok, text } | null — set from ?meta_connect=... on boot (Phase 29d)
+  pinterestConnectNotice: null, // { ok, text } | null — set from ?pinterest_connect=... on boot (Phase 29e)
   composer: {
     platform: "youtube",
     accounts: [],
     accountsLoading: false,
     accountsError: null,
     accountId: "",
+    boards: [], // pinterest only — populated by loadComposerBoards()
+    boardsLoading: false,
+    boardsError: null,
+    boardId: "",
     submitting: false,
   },
 };
@@ -700,16 +705,47 @@ async function loadComposerAccounts() {
   }
   if (!c.accounts.some((a) => String(a.id) === c.accountId)) {
     // Default to the first available account for platforms with no single-account
-    // fallback (tiktok/facebook/instagram) — their <select> has no "no account"
-    // option, so with exactly one account the browser auto-selects it visually
-    // even though a "change" event never fires to update this state. Without
-    // this, submission reads an empty accountId and blocks with a misleading
-    // "none selected" error despite the UI showing an account chosen.
+    // fallback (tiktok/facebook/instagram/pinterest) — their <select> has no "no
+    // account" option, so with exactly one account the browser auto-selects it
+    // visually even though a "change" event never fires to update this state.
+    // Without this, submission reads an empty accountId and blocks with a
+    // misleading "none selected" error despite the UI showing an account chosen.
     c.accountId = ACCOUNT_REQUIRED_PLATFORMS.has(c.platform) && c.accounts.length > 0
       ? String(c.accounts[0].id)
       : "";
   }
   c.accountsLoading = false;
+  renderAll();
+  if (c.platform === "pinterest") loadComposerBoards();
+}
+
+// Pinterest only (Phase 29e): fetches the boards the selected account can
+// post to, so the Composer can offer a <select> of real board names instead
+// of making the operator type a numeric board_id by hand. Falls back to a
+// plain text input (see renderComposerPlatformFields) when this fails —
+// never blocks job creation on its own.
+async function loadComposerBoards() {
+  const c = state.composer;
+  if (!c.accountId) {
+    c.boards = [];
+    c.boardsError = null;
+    c.boardId = "";
+    renderAll();
+    return;
+  }
+  c.boardsLoading = true;
+  c.boardsError = null;
+  renderAll();
+  try {
+    c.boards = await fetchJson(`/api/accounts/${c.accountId}/boards`);
+  } catch (e) {
+    c.boards = [];
+    c.boardsError = e.message;
+  }
+  if (!c.boards.some((b) => b.id === c.boardId)) {
+    c.boardId = c.boards.length > 0 ? c.boards[0].id : "";
+  }
+  c.boardsLoading = false;
   renderAll();
 }
 
@@ -720,6 +756,10 @@ function openComposer() {
     accountsLoading: false,
     accountsError: null,
     accountId: "",
+    boards: [],
+    boardsLoading: false,
+    boardsError: null,
+    boardId: "",
     submitting: false,
   };
   goScreen("composer");
@@ -730,6 +770,8 @@ function setComposerPlatform(platform) {
   if (state.composer.platform === platform) return;
   state.composer.platform = platform;
   state.composer.accountId = "";
+  state.composer.boards = [];
+  state.composer.boardId = "";
   renderAll();
   loadComposerAccounts();
 }
@@ -1173,6 +1215,7 @@ function renderAccounts() {
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/twitter/start">Connect X/Twitter</a>
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/tiktok/start">Connect TikTok</a>
         <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/meta/start">Connect Facebook & Instagram</a>
+        <a class="btn-primary" style="text-decoration:none;" href="/api/oauth/pinterest/start">Connect Pinterest</a>
       </div>`
     : "";
 
@@ -1216,13 +1259,14 @@ function renderAccounts() {
     renderNotice(state.youtubeConnectNotice) +
     renderNotice(state.twitterConnectNotice) +
     renderNotice(state.tiktokConnectNotice) +
-    renderNotice(state.metaConnectNotice);
+    renderNotice(state.metaConnectNotice) +
+    renderNotice(state.pinterestConnectNotice);
   return `
     <div style="font-size:13px;color:var(--muted);margin-bottom:16px;">Connected platforms for ${escapeHtml(activeClientLabel().name)}</div>
     ${noticeHtml}
     ${connectHtml}
     ${body}
-    <p style="font-size:12px;color:var(--muted);margin-top:16px;">YouTube, X/Twitter, TikTok and Facebook/Instagram can be connected above (Phases 29a/29b/29c/29d); every other platform's onboarding isn't built in this UI yet — use the <code>scripts/authorize_*.py</code> CLI scripts, then it shows up here.</p>
+    <p style="font-size:12px;color:var(--muted);margin-top:16px;">YouTube, X/Twitter, TikTok, Facebook/Instagram and Pinterest can be connected above (Phases 29a/29b/29c/29d/29e); every other platform's onboarding isn't built in this UI yet — use the <code>scripts/authorize_*.py</code> CLI scripts, then it shows up here.</p>
   `;
 }
 
@@ -1304,19 +1348,63 @@ function renderComposerPlatformFields(platform) {
       </div>
     `;
   }
-  // instagram
+  if (platform === "instagram") {
+    return `
+      <div class="form-group">
+        <div class="form-label">Media (required — one photo or video)</div>
+        <div class="dropzone">
+          <i data-lucide="upload" style="width:18px;height:18px;"></i>
+          <input type="file" id="composer-media-file" accept="image/*,video/*" />
+        </div>
+        <div class="form-hint">Instagram has no text-only post type and needs a publicly accessible media URL — the server stages this to Cloudflare R2 automatically. If R2 isn't configured, job creation will fail with a clear error below.</div>
+      </div>
+      <div class="form-group">
+        <div class="form-label">Caption (optional)</div>
+        <textarea id="composer-text" class="form-input composer-textarea" placeholder="Write a caption…"></textarea>
+      </div>
+    `;
+  }
+  // pinterest (Phase 29e)
+  const c = state.composer;
+  let boardFieldHtml;
+  if (c.boardsLoading) {
+    boardFieldHtml = `<div class="form-hint">Loading boards…</div>`;
+  } else if (c.boardsError) {
+    boardFieldHtml = `
+      <div class="form-hint form-hint-warn">Could not load boards: ${escapeHtml(c.boardsError)}. Enter a board ID manually.</div>
+      <input type="text" id="composer-board-manual" class="form-input" placeholder="Board ID" />
+    `;
+  } else if (c.boards.length === 0) {
+    boardFieldHtml = `
+      <div class="form-hint">${c.accountId ? "No boards found for this account." : "Select an account to load its boards."}</div>
+      <input type="text" id="composer-board-manual" class="form-input" placeholder="Board ID" />
+    `;
+  } else {
+    const options = c.boards
+      .map((b) => `<option value="${escapeHtml(b.id)}" ${b.id === c.boardId ? "selected" : ""}>${escapeHtml(b.name)}</option>`)
+      .join("");
+    boardFieldHtml = `<select id="composer-board" class="form-input">${options}</select>`;
+  }
   return `
     <div class="form-group">
-      <div class="form-label">Media (required — one photo or video)</div>
+      <div class="form-label">Title</div>
+      <input type="text" id="composer-title" class="form-input" placeholder="Required by Pinterest" />
+    </div>
+    <div class="form-group">
+      <div class="form-label">Board</div>
+      ${boardFieldHtml}
+    </div>
+    <div class="form-group">
+      <div class="form-label">Description (optional)</div>
+      <textarea id="composer-text" class="form-input composer-textarea" placeholder="Write a description…"></textarea>
+    </div>
+    <div class="form-group">
+      <div class="form-label">Media (required — one image or video)</div>
       <div class="dropzone">
         <i data-lucide="upload" style="width:18px;height:18px;"></i>
         <input type="file" id="composer-media-file" accept="image/*,video/*" />
       </div>
-      <div class="form-hint">Instagram has no text-only post type and needs a publicly accessible media URL — the server stages this to Cloudflare R2 automatically. If R2 isn't configured, job creation will fail with a clear error below.</div>
-    </div>
-    <div class="form-group">
-      <div class="form-label">Caption (optional)</div>
-      <textarea id="composer-text" class="form-input composer-textarea" placeholder="Write a caption…"></textarea>
+      <div class="form-hint">An image needs a publicly accessible URL — the server stages it to Cloudflare R2 automatically. A video is uploaded directly to Pinterest.</div>
     </div>
   `;
 }
@@ -1474,8 +1562,7 @@ async function submitComposer(e) {
     }
     if (text) fd.append("text", text);
     if (file) fd.append("media_files", file);
-  } else {
-    // instagram
+  } else if (platform === "instagram") {
     const fileEl = document.getElementById("composer-media-file");
     const file = fileEl && fileEl.files[0];
     if (!file) {
@@ -1483,6 +1570,31 @@ async function submitComposer(e) {
       return;
     }
     fd.append("media_files", file);
+    const text = document.getElementById("composer-text").value.trim();
+    if (text) fd.append("text", text);
+  } else {
+    // pinterest
+    const fileEl = document.getElementById("composer-media-file");
+    const file = fileEl && fileEl.files[0];
+    if (!file) {
+      setComposerError("A media file is required for a Pinterest Pin.");
+      return;
+    }
+    const title = document.getElementById("composer-title").value.trim();
+    if (!title) {
+      setComposerError("A title is required for a Pinterest Pin.");
+      return;
+    }
+    const boardSel = document.getElementById("composer-board");
+    const boardManual = document.getElementById("composer-board-manual");
+    const boardId = (boardSel ? boardSel.value : boardManual ? boardManual.value : "").trim();
+    if (!boardId) {
+      setComposerError("A destination board is required for a Pinterest Pin.");
+      return;
+    }
+    fd.append("media_files", file);
+    fd.append("title", title);
+    fd.append("board_id", boardId);
     const text = document.getElementById("composer-text").value.trim();
     if (text) fd.append("text", text);
   }
@@ -1517,6 +1629,14 @@ function wireComposerEvents() {
   if (accountSel) {
     accountSel.addEventListener("change", () => {
       state.composer.accountId = accountSel.value;
+      if (state.composer.platform === "pinterest") loadComposerBoards();
+    });
+  }
+
+  const boardSel = document.getElementById("composer-board");
+  if (boardSel) {
+    boardSel.addEventListener("change", () => {
+      state.composer.boardId = boardSel.value;
     });
   }
 
@@ -2061,10 +2181,11 @@ async function submitRegister(e) {
 
 // Reads ?screen=...&youtube_connect=success|error&reason=... (Phase 29a),
 // ?twitter_connect=success|error&reason=... (Phase 29b),
-// ?tiktok_connect=success|error&reason=... (Phase 29c) or
-// ?meta_connect=success|error&reason=...&facebook=N&instagram=M (Phase 29d)
-// left by the /api/oauth/{youtube,twitter,tiktok,meta}/callback redirect —
-// a full-page browser navigation, so this is how those routes report their
+// ?tiktok_connect=success|error&reason=... (Phase 29c),
+// ?meta_connect=success|error&reason=...&facebook=N&instagram=M (Phase 29d) or
+// ?pinterest_connect=success|error&reason=... (Phase 29e) left by the
+// /api/oauth/{youtube,twitter,tiktok,meta,pinterest}/callback redirect — a
+// full-page browser navigation, so this is how those routes report their
 // outcome back into the SPA instead of a fetch() response — and strips them
 // from the URL via history.replaceState so a page refresh doesn't re-show
 // the same notice.
@@ -2110,7 +2231,15 @@ function consumeOauthRedirectParams() {
     state.metaConnectNotice = { ok: false, text: `Could not connect Facebook/Instagram (${reason}). Please try again.` };
   }
 
-  if (screen || youtubeConnect || twitterConnect || tiktokConnect || metaConnect) {
+  const pinterestConnect = params.get("pinterest_connect");
+  if (pinterestConnect === "success") {
+    state.pinterestConnectNotice = { ok: true, text: "Pinterest account connected." };
+  } else if (pinterestConnect === "error") {
+    const reason = params.get("reason") || "unknown_error";
+    state.pinterestConnectNotice = { ok: false, text: `Could not connect Pinterest (${reason}). Please try again.` };
+  }
+
+  if (screen || youtubeConnect || twitterConnect || tiktokConnect || metaConnect || pinterestConnect) {
     window.history.replaceState({}, "", window.location.pathname);
   }
 }

@@ -30,6 +30,7 @@ from app.publishers import facebook as facebook_publisher
 from app.publishers import fake as fake_publisher
 from app.publishers import instagram as instagram_publisher
 from app.publishers import meta as meta_publisher
+from app.publishers import pinterest as pinterest_publisher
 from app.publishers import tiktok as tiktok_publisher
 from app.publishers import twitter as twitter_publisher
 from app.publishers import youtube as youtube_publisher
@@ -47,6 +48,7 @@ _PUBLISHERS_BY_PLATFORM = {
     "tiktok": tiktok_publisher.publish,
     "facebook": facebook_publisher.publish,
     "instagram": instagram_publisher.publish,
+    "pinterest": pinterest_publisher.publish,
 }
 
 # Platforms whose publisher module exposes the proactive-refresh helpers
@@ -62,6 +64,7 @@ _TOKEN_REFRESH_MODULES_BY_PLATFORM = {
     "twitter": twitter_publisher,
     "facebook": meta_publisher,
     "instagram": meta_publisher,
+    "pinterest": pinterest_publisher,
 }
 
 # Human-readable re-authorization instructions per platform, named in the
@@ -71,6 +74,10 @@ _TOKEN_REFRESH_MODULES_BY_PLATFORM = {
 # interactive authorize script yet (unlike youtube/tiktok's
 # scripts/authorize_*.py) — re-authorization means running X's OAuth 2.0
 # PKCE flow by hand and registering the result via scripts/add_account.py.
+# Pinterest (Phase 29e) likewise has no CLI script — unlike Twitter, it
+# never did, since its in-browser self-service "Connect Pinterest" flow
+# (dashboard/api.py) was built from the start as the only way to authorize
+# it, so the instructions point straight there.
 _REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM = {
     "youtube": 'python -m scripts.authorize_youtube --account "{name}"',
     "tiktok": 'python -m scripts.authorize_tiktok --account "{name}"',
@@ -83,6 +90,10 @@ _REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM = {
     "instagram": (
         'python -m scripts.authorize_meta --account "{name}" (re-authorizing the linked '
         "Facebook Page refreshes this Instagram account's credentials too)"
+    ),
+    "pinterest": (
+        'have the client re-click "Connect Pinterest" on the dashboard\'s Connected Accounts screen '
+        '(client_user session) to re-authorize account "{name}" — Pinterest has no CLI authorize script'
     ),
 }
 
@@ -99,6 +110,9 @@ _TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM = {
     # instead of the 45-minute default.
     "facebook": 7 * 24 * 60 * 60,
     "instagram": 7 * 24 * 60 * 60,
+    # Pinterest access tokens last 30 days (Phase 29e point 2) — wider than
+    # the 45-minute default, but not wide enough to need Meta's 7-day window.
+    "pinterest": 24 * 60 * 60,
 }
 
 

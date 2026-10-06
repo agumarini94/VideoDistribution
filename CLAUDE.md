@@ -2572,6 +2572,144 @@ unit-tested without Redis or a worker running.
   parameter, not added here since the phase brief scoped this to
   self-service only.
 
+### Phase 29e (current)
+- **Pinterest publisher + in-browser OAuth** (`app/publishers/pinterest.py`)
+  — the fifth self-service "Connect ..." platform (after YouTube/Twitter/
+  TikTok/Meta, Phases 29a-d), and the first Pinterest integration in this
+  project at all. Built "ready waiting for credentials" like every real
+  publisher before it: no real Pinterest Developer app exists yet, so
+  everything is exercised only against fully mocked HTTP
+  (`tests/test_publisher_pinterest.py`,
+  `tests/test_tasks_pinterest_token_refresh.py`,
+  `tests/test_dashboard_pinterest_oauth.py`,
+  `tests/test_dashboard_pinterest_boards.py`), not a live account.
+  - **OAuth, no PKCE** (confirmed against developers.pinterest.com, not
+    guessed by analogy): `GET https://www.pinterest.com/oauth/` ->
+    `POST https://api.pinterest.com/v5/oauth/token`, confidential-app HTTP
+    Basic auth (`PINTEREST_APP_ID`:`PINTEREST_APP_SECRET`, read directly
+    from the environment via `_app_credentials()` — same pattern as
+    `meta.py`'s/`facebook.py`'s, **not** `twitter.py`'s older pattern of
+    duplicating the app secret into every Account row's credentials, since
+    there's no benefit to that duplication here). Scopes: `boards:read,
+    pins:write` only (minimal — no `boards:read_secret`/`pins:read`).
+  - **Refresh tokens ROTATE** ("continuous refresh", confirmed via
+    Pinterest's own developer community posts) — same single-use/rotating
+    contract as `twitter.py`'s, unlike Meta's non-rotating long-lived
+    token: `refresh_stored_credentials()` returns a NEW access_token AND a
+    NEW refresh_token every time, and a response missing the rotated
+    refresh_token is treated as `TransientError` rather than silently
+    reusing the now-invalidated old one. Registered in
+    `_TOKEN_REFRESH_MODULES_BY_PLATFORM`/`_TOKEN_REFRESH_WINDOW_SECONDS_BY_PLATFORM`
+    (`app/tasks.py`) with a 24-hour proactive window (access tokens last 30
+    days). No CLI authorize script exists or ever will — re-authorization
+    instructions (`_REAUTHORIZE_INSTRUCTIONS_BY_PLATFORM`) point straight at
+    the dashboard's "Connect Pinterest" button.
+  - **No env-var single-account fallback** (same posture as
+    `tiktok.py`/`facebook.py`/`instagram.py`): every `platform="pinterest"`
+    job needs an `Account` row, created via the self-service OAuth flow or
+    `scripts/add_account.py`.
+  - **Payload contract**: `board_id` and `title` are both required (an
+    image Pin: `media_public_url`, Pinterest downloads it directly, no
+    upload step; a video Pin: a single `media_paths` local file, since
+    Pinterest video Pins cannot use a direct URL — its own mandatory 3-step
+    upload flow is used instead: `POST /v5/media` to register ->
+    `POST <presigned S3 upload_url>` with the raw file -> poll
+    `GET /v5/media/{id}` until `status="succeeded"` -> `POST /v5/pins` with
+    `media_source.video_id`). `media_public_url` and `media_paths` are
+    mutually exclusive — exactly one is required. Optional:
+    `description` (falls back to `payload["text"]`), `link`,
+    `cover_image_url` (video only — **if omitted, defaults to
+    `cover_image_key_frame_time: 0`**, the video's own first frame, per
+    this phase's explicit decision, rather than requiring a separate cover
+    image). Result dict: `external_id` is the Pin id, plus `board_id`.
+  - **Error classification**: the real Pinterest error-body shape couldn't
+    be confirmed against rendered docs this session, so classification
+    leans on HTTP status alone (429/5xx -> `TransientError`; 401 ->
+    `TokenExpiredError` on publish-time calls, enabling the existing
+    `_handle_token_expired` reactive-refresh path for free, same as
+    Facebook/Instagram; other 4xx -> `PermanentError`) — flagged in-code as
+    unverified, same caveat as every other publisher's error table before
+    real credentials exist. The S3 upload step (not a Pinterest API call)
+    is classified even more defensively: any non-2xx is `TransientError`.
+  - **Board picker — new endpoint**: `GET /api/accounts/{id}/boards`
+    (`dashboard/api.py`) calls a new pure `pinterest.py::list_boards()`
+    (paginated via Pinterest's `bookmark` cursor), used only by the
+    Composer's board `<select>` — never by `publish()`/`app/tasks.py`, so a
+    401 there is a plain `PermanentError`, not `TokenExpiredError` (same
+    reasoning as `meta.py::list_pages`). Ownership-scoped exactly like
+    every other Account-addressed route (`client_user` 403 on a
+    cross-tenant or unscoped account; admin unscoped). Surfaces upstream
+    `PermanentError`/`TransientError` as a clean `502`/`503` instead of a
+    raw 500, so the Composer can fall back to a plain text "Board ID" input
+    when the picker fails rather than being stuck.
+  - **Dashboard OAuth routes**: `GET /api/oauth/pinterest/start`
+    (`client_user`-only) / `GET /api/oauth/pinterest/callback` (public —
+    added to `_PUBLIC_API_PATHS`), mirroring `meta_oauth_start`/
+    `meta_oauth_callback`'s shape exactly (no PKCE verifier in `state`,
+    unlike Twitter's/TikTok's). Upserts an `Account`
+    (`"<Client name> (self-service)"`) via the same
+    `scripts/add_account.py::upsert_account` helper every other platform
+    uses — reconnecting rotates the same row in place.
+  - **Dashboard NEW JOB / Composer form**: `pinterest` added to
+    `_SUPPORTED_PLATFORMS` and `_ACCOUNT_REQUIRED_PLATFORMS`
+    (`dashboard/api.py`); `create_job` gained a `board_id` form field and a
+    pinterest branch requiring `title` + `board_id` + exactly one media
+    file, auto-detecting image (staged to R2, 400s up front if staging
+    fails — same as Instagram) vs. video (local path only, no R2 staging,
+    since Pinterest's own upload flow reads the raw file) from the
+    uploaded file's guessed MIME type. `dashboard/static/index.html`'s
+    Composer gained a Pinterest platform chip, a title field, a board
+    `<select>` fed by `GET /api/accounts/{id}/boards` (falling back to a
+    plain text "Board ID" input if the fetch fails or the account has no
+    boards yet), a description textarea, and a media file input; a fourth
+    "Connect Pinterest" button was added to Connected Accounts alongside
+    the other four self-service buttons.
+- `scripts/enqueue_pinterest_test.py` — `--mode image|video`, `--file`,
+  `--account` (required, no single-account fallback), `--board-id`
+  (required), optional `--title`/`--description`. For `--mode image` it
+  uploads to R2 itself first (same reason `enqueue_instagram_test.py`
+  does); for `--mode video` it just passes the local path through, since
+  `pinterest.py` uploads the raw file itself.
+- Covered by `tests/test_publisher_pinterest.py` (credential resolution,
+  payload validation incl. the image-vs-video media-source mismatch cases,
+  image Pin happy path, the full video-Pin 3-step flow incl. default
+  key-frame-0 cover vs. an explicit `cover_image_url`, processing
+  failed/timeout, S3 upload failure, error classification, board listing
+  + pagination, token refresh rotation incl. the missing-rotated-token
+  safeguard, and the OAuth build/exchange functions — no PKCE assertions,
+  unlike Twitter's/TikTok's equivalent tests),
+  `tests/test_tasks_pinterest_token_refresh.py` (reactive retry-once and
+  proactive Beat refresh, modeled on the Facebook/Instagram equivalents),
+  `tests/test_dashboard_pinterest_oauth.py` (FastAPI `TestClient`, modeled
+  on `test_dashboard_meta_oauth.py` minus PKCE) and
+  `tests/test_dashboard_pinterest_boards.py` (ownership scoping of the new
+  boards endpoint, including the `502`/`503` upstream-error mapping). Whole
+  suite green (`.venv/bin/python -m pytest -q` -> 463 passed).
+
+  **When Pinterest credentials arrive:**
+  1. Create an app at developers.pinterest.com/apps, request `boards:read`
+     and `pins:write` (Trial access is the default tier — 1,000 requests/
+     day, and Pins you create are visible only to you; Standard access,
+     which lifts both limits, requires submitting a demo video for
+     review — same kind of Sandbox-vs-production gate as TikTok's, Phase
+     10).
+  2. Register `http://localhost:8000/api/oauth/pinterest/callback` as a
+     redirect URI (adjust host/port for wherever the dashboard runs
+     locally — `/api/oauth/pinterest/start` derives `redirect_uri` from the
+     incoming request, so it always matches whatever's registered as long
+     as that's what's typed into the browser). In production, add the real
+     deployed origin's equivalent.
+  3. Set `PINTEREST_APP_ID`/`PINTEREST_APP_SECRET` in `.env`.
+  4. Test by clicking "Connect Pinterest" on the Connected Accounts screen
+     (as a `client_user`), then
+     `python -m scripts.enqueue_pinterest_test --mode image --file
+     photo.jpg --account "<Client name> (self-service)" --board-id
+     <board_id>` (find a real `board_id` via `GET /api/accounts/{id}/boards`
+     once connected), then `--mode video` once that works.
+  5. Watch a reactive refresh happen naturally the first time the stored
+     access token is rejected mid-publish, and confirm rotation persists
+     correctly onto the `Account` row (`scripts/show_accounts.py`).
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)
