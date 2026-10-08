@@ -2572,6 +2572,109 @@ unit-tested without Redis or a worker running.
   parameter, not added here since the phase brief scoped this to
   self-service only.
 
+### Phase 34 (current)
+- **`JobStatus.NEEDS_USER_ACTION`** (new status) — fixes a misleading
+  Monitor display: a TikTok job was ending as `PUBLISHED` even though the
+  video was only sitting as a draft in the account's TikTok inbox, waiting
+  for a human to actually post it. Semantics: the engine's part is done,
+  but the content isn't live yet and someone has to take an action on the
+  platform's own app/site to finish it. **No DB migration** — `Job.status`
+  is stored as a plain `VARCHAR(20)` (`Enum(JobStatus, native_enum=False,
+  length=20)`), not a native Postgres enum, and `"needs_user_action"` is 17
+  characters, so the new value just works on an existing Neon database with
+  no `ALTER TABLE`.
+  - **Why TikTok lands here — corrected 2026-10-08, NOT a Sandbox
+    limitation**: earlier docs (Phase 10) attributed the inbox-landing
+    behavior to the app's TikTok review not having passed yet. That was
+    wrong, or at least stale: the app was reviewed and has been live in
+    production since 2026-10-08. The real reason is permission scope, not
+    review status — this app holds the `video.upload` permission but not
+    `video.publish` (Direct Post), which is a separate, more sensitive
+    permission requiring its own request/approval in the Developer Portal.
+    With only `video.upload`, every upload lands as a draft in the target
+    account's TikTok inbox regardless of whether the app itself is
+    Sandbox or production — see the corrected module docstring in
+    `app/publishers/tiktok.py` for the full explanation. This correction
+    does not change anything about Phase 10's inbox-vs-Direct-Post
+    migration path (still a small, contained change once `video.publish`
+    is requested and approved) or Phase 10b's webhook mechanics below.
+  - **`app/publishers/tiktok.py::publish()`** — the result dict now
+    includes `"requires_user_action": True` on every successful inbox
+    upload. **`app/tasks.py::publish_job`** checks this key after a
+    successful publish: `True` -> `JobStatus.NEEDS_USER_ACTION`, absent or
+    `False` -> `JobStatus.PUBLISHED` (unchanged behavior for every other
+    publisher, none of which set this key). Same "publisher returns data,
+    task persists the right state" pattern already used for
+    `refreshed_credentials`/`external_id`/`playlist_error` — generic over
+    platform, not a hardcoded `if job.platform == "tiktok"` check, so a
+    future publisher landing in the same situation only needs to set the
+    flag, no `app/tasks.py` change.
+  - **TikTok's own confirmation webhook already promotes this status —
+    once it's actually connected**: `handle_tiktok_webhook_event`'s
+    success-event branch (Phase 10b) already does
+    `if job.status != FAILED: job.status = PUBLISHED`, so a
+    `video.publish.completed` event (TikTok's confirmation that the user
+    manually posted the draft) correctly promotes a `NEEDS_USER_ACTION` job
+    to `PUBLISHED` with no code change needed there. **This is not
+    reachable in practice yet**: per Phase 10b's "what remains" note, the
+    callback URL still hasn't been registered in the TikTok Developer
+    Portal, so no real webhook call has ever been observed — a
+    `NEEDS_USER_ACTION` TikTok job today just stays in that state
+    indefinitely (the owner posting it from the app doesn't update
+    anything here) until that registration happens. Flagged in both
+    `app/publishers/tiktok.py` and `app/tasks.py`'s docstrings, not just
+    here.
+  - **No backfill**: jobs that were already `PUBLISHED` before this phase
+    (all of them test jobs so far) are left exactly as they are — this
+    phase only changes the outcome of *new* publish attempts.
+- **Monitor UI** (`dashboard/static/index.html`) — color and copy changes
+  only, no new endpoints (every screen that lists jobs already gets
+  `needs_user_action` for free via `JobStatus` iteration in
+  `dashboard/api.py`'s `by_status`/`AnalyticsSummaryOut`, which were
+  already generic over the enum).
+  - **`STATUS_STYLE` recolored** to a consistent meaning everywhere a
+    status pill renders (Queue table, Calendar agenda rows, Calendar
+    month-grid day chips — all three already read from this one map):
+    green = `published`, yellow = `needs_user_action`, red = `failed`, and
+    the three in-flight states (`scheduled`/`queued`/`processing`) stay in
+    distinct neutral gray/slate tones. The label text is always shown next
+    to the color, never color-only — `needs_user_action`'s pill reads
+    **"Needs owner action"**, not just "Needs action", so it's clear whose
+    action is pending.
+  - **`STATUS_HINTS`** (new) — a short "what to do" line shown wherever a
+    status is shown, keyed by status then by platform (falling back to a
+    generic `default`), since the same status can mean something different
+    depending on which platform/flow produced it. TikTok's
+    `needs_user_action` hint: "The video is in TikTok's inbox — open the
+    TikTok app, tap the notification, and post it from there. It can take a
+    few minutes to appear." Rendered as a muted line under the caption in
+    the Queue table and the Calendar agenda view; the Calendar month-grid
+    day chips have no room for a second line, so the hint (plus the status
+    word) is appended to that chip's existing hover tooltip instead of
+    being dropped.
+  - **`QUEUE_FILTERS`** gained a "Needs owner action" chip
+    (`needs_user_action`), alongside the existing status filter chips.
+- **Tests**: `tests/test_tasks_publish_job_status.py` (new) —
+  `requires_user_action: True` sets `NEEDS_USER_ACTION`; the flag absent or
+  explicitly `False` still sets `PUBLISHED` (publisher monkeypatched into
+  `_PUBLISHERS_BY_PLATFORM`, no real HTTP, same pattern as
+  `tests/test_tasks_facebook_token_refresh.py`). `tests/test_publisher_tiktok.py`'s
+  happy-path test updated to assert the new key on `publish()`'s result.
+  `tests/test_tasks_tiktok_webhook_event.py` gained a case asserting a
+  `NEEDS_USER_ACTION` job is promoted to `PUBLISHED` by a
+  `video.publish.completed` event. No new test needed for the `by_status`/
+  `AnalyticsSummaryOut` zero-fill — both already iterate `JobStatus`
+  generically and are covered by existing tests that build that dict from
+  the live enum. No automated frontend test (no JS test harness in this
+  project) — the color/label/hint changes are UI-only and were checked by
+  reading through every `statusStyle()`/`statusHint()` call site by hand.
+  Whole suite green (`.venv/bin/python -m pytest -q` -> 523 passed).
+- **Not built / out of scope**: no change to `scripts/check_tiktok_status.py`
+  or `scripts/authorize_tiktok.py`'s own Sandbox-flavored comments (they
+  describe a different concern — target-account registration and
+  `fetch_post_status`, not the inbox-vs-Direct-Post reason this phase
+  corrected) — left as a follow-up pass if they turn out to be stale too.
+
 ### Phase 29e (current)
 - **Pinterest publisher + in-browser OAuth** (`app/publishers/pinterest.py`)
   — the fifth self-service "Connect ..." platform (after YouTube/Twitter/

@@ -111,7 +111,11 @@ class TestHappyPath:
 
         result = tiktok_publisher.publish("tiktok", _payload(video_file), CREDENTIALS)
 
-        assert result == {"platform": "tiktok", "external_id": "pub-123"}
+        # requires_user_action=True (Phase 34) is how app/tasks.py::publish_job
+        # knows to persist JobStatus.NEEDS_USER_ACTION instead of PUBLISHED —
+        # the video uploaded, but it's a draft in the account's TikTok inbox
+        # until the owner posts it themselves.
+        assert result == {"platform": "tiktok", "external_id": "pub-123", "requires_user_action": True}
         assert len(responses.calls) == 2  # the init POST + exactly one PUT chunk
 
 

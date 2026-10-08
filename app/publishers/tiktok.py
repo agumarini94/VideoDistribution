@@ -1,24 +1,38 @@
 """
-Real TikTok publisher (Content Posting API v2) — Sandbox mode.
+Real TikTok publisher (Content Posting API v2).
 
 Same contract as the other publishers in this package: publish() is a pure
 function that knows nothing about Celery or the database. It either returns
 a result dict or raises TransientError / PermanentError.
 
-Sandbox limitation (Phase 10): the app's TikTok Developer Portal review has
-not passed yet, so only the `video.upload` scope is granted — `video.publish`
-(Direct Post) is gated behind app review. This means every upload lands as a
-draft in the target account's TikTok inbox (the user still has to open the
-TikTok app and manually post it) rather than being published directly. This
-also only works against Sandbox target accounts registered in the portal
-until review passes.
+Why uploads land in the inbox instead of being published (corrected
+2026-10-08, Phase 34 — this was previously misdocumented as a Sandbox
+limitation): it is NOT a Sandbox limitation. The app was reviewed and has
+been live in production since 2026-10-08. The actual reason is simpler:
+this app only holds the `video.upload` permission, not `video.publish`
+(Direct Post) — a separate, more sensitive permission that has to be
+requested and approved on its own in the TikTok Developer Portal. With only
+`video.upload`, every upload lands as a draft in the target account's
+TikTok inbox — the account owner still has to open the TikTok app, tap the
+notification, and manually post it from there. This applies to any account
+that completes the OAuth flow with this app, not just pre-registered
+Sandbox testers (that registration requirement no longer applies now that
+the app is in production).
+
+app/tasks.py::publish_job persists this as JobStatus.NEEDS_USER_ACTION
+(Phase 34), not PUBLISHED, via the "requires_user_action" key below. TikTok
+can later confirm the user actually posted it via a webhook event
+(app/webhooks/tiktok.py, app/tasks.py::handle_tiktok_webhook_event), which
+would promote the job to PUBLISHED — but as of this phase that callback URL
+still hasn't been registered in the Developer Portal, so that promotion
+does not happen automatically yet (see CLAUDE.md Phase 10b/34).
 
 Inbox upload vs. Direct Post: the two flows differ only in which init
 endpoint is called and what the request body contains — the chunked upload
 mechanics after that point are identical. Everything endpoint/body-specific
 is isolated in _init_upload/_build_init_body below, with the switch marked
-inline, so moving to Direct Post once video.publish is approved is a small,
-contained change.
+inline, so moving to Direct Post once video.publish is requested and
+approved is a small, contained change.
 
 Auth: bearer access_token from account_credentials (an Account.credentials
 dict: access_token, refresh_token, expires_at, open_id, scope — see
@@ -60,9 +74,10 @@ from app.exceptions import PermanentError, TransientError
 
 AUTHORIZE_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
-# Sandbox only grants video.upload; user.info.basic is requested alongside it
-# because TikTok's Login Kit requires at least one basic-info scope in the
-# same authorization.
+# This app only holds the video.upload permission (not video.publish /
+# Direct Post — see module docstring); user.info.basic is requested
+# alongside it because TikTok's Login Kit requires at least one basic-info
+# scope in the same authorization.
 SCOPES = "user.info.basic,video.upload"
 
 _FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
@@ -74,11 +89,13 @@ _TRANSIENT_TOKEN_ERROR_CODES = {"server_error", "temporarily_unavailable"}
 
 # --- Content Posting API (inbox upload) ---------------------------------
 
-# Sandbox-only endpoint: uploads land as a draft in the user's TikTok inbox
-# instead of being published. When video.publish is approved, switch to
-# Direct Post by pointing _init_upload at this URL and adding a "post_info"
-# object (title, privacy_level, disable_comment, ...) to the request body
-# built in _build_init_body — the chunked upload step below doesn't change.
+# Used because this app only holds the video.upload permission (not
+# video.publish / Direct Post — see module docstring): uploads land as a
+# draft in the user's TikTok inbox instead of being published. If
+# video.publish is requested and approved later, switch to Direct Post by
+# pointing _init_upload at this URL and adding a "post_info" object (title,
+# privacy_level, disable_comment, ...) to the request body built in
+# _build_init_body — the chunked upload step below doesn't change.
 _INBOX_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
 _DIRECT_POST_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"  # not used yet, see above
 
@@ -104,8 +121,11 @@ def publish(platform: str, payload: dict, account_credentials: dict | None = Non
     Uploads a video to TikTok via the inbox-upload flow: POST .../init/ to
     get a publish_id + upload_url, then PUT the file to upload_url in
     chunks. The video lands as a draft in the target account's TikTok inbox
-    (Sandbox limitation — see module docstring), it is not published
-    automatically.
+    rather than being published automatically — not a Sandbox limitation,
+    just this app's current video.upload-only permission (see module
+    docstring). The returned "requires_user_action" flag is how
+    app/tasks.py::publish_job knows to persist JobStatus.NEEDS_USER_ACTION
+    instead of PUBLISHED.
 
     Expected payload keys: video_path (required). `title` is accepted but
     unused in inbox mode (TikTok assigns no caption until the user manually
@@ -126,7 +146,13 @@ def publish(platform: str, payload: dict, account_credentials: dict | None = Non
         publish_id, upload_url = _init_upload(access_token, video_size, chunk_size, total_chunk_count)
         _upload_chunks(upload_url, video_path, video_size, chunk_size, total_chunk_count)
 
-        return {"platform": "tiktok", "external_id": publish_id}
+        # requires_user_action=True tells app/tasks.py::publish_job to
+        # persist JobStatus.NEEDS_USER_ACTION instead of PUBLISHED — the
+        # upload succeeded, but it's a draft in the account's TikTok inbox,
+        # not a live post, until the account owner manually posts it (see
+        # module docstring for why: video.upload-only permission, not a
+        # Sandbox limitation).
+        return {"platform": "tiktok", "external_id": publish_id, "requires_user_action": True}
     except (TransientError, PermanentError):
         raise
     except requests.RequestException as exc:

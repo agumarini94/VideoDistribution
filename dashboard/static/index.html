@@ -209,7 +209,9 @@
     justify-content: center; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 11px;
     color: var(--accent-dark); flex: none;
   }
-  .agenda-caption { flex: 1; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agenda-caption { flex: 1; min-width: 0; }
+  .agenda-caption-text { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agenda-hint { font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .agenda-client { font-size: 11px; color: var(--muted); flex: none; }
   .status-pill { font-size: 11px; padding: 3px 9px; flex: none; }
 
@@ -447,19 +449,48 @@ const ACCOUNT_REQUIRED_PLATFORMS = new Set(["tiktok", "facebook", "instagram", "
 const TWITTER_CHAR_LIMIT = 280;
 const THREADS_CHAR_LIMIT = 500;
 
+// Color groups, per the Monitor redesign (not just the pill's own color —
+// the label text is always shown too, color is a secondary cue):
+// green = published (succeeded, live), yellow = needs_user_action (engine's
+// part is done, but the account owner still has to finish it on the
+// platform's own app), red = failed, and the three in-flight states
+// (scheduled/queued/processing) stay in neutral gray/slate tones distinct
+// from all three outcome colors.
 const STATUS_STYLE = {
-  scheduled: { bg: "#eef6ff", color: "#2c455d", label: "Scheduled" },
+  scheduled: { bg: "#e9ebed", color: "#4a4f54", label: "Scheduled" },
   queued: { bg: "#e7e7ea", color: "#424244", label: "Queued" },
-  processing: { bg: "#d6ebff", color: "#416180", label: "Processing" },
-  published: { bg: "#eef6ff", color: "#1d2d3d", label: "Published" },
-  failed: { bg: "#f5e7e7", color: "#7a3030", label: "Failed" },
+  processing: { bg: "#dde1e4", color: "#3c454b", label: "Processing" },
+  published: { bg: "#e1f2e5", color: "#206b35", label: "Published" },
+  // Label spells out that this needs the account owner, not just "Needs
+  // action" — see statusHint() below for the per-platform explanation of
+  // what exactly they need to do.
+  needs_user_action: { bg: "#fdf0cd", color: "#7a5a00", label: "Needs owner action" },
+  failed: { bg: "#f8dcdc", color: "#8a1f1f", label: "Failed" },
 };
+
+// Short "what to do" text shown next to the status wherever it's
+// displayed, keyed by status then by platform (falling back to
+// "default") — a status like needs_user_action means something different
+// depending on which platform/flow put the job there.
+const STATUS_HINTS = {
+  needs_user_action: {
+    tiktok:
+      "The video is in TikTok's inbox — open the TikTok app, tap the notification, and post it from there. It can take a few minutes to appear.",
+    default: "Waiting on the account owner to finish this from the platform's own app.",
+  },
+};
+function statusHint(job) {
+  const forStatus = STATUS_HINTS[job.status];
+  if (!forStatus) return null;
+  return forStatus[job.platform] || forStatus.default || null;
+}
 
 const QUEUE_FILTERS = [
   { id: "all", label: "All" },
   { id: "scheduled", label: "Scheduled" },
   { id: "queued", label: "Queued" },
   { id: "published", label: "Published" },
+  { id: "needs_user_action", label: "Needs owner action" },
   { id: "failed", label: "Failed" },
 ];
 
@@ -1061,7 +1092,14 @@ function renderCalendar() {
                         const s = statusStyle(j.status);
                         const cap = j.caption || "(no caption)";
                         const short = cap.length > 26 ? cap.slice(0, 26) + "…" : cap;
-                        return `<div class="job-chip" style="background:${s.bg};color:${s.color};" title="${escapeHtml(cap)}">
+                        // No room for the status word or the hint text in
+                        // this tiny chip — both still reach the viewer via
+                        // the hover tooltip (the chip's color alone is
+                        // never the only signal, per the status pill
+                        // elsewhere on this screen).
+                        const hint = statusHint(j);
+                        const tooltip = `${cap} — ${s.label}${hint ? ": " + hint : ""}`;
+                        return `<div class="job-chip" style="background:${s.bg};color:${s.color};" title="${escapeHtml(tooltip)}">
                           <span class="letter">${escapeHtml(platformLetter(j.platform))}</span>
                           <span class="caption">${escapeHtml(short)}</span>
                         </div>`;
@@ -1099,7 +1137,14 @@ function renderCalendar() {
               <div class="agenda-row">
                 <div class="agenda-time">${escapeHtml(fmtTimeLabel(jobDate(j)))}</div>
                 <div class="platform-box">${escapeHtml(platformLetter(j.platform))}</div>
-                <div class="agenda-caption">${escapeHtml(j.caption || "(no caption)")}</div>
+                <div class="agenda-caption">
+                  <div class="agenda-caption-text">${escapeHtml(j.caption || "(no caption)")}</div>
+                  ${
+                    statusHint(j)
+                      ? `<div class="agenda-hint" title="${escapeHtml(statusHint(j))}">${escapeHtml(statusHint(j))}</div>`
+                      : ""
+                  }
+                </div>
                 <div class="agenda-client">${escapeHtml(j.client_name || "—")}</div>
                 <div class="status-pill" style="background:${s.bg};color:${s.color};">${escapeHtml(s.label)}</div>
               </div>`;
@@ -1160,6 +1205,11 @@ function renderQueue() {
             ${
               j.status === "failed" && j.error_message
                 ? `<div style="color:#7a3030;font-size:11.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(j.error_message)}">${escapeHtml(j.error_message)}</div>`
+                : ""
+            }
+            ${
+              statusHint(j)
+                ? `<div style="color:var(--muted);font-size:11.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(statusHint(j))}">${escapeHtml(statusHint(j))}</div>`
                 : ""
             }
           </td>

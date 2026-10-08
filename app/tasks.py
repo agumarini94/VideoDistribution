@@ -270,7 +270,18 @@ def publish_job(self, job_id: int) -> None:
         else:
             _persist_refreshed_credentials(db, job, result)
             _persist_external_id(job, result)
-            job.status = JobStatus.PUBLISHED
+            # A publisher can report success without the content actually
+            # being live yet — e.g. app/publishers/tiktok.py's inbox-upload
+            # flow uploads the video but leaves it as a draft in the
+            # account's TikTok inbox until the owner manually posts it
+            # (video.upload-only permission, not a Sandbox limitation — see
+            # that module's docstring). result["requires_user_action"] is
+            # how a publisher signals that (Phase 34), so the status
+            # reflects reality instead of claiming PUBLISHED prematurely.
+            if result.get("requires_user_action"):
+                job.status = JobStatus.NEEDS_USER_ACTION
+            else:
+                job.status = JobStatus.PUBLISHED
             db.commit()
     finally:
         db.close()
@@ -478,6 +489,17 @@ def handle_tiktok_webhook_event(webhook_event_id: int) -> None:
     doesn't match any Job, is left as an audit-only row: already logged by
     the endpoint's 200 response, nothing more to do here — TikTok must not
     be made to retry something we can't resolve.
+
+    A success event is what promotes a job out of
+    JobStatus.NEEDS_USER_ACTION (Phase 34, publish_job's inbox-upload
+    outcome) to PUBLISHED, once TikTok confirms the account owner actually
+    posted the draft. **Not yet reachable in practice as of Phase 34**: the
+    callback URL for this endpoint still hasn't been registered in the
+    TikTok Developer Portal (see Phase 10b's "what remains" note in
+    CLAUDE.md), so no real webhook call has been observed and
+    NEEDS_USER_ACTION jobs currently just stay in that state indefinitely
+    until the callback is registered — this handler is ready for that, not
+    yet exercised by it.
     """
     db = SessionLocal()
     try:
@@ -518,9 +540,12 @@ def handle_tiktok_webhook_event(webhook_event_id: int) -> None:
                 f"Reason: {fail_reason}"
             )
         elif outcome == "success":
-            # Idempotent: publish_job already set PUBLISHED right after the
-            # upload succeeded (see publish_job above). This webhook is
-            # TikTok's own later confirmation. Never resurrect a job a
+            # Idempotent either way. Usually this promotes a job from
+            # NEEDS_USER_ACTION (publish_job's inbox-upload outcome, Phase
+            # 34) to PUBLISHED — TikTok's confirmation that the account
+            # owner actually posted the draft. If the job was already
+            # PUBLISHED (e.g. a future Direct Post job, or a replayed
+            # event), this is a harmless no-op. Never resurrect a job a
             # failure event (or anything else) already marked FAILED.
             if job.status != JobStatus.FAILED:
                 job.status = JobStatus.PUBLISHED

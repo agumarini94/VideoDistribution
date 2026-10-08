@@ -176,21 +176,44 @@ class JobStatus(str, enum.Enum):
     """
     States of the job's state machine.
 
-    scheduled  -> job created for a future time slot (scheduled_at set);
-                  waiting for the dispatch_due_jobs Beat task to claim it
-                  once scheduled_at is due. Skipped entirely for urgent jobs.
-    queued     -> ready for a worker to pick it up right now.
-    processing -> a worker is attempting to publish it right now.
-    published  -> published successfully. Terminal state.
-    failed     -> retries were exhausted (transient error) or the error was
-                  permanent. Terminal state; the job is also routed to the
-                  dead-letter queue for manual review.
+    scheduled           -> job created for a future time slot (scheduled_at
+                            set); waiting for the dispatch_due_jobs Beat task
+                            to claim it once scheduled_at is due. Skipped
+                            entirely for urgent jobs.
+    queued              -> ready for a worker to pick it up right now.
+    processing          -> a worker is attempting to publish it right now.
+    published           -> published successfully. Terminal state.
+    needs_user_action    -> (Phase 34) the engine's part is done, but the
+                            content isn't actually live yet — the account
+                            owner still has to do something on the
+                            platform's own app/site to finish it. First (and
+                            so far only) user: app/publishers/tiktok.py's
+                            inbox-upload flow, which uploads a video but
+                            leaves it as a draft in the user's TikTok inbox
+                            because this app only holds the video.upload
+                            permission, not video.publish (Direct Post) —
+                            see that module's docstring, this is NOT a
+                            Sandbox limitation. Not a terminal state in the
+                            strict sense: app/tasks.py::handle_tiktok_webhook_event
+                            promotes it to published once TikTok confirms the
+                            user actually posted it — though as of this
+                            phase that webhook isn't registered in the
+                            Developer Portal yet, so that promotion doesn't
+                            happen automatically in practice (see Phase 10b/
+                            34 notes in CLAUDE.md). Jobs published before
+                            this phase existed were left as published, not
+                            backfilled.
+    failed              -> retries were exhausted (transient error) or the
+                            error was permanent. Terminal state; the job is
+                            also routed to the dead-letter queue for manual
+                            review.
     """
 
     SCHEDULED = "scheduled"
     QUEUED = "queued"
     PROCESSING = "processing"
     PUBLISHED = "published"
+    NEEDS_USER_ACTION = "needs_user_action"
     FAILED = "failed"
 
 

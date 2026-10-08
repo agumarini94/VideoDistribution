@@ -98,6 +98,20 @@ class TestSuccessEvent:
         db_session.refresh(job)
         assert job.status == JobStatus.PUBLISHED
 
+    def test_promotes_needs_user_action_job_to_published(self, db_session, alert):
+        # The real-world case (Phase 34): publish_job leaves an inbox-upload
+        # job in NEEDS_USER_ACTION because the account owner still has to
+        # post the draft from the TikTok app. This event is TikTok's
+        # confirmation that they actually did, so it promotes the job the
+        # rest of the way to PUBLISHED.
+        job = _make_job(db_session, status=JobStatus.NEEDS_USER_ACTION)
+        event = _make_event(db_session, "video.publish.completed", publish_id=job.external_id)
+
+        tasks.handle_tiktok_webhook_event(event.id)
+
+        db_session.refresh(job)
+        assert job.status == JobStatus.PUBLISHED
+
 
 class TestNoOpCases:
     def test_unknown_publish_id_is_a_noop(self, db_session, alert):
