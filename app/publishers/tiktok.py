@@ -82,6 +82,11 @@ _TRANSIENT_TOKEN_ERROR_CODES = {"server_error", "temporarily_unavailable"}
 _INBOX_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
 _DIRECT_POST_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"  # not used yet, see above
 
+# Status-check endpoint, same for both inbox and Direct Post flows. publish()
+# does NOT call this — see fetch_post_status below for why that's a real gap,
+# not just an oversight.
+_STATUS_FETCH_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
+
 # TikTok's chunking rules: chunk_size must be between 5 MB and 64 MB, except
 # when the whole video is under 5 MB, which uploads as a single chunk equal
 # to its full size.
@@ -245,6 +250,42 @@ def _raise_for_api_error(response: requests.Response, context: str) -> dict:
         raise PermanentError(f"TikTok API rejected the request {context} (code={code}): {message}")
 
     return body
+
+
+def fetch_post_status(access_token: str, publish_id: str) -> dict:
+    """
+    Queries POST /v2/post/publish/status/fetch/ for the real, current status
+    of a previously-initiated upload (publish_id — see _init_upload's
+    response, persisted onto Job.external_id by
+    app/tasks.py::_persist_external_id).
+
+    NOT called anywhere in publish()'s own flow, which is a real gap, not
+    an oversight: publish() returns success (and app/tasks.py marks the job
+    PUBLISHED) as soon as every chunk's PUT to upload_url acks 2xx — that
+    only confirms TikTok received the bytes, not that it finished
+    processing them, nor (in Sandbox/inbox mode, see module docstring) that
+    the account owner has actually opened the TikTok app and posted the
+    draft. A job sitting at PUBLISHED here can still be unfinished,
+    rejected, or just waiting in the user's inbox from TikTok's point of
+    view — this function (and scripts/check_tiktok_status.py, which calls
+    it) exists to let a human check the real status after the fact,
+    independent of this project's own job-status column.
+
+    Response shape (developers.tiktok.com/doc/content-posting-api-reference-get-content-posting-status)
+    is unverified against a live account — flagged the same way as every
+    other not-yet-exercised TikTok endpoint in this module. Returns the
+    parsed "data" object untouched; the documented "status" values include
+    PROCESSING_DOWNLOAD, PROCESSING_UPLOAD, SEND_TO_USER_INBOX (inbox
+    uploads land here once ready — still just a draft, not a live post),
+    PUBLISH_COMPLETE and FAILED (with a "fail_reason" alongside it) — treat
+    any other value defensively, the same spirit as
+    app/webhooks/tiktok.py::classify_event's substring matching for an
+    unsettled event-naming scheme.
+    """
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"}
+    response = requests.post(_STATUS_FETCH_URL, headers=headers, json={"publish_id": publish_id}, timeout=30)
+    result = _raise_for_api_error(response, "fetching post status")
+    return result.get("data") or {}
 
 
 def _raise_for_token_error(response: requests.Response, context: str) -> dict:
