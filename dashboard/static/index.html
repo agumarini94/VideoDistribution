@@ -1253,6 +1253,23 @@ function renderQueue() {
 // Render: Connected accounts (basic — no handle field / onboarding yet)
 // ---------------------------------------------------------------------
 
+function accountIdentityHtml(a) {
+  // Phase 35: the social network's own identity for this account, distinct
+  // from a.name (our internal label — see app/models.py's
+  // Account.display_name/handle docstring). Both null for an account
+  // connected before this phase, or one whose platform doesn't implement
+  // fetch_account_identity (facebook/instagram) — render nothing rather
+  // than an empty line or a literal "null"/"undefined".
+  if (!a.display_name && !a.handle) return "";
+  const parts = [];
+  if (a.display_name) parts.push(escapeHtml(a.display_name));
+  // YouTube's customUrl already comes "@"-prefixed from the API; X's/
+  // TikTok's/Pinterest's/Threads' username fields never do — only add our
+  // own "@" when the value doesn't already have one, so it never doubles up.
+  if (a.handle) parts.push(escapeHtml(a.handle.startsWith("@") ? a.handle : `@${a.handle}`));
+  return `<div class="account-sub">${parts.join(" · ")}</div>`;
+}
+
 function renderAccounts() {
   // Self-service connect (Phase 29a YouTube, Phase 29b Twitter/X, Phase 29c
   // TikTok, Phase 29d Facebook + Instagram, Phase 29e Pinterest, Phase 29f
@@ -1291,6 +1308,7 @@ function renderAccounts() {
             <div class="platform-box" style="width:24px;height:24px;">${escapeHtml(platformLetter(a.platform))}</div>
             <div style="flex:1;">
               <div class="account-name">${escapeHtml(a.name)} <span class="muted" style="color:var(--muted);font-size:11px;">· ${escapeHtml(platformLabel(a.platform))}</span></div>
+              ${accountIdentityHtml(a)}
               <div class="account-sub">${escapeHtml(a.client_name || "No client workspace")}</div>
             </div>
             <div class="status-pill" style="background:${a.is_active ? "#eef6ff" : "#f5e7e7"};color:${a.is_active ? "#2c455d" : "#7a3030"};">${a.is_active ? "Active" : "Inactive"}</div>

@@ -338,6 +338,32 @@ def _publish_container(credentials: dict, creation_id: str) -> str:
     return thread_id
 
 
+def fetch_account_identity(credentials: dict) -> dict:
+    """
+    Looks up the just-connected Threads profile's own display name/username
+    (GET /me, same call as _fetch_own_profile uses during the OAuth exchange
+    itself, plus the "name" field) right after a successful OAuth exchange,
+    so dashboard/api.py can show the real connected profile instead of just
+    the internal Account.name (Phase 35). Covered by the already-requested
+    threads_basic scope — no scope change needed.
+
+    Never called from publish() or the refresh paths; a failure here is the
+    caller's (dashboard/api.py) problem to log and ignore, not a reason to
+    fail the OAuth connection — see its docstring. A second /me call right
+    after exchange_code_for_credentials's own (which only asked for
+    "id,username") is a deliberate, small redundancy rather than special-
+    casing this one platform's callback to reuse that earlier result — every
+    other platform's fetch_account_identity also does its own fresh lookup.
+    """
+    access_token = str(credentials.get("access_token", "")).strip()
+    if not access_token:
+        raise PermanentError("Missing access_token; cannot look up the Threads account identity.")
+
+    response = requests.get(f"{_API_BASE}/me", params={"fields": "name,username", "access_token": access_token}, timeout=30)
+    body = raise_for_graph_error(response, "looking up the authorized Threads profile")
+    return {"display_name": body.get("name"), "handle": body.get("username")}
+
+
 def token_expires_within(credentials: dict, seconds: int) -> bool:
     """
     True if `credentials` (an Account.credentials dict) has no usable

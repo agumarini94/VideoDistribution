@@ -374,3 +374,42 @@ class TestWebOAuthFlow:
 
         with pytest.raises(PermanentError):
             threads_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback")
+
+
+class TestFetchAccountIdentity:
+    """
+    Phase 35: fetch_account_identity (GET /me?fields=name,username), called
+    by dashboard/api.py right after a successful OAuth connect/reconnect —
+    never by publish() or the refresh paths. A separate call from the one
+    exchange_code_for_credentials already makes (which only asks for
+    "id,username") — see the function's docstring for why.
+    """
+
+    def test_missing_access_token_is_permanent(self):
+        with pytest.raises(PermanentError):
+            threads_publisher.fetch_account_identity({})
+
+    @responses.activate
+    def test_happy_path(self):
+        responses.add(responses.GET, _ME_URL, json={"id": THREADS_USER_ID, "name": "Acme Co", "username": "acme"}, status=200)
+
+        identity = threads_publisher.fetch_account_identity(CREDENTIALS)
+
+        assert identity == {"display_name": "Acme Co", "handle": "acme"}
+
+    @responses.activate
+    def test_code_190_raises_permanent(self):
+        responses.add(
+            responses.GET,
+            _ME_URL,
+            json={"error": {"message": "invalid token", "code": 190}},
+            status=400,
+        )
+        with pytest.raises(PermanentError):
+            threads_publisher.fetch_account_identity(CREDENTIALS)
+
+    @responses.activate
+    def test_http_500_raises_transient(self):
+        responses.add(responses.GET, _ME_URL, json={"error": {"message": "oops", "code": 2}}, status=500)
+        with pytest.raises(TransientError):
+            threads_publisher.fetch_account_identity(CREDENTIALS)

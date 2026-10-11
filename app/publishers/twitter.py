@@ -143,6 +143,11 @@ _FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
 AUTHORIZE_URL = "https://twitter.com/i/oauth2/authorize"
 _OAUTH_SCOPES = "tweet.read tweet.write users.read offline.access media.write"
 
+# GET /2/users/me (Phase 35, fetch_account_identity below) — covered by the
+# users.read scope already requested above, so no scope change was needed
+# for this phase.
+_USERS_ME_URL = "https://api.twitter.com/2/users/me"
+
 # error codes from the OAuth 2.0 token endpoint worth retrying (transient on
 # X's side); everything else (e.g. invalid_grant for a revoked/expired or
 # already-used refresh token) is permanent. Same convention as
@@ -508,6 +513,35 @@ def _raise_for_media_error(response: requests.Response, context: str) -> dict:
     except ValueError:
         # APPEND normally answers with an empty 2xx body; nothing to parse.
         return {}
+
+
+def fetch_account_identity(credentials: dict) -> dict:
+    """
+    Looks up the just-connected X account's own display name/username
+    (GET /2/users/me) right after a successful OAuth exchange, so
+    dashboard/api.py can show the real connected handle instead of just the
+    internal Account.name (Phase 35). Covered by the already-requested
+    users.read scope — no scope change needed.
+
+    Never called from publish() or the refresh paths; a failure here is the
+    caller's (dashboard/api.py) problem to log and ignore, not a reason to
+    fail the OAuth connection — see its docstring.
+    """
+    access_token = str(credentials.get("access_token", "")).strip()
+    if not access_token:
+        raise PermanentError("Missing access_token; cannot look up the X account identity.")
+
+    response = requests.get(_USERS_ME_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+    error = _classify_response_error(response.status_code, response.headers, response.text, "looking up the authorized account")
+    if error is not None:
+        raise error
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise TransientError(f"X users/me endpoint returned a non-JSON response: {exc}") from exc
+
+    data = body.get("data") or {}
+    return {"display_name": data.get("name"), "handle": data.get("username")}
 
 
 def _raise_for_token_error(response: requests.Response, context: str) -> dict:

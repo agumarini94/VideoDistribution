@@ -104,6 +104,12 @@ _DIRECT_POST_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/
 # not just an oversight.
 _STATUS_FETCH_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 
+# User Info endpoint (Phase 35) — covered by the user.info.basic scope
+# already requested in SCOPES above (TikTok's Login Kit requires it
+# alongside video.upload regardless, see SCOPES's comment), so no scope
+# change was needed for this phase.
+_USER_INFO_URL = "https://open.tiktokapis.com/v2/user/info/"
+
 # TikTok's chunking rules: chunk_size must be between 5 MB and 64 MB, except
 # when the whole video is under 5 MB, which uploads as a single chunk equal
 # to its full size.
@@ -312,6 +318,31 @@ def fetch_post_status(access_token: str, publish_id: str) -> dict:
     response = requests.post(_STATUS_FETCH_URL, headers=headers, json={"publish_id": publish_id}, timeout=30)
     result = _raise_for_api_error(response, "fetching post status")
     return result.get("data") or {}
+
+
+def fetch_account_identity(credentials: dict) -> dict:
+    """
+    Looks up the just-connected TikTok account's own display_name/username
+    (GET /v2/user/info/) right after a successful OAuth exchange, so
+    dashboard/api.py can show the real connected account instead of just
+    the internal Account.name (Phase 35). Covered by the already-requested
+    user.info.basic scope — no scope change needed.
+
+    Never called from publish() or the refresh paths; a failure here is the
+    caller's (dashboard/api.py) problem to log and ignore, not a reason to
+    fail the OAuth connection — see its docstring.
+    """
+    access_token = str(credentials.get("access_token", "")).strip()
+    if not access_token:
+        raise PermanentError("Missing access_token; cannot look up the TikTok account identity.")
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(
+        _USER_INFO_URL, headers=headers, params={"fields": "open_id,display_name,username"}, timeout=30
+    )
+    result = _raise_for_api_error(response, "looking up the authorized account")
+    user = (result.get("data") or {}).get("user") or {}
+    return {"display_name": user.get("display_name"), "handle": user.get("username")}
 
 
 def _raise_for_token_error(response: requests.Response, context: str) -> dict:

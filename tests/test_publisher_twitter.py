@@ -323,3 +323,44 @@ class TestWebOAuthFlow:
 
         with pytest.raises(PermanentError, match="invalid_grant"):
             twitter_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+
+class TestFetchAccountIdentity:
+    """
+    Phase 35: fetch_account_identity (GET /2/users/me), called by
+    dashboard/api.py right after a successful OAuth connect/reconnect —
+    never by publish() or the refresh paths.
+    """
+
+    _USERS_ME_URL = "https://api.twitter.com/2/users/me"
+
+    def test_missing_access_token_is_permanent(self):
+        with pytest.raises(PermanentError):
+            twitter_publisher.fetch_account_identity({})
+
+    @responses.activate
+    def test_happy_path(self):
+        responses.add(
+            responses.GET,
+            self._USERS_ME_URL,
+            json={"data": {"id": "123", "name": "Acme Co", "username": "acmeco"}},
+            status=200,
+        )
+
+        identity = twitter_publisher.fetch_account_identity({"access_token": "acc-token"})
+
+        assert identity == {"display_name": "Acme Co", "handle": "acmeco"}
+        request = responses.calls[0].request
+        assert request.headers["Authorization"] == "Bearer acc-token"
+
+    @responses.activate
+    def test_http_401_raises(self):
+        responses.add(responses.GET, self._USERS_ME_URL, status=401)
+        with pytest.raises(PermanentError):
+            twitter_publisher.fetch_account_identity({"access_token": "acc-token"})
+
+    @responses.activate
+    def test_http_500_raises_transient(self):
+        responses.add(responses.GET, self._USERS_ME_URL, status=500)
+        with pytest.raises(TransientError):
+            twitter_publisher.fetch_account_identity({"access_token": "acc-token"})

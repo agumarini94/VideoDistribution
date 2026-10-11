@@ -421,6 +421,42 @@ def exchange_code_for_credentials(code: str, redirect_uri: str, code_verifier: s
     return json.loads(flow.credentials.to_json())
 
 
+def fetch_account_identity(credentials: dict) -> dict:
+    """
+    Looks up the just-connected YouTube channel's own display name/handle
+    (channels.list, mine=true) right after a successful OAuth exchange, so
+    dashboard/api.py can show the real connected channel instead of just the
+    internal Account.name (Phase 35). The broader "youtube" scope already
+    requested in SCOPES above (needed since Phase 15 for playlistItems.insert)
+    already covers this read — no scope change needed; an account whose
+    stored credentials only hold the older "youtube.upload" scope (never
+    re-authorized since Phase 15) will fail this lookup the same way it
+    already fails playlist assignment, which is fine: the caller
+    (dashboard/api.py) treats any failure here as "no identity available",
+    never as a reason to fail the connection itself.
+
+    Never called from publish() or the refresh paths — those use
+    _load_credentials' single-account/multi-account branching, which this
+    function doesn't need: it's only ever invoked right after a web-flow
+    OAuth exchange, where `credentials` is always a full Credentials.to_json()
+    -shaped dict (see exchange_code_for_credentials above), never None.
+    """
+    try:
+        creds = Credentials.from_authorized_user_info(credentials, SCOPES)
+        youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+        response = youtube.channels().list(part="snippet", mine=True).execute()
+    except HttpError as exc:
+        raise _classify_http_error(exc) from exc
+    except Exception as exc:
+        raise PermanentError(f"Failed to look up the authorized YouTube channel: {exc}") from exc
+
+    items = response.get("items") or []
+    if not items:
+        return {"display_name": None, "handle": None}
+    snippet = items[0].get("snippet") or {}
+    return {"display_name": snippet.get("title"), "handle": snippet.get("customUrl")}
+
+
 def _classify_http_error(exc: HttpError) -> PublishError:
     status = exc.resp.status if exc.resp is not None else None
     reason = _extract_reason(exc)

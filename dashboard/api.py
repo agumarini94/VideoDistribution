@@ -515,6 +515,12 @@ class AccountOut(BaseModel):
     created_at: str
     client_id: int | None
     client_name: str | None
+    # The social network's own identity for this account (Phase 35) — see
+    # app/models.py's Account.display_name/handle docstring. Both null for
+    # an account connected before this phase, or one whose platform doesn't
+    # implement fetch_account_identity (facebook/instagram).
+    display_name: str | None
+    handle: str | None
     # Deliberately no credentials field: this response is served to the
     # browser, and Account.credentials holds live OAuth tokens / API
     # secrets (see app/models.py) that must never leave the server.
@@ -529,6 +535,8 @@ class AccountOut(BaseModel):
             created_at=account.created_at.isoformat(),
             client_id=account.client_id,
             client_name=client_name,
+            display_name=account.display_name,
+            handle=account.handle,
         )
 
 
@@ -768,6 +776,39 @@ def auth_me(request: Request = None, db: Session = Depends(get_db)):
     return MeOut(authenticated=True, role=auth.role, client_id=auth.client_id, client_name=client_name, email=auth.email)
 
 
+def _fetch_and_store_identity(account: Account, publisher_module, credentials: dict) -> None:
+    """
+    Best-effort (Phase 35): looks up the social network's own display name/
+    handle for a just-connected (or reconnected) account via the
+    publisher's fetch_account_identity(credentials), and sets them on the
+    Account row — so Connected Accounts can show more than just the
+    internal Account.name (see app/models.py's Account.display_name/handle
+    docstring). Called from every "Connect ..." OAuth callback below except
+    Meta's (facebook/instagram): Meta already stores a real Page name on
+    the credentials dict itself, so it was left out of this phase's scope.
+
+    Never raises, and never breaks the connection: any failure (network,
+    missing/insufficient scope on an older token, an unexpected response
+    shape) is logged as a warning and both fields are set to None, per this
+    phase's explicit instruction — a client_user should never see their
+    "Connect ..." click fail just because this secondary lookup didn't work.
+    Does not commit — same transaction-boundary convention as
+    scripts/add_account.py::upsert_account; the caller commits once,
+    alongside account.client_id.
+    """
+    try:
+        identity = publisher_module.fetch_account_identity(credentials)
+    except Exception as exc:
+        logger.warning(
+            "Failed to fetch %s account identity for Account %r: %s", account.platform, account.name, exc
+        )
+        account.display_name = None
+        account.handle = None
+        return
+    account.display_name = identity.get("display_name")
+    account.handle = identity.get("handle")
+
+
 @app.get("/api/oauth/youtube/start")
 def youtube_oauth_start(request: Request = None):
     """
@@ -860,6 +901,7 @@ def youtube_oauth_callback(
 
     account, _action = upsert_account(db, "youtube", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
+    _fetch_and_store_identity(account, youtube_publisher, credentials)
     db.commit()
 
     return RedirectResponse("/dashboard/?screen=accounts&youtube_connect=success")
@@ -979,6 +1021,7 @@ def twitter_oauth_callback(
 
     account, _action = upsert_account(db, "twitter", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
+    _fetch_and_store_identity(account, twitter_publisher, credentials)
     db.commit()
 
     return RedirectResponse("/dashboard/?screen=accounts&twitter_connect=success")
@@ -1069,6 +1112,7 @@ def tiktok_oauth_callback(
 
     account, _action = upsert_account(db, "tiktok", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
+    _fetch_and_store_identity(account, tiktok_publisher, credentials)
     db.commit()
 
     return RedirectResponse("/dashboard/?screen=accounts&tiktok_connect=success")
@@ -1279,6 +1323,7 @@ def pinterest_oauth_callback(
 
     account, _action = upsert_account(db, "pinterest", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
+    _fetch_and_store_identity(account, pinterest_publisher, credentials)
     db.commit()
 
     return RedirectResponse("/dashboard/?screen=accounts&pinterest_connect=success")
@@ -1349,6 +1394,7 @@ def threads_oauth_callback(
 
     account, _action = upsert_account(db, "threads", f"{client.name} (self-service)", credentials)
     account.client_id = client.id
+    _fetch_and_store_identity(account, threads_publisher, credentials)
     db.commit()
 
     return RedirectResponse("/dashboard/?screen=accounts&threads_connect=success")
@@ -1717,6 +1763,12 @@ def disconnect_account(account_id: int, request: Request = None, db: Session = D
 
     account.is_active = False
     account.credentials = {}
+    # Clear the platform identity too (Phase 35) — it was looked up from
+    # those now-cleared credentials and would otherwise keep showing a
+    # stale @handle/display name for an account that's no longer actually
+    # connected. Reconnecting re-populates it via _fetch_and_store_identity.
+    account.display_name = None
+    account.handle = None
     db.commit()
     db.refresh(account)
 

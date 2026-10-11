@@ -2985,6 +2985,154 @@ unit-tested without Redis or a worker running.
      persists correctly onto the `Account` row
      (`scripts/show_accounts.py`).
 
+### Phase 35 (current)
+- **Connected Accounts shows the real platform identity, not just our
+  internal label** — resolves the gap flagged back in Phase 26 ("Connected
+  accounts' @handle display — `Account` has no handle field, only name").
+  Scoped to the five platforms with a self-service OAuth flow that this
+  phase could reach directly: youtube, twitter, tiktok, pinterest, threads.
+  Facebook/Instagram (Meta) were left out on purpose — `meta.py`'s OAuth
+  callback already stores a real Page name (`page_name`) on the
+  credentials dict itself, so there was nothing missing to fetch there.
+- **`app/models.py::Account.display_name` / `Account.handle`** (new
+  columns, both nullable `String(255)`) — the social network's own display
+  name / @handle for the account, distinct from `Account.name` (our
+  internal label, e.g. the self-service `"<Client name> (self-service)"`
+  convention from Phase 29a-f). Both null for every account connected
+  before this phase, and for facebook/instagram (not in scope this phase).
+  **Manual schema step**, same pattern as every prior additive column
+  (`account_id` Phase 6, `external_id` Phase 10b, `last_stall_alert_at`
+  Phase 14, `client_id` Phase 26, `is_active` Phase 32): `init_db()`'s
+  `create_all` won't add these to the existing `accounts` table on an
+  existing Neon database. Run once, by hand, against Neon:
+  ```sql
+  ALTER TABLE accounts ADD COLUMN display_name VARCHAR(255);
+  ALTER TABLE accounts ADD COLUMN handle VARCHAR(255);
+  ```
+- **`fetch_account_identity(credentials) -> {"display_name", "handle"}`** —
+  one new pure function per publisher (`app/publishers/{youtube,twitter,
+  tiktok,pinterest,threads}.py`), same contract everywhere: takes the same
+  credentials dict shape the platform's own `exchange_code_for_credentials`
+  returns, looks up the account's own profile, and returns a dict with
+  both keys (either can be `None` if the platform's response doesn't carry
+  it). Never called from `publish()` or the refresh paths — only from
+  `dashboard/api.py`'s OAuth callbacks, right after a successful connect or
+  reconnect.
+  - **youtube.py**: `channels.list(part="snippet", mine=True)` ->
+    `snippet.title` (display name) / `snippet.customUrl` (handle, often
+    already `@`-prefixed by YouTube itself, so the frontend does not add
+    its own `@` for a value that already starts with one — see
+    `accountIdentityHtml` below). Covered by the broad `"youtube"` scope
+    already requested since Phase 15 (needed for `playlistItems.insert`) —
+    **no scope change needed**; an account stuck on the older
+    `youtube.upload`-only scope (never re-authorized since Phase 15) fails
+    this lookup the same way it already fails playlist assignment, which
+    `_fetch_and_store_identity` (below) just treats as "no identity
+    available," not an error.
+  - **twitter.py**: `GET /2/users/me` -> `data.name` / `data.username`.
+    Covered by the `users.read` scope already requested since Phase 21 —
+    **no scope change needed**.
+  - **tiktok.py**: `GET /v2/user/info/` (`fields=open_id,display_name,
+    username`) -> `data.user.display_name` / `data.user.username`. Covered
+    by the `user.info.basic` scope already requested since Phase 10 (TikTok
+    Login Kit requires it alongside `video.upload` regardless) — **no
+    scope change needed**.
+  - **pinterest.py**: `GET /v5/user_account` -> `business_name` (falls back
+    to `username` when absent — Pinterest only sets `business_name` for
+    Business accounts) / `username`. **Scope change needed and made**:
+    `_OAUTH_SCOPES` gained `user_accounts:read` (was `boards:read,
+    pins:write` only) — this endpoint checks that scope specifically and
+    403s without it. Same reconnect caveat as Twitter's `media.write`
+    addition (Phase 29b): **an account connected before this phase only
+    holds the original two scopes and must reconnect** ("Connect Pinterest"
+    again) to pick up `user_accounts:read` — there's no way to add a scope
+    to an already-issued token pair.
+  - **threads.py**: `GET /me` (`fields=name,username`) -> `name` / `username`.
+    Covered by the `threads_basic` scope already requested since Phase 29f
+    — **no scope change needed**. A second `/me` call, deliberately not
+    folded into `exchange_code_for_credentials`'s own earlier `/me` lookup
+    (which only asks for `id,username`, during the OAuth exchange itself)
+    — kept as its own fresh call for the same reason every other
+    platform's `fetch_account_identity` is its own fresh call: consistency
+    over micro-optimizing away one cheap, infrequent GET.
+  - Facebook/Instagram: **not built this phase** — `meta.py` has no
+    `fetch_account_identity`; see above for why.
+- **`dashboard/api.py::_fetch_and_store_identity(account, publisher_module,
+  credentials)`** — the one place that calls the five functions above,
+  wired into `youtube_oauth_callback`/`twitter_oauth_callback`/
+  `tiktok_oauth_callback`/`pinterest_oauth_callback`/`threads_oauth_callback`
+  right after `upsert_account`, before the single `db.commit()` each
+  callback already made. **Never breaks the connection**: any failure
+  (network error, an older token missing a newly-required scope, an
+  unexpected response shape) is caught, logged as a `logger.warning`, and
+  both fields are set to `None` — per this phase's explicit instruction, a
+  `client_user` should never see their "Connect ..." click fail just
+  because this secondary lookup didn't work. Not wired into
+  `meta_oauth_callback` (out of scope, see above).
+- **`AccountOut`** (`dashboard/api.py`) gained `display_name`/`handle`
+  (both `str | None`, always present in the response shape, just possibly
+  `null`) — returned by `GET /api/accounts` and
+  `POST /api/accounts/{id}/disconnect` exactly like every other field on
+  that model; no new endpoint needed. `credentials` itself is still never
+  serialized, as before.
+- **Disconnect clears the identity too** (`disconnect_account`, Phase 33) —
+  `display_name`/`handle` are reset to `None` alongside `is_active=False`
+  and `credentials={}`, since they were looked up from those now-cleared
+  credentials and would otherwise keep showing a stale identity for an
+  account that's no longer actually connected. Reconnecting re-populates
+  them via `_fetch_and_store_identity`, same as any other reconnect.
+- **Frontend** (`dashboard/static/index.html`) — `accountIdentityHtml(a)`
+  renders a second line under the account name/platform in
+  `renderAccounts()`'s account-row list: `display_name`, a `·` separator,
+  then `@handle` (the `@` is only added by this function when `a.handle`
+  doesn't already start with one — YouTube's `customUrl` already comes
+  `@`-prefixed from the API, while X's/TikTok's/Pinterest's/Threads'
+  `username` fields never do). Renders nothing at all when both are
+  `null` — an account connected before this phase, or a facebook/instagram
+  account, shows exactly as it did before this phase, no empty line, no
+  literal `"null"`/`"undefined"`.
+- **No backfill performed, and no backfill script built this phase** —
+  every account connected before this phase (and every facebook/instagram
+  account) simply has `display_name`/`handle` both `null` until the owning
+  `client_user` reconnects it from the dashboard (the self-service naming
+  convention means reconnecting rotates the same `Account` row in place,
+  per Phase 29a-d/33 — it does not create a duplicate). This was a
+  deliberate choice flagged back to the client per point 4 of this phase's
+  brief rather than decided unilaterally: a one-off backfill script could
+  call each active account's `fetch_account_identity` directly and write
+  the result without a full reconnect, but it wasn't requested or built.
+- Covered by a new `TestFetchAccountIdentity` class in each of
+  `tests/test_publisher_youtube.py` (API mocked via an in-memory fake
+  `channels()` service plus a monkeypatched `Credentials.
+  from_authorized_user_info`, same spirit as `TestShortsValidation`/
+  `TestPlaylistAssignment`; happy path, no-channel-items, and an `HttpError`
+  classified the same way `publish()`'s own errors are), `tests/
+  test_publisher_twitter.py`, `tests/test_publisher_tiktok.py` and `tests/
+  test_publisher_pinterest.py` (`responses`-mocked HTTP: happy path, a
+  missing/blank access token, HTTP 401/500 classification; Pinterest's
+  business-name-vs-username-fallback branch gets its own two cases), and
+  `tests/test_publisher_threads.py` (happy path, missing access token, and
+  Graph API's `code=190`/5xx classification via the shared `meta.py::
+  raise_for_graph_error`). Each `tests/test_dashboard_{youtube,twitter,
+  tiktok,pinterest,threads}_oauth.py` gained an autouse fixture stubbing
+  `fetch_account_identity` to a fixed successful identity (so no existing
+  test in those files accidentally makes a real HTTP/Google-API call), an
+  extension of the existing happy-path test asserting the stubbed identity
+  landed on the `Account` row, and a new `TestAccountIdentity` class
+  asserting a `fetch_account_identity` failure still leaves the connection
+  successful with both fields `null`. `tests/
+  test_dashboard_accounts_disconnect.py` gained `display_name`/`handle`
+  assertions on its happy-path disconnect test (both cleared, in the DB row
+  and the response) and the new fields to its exact-response-keys
+  assertion. Whole suite green (`.venv/bin/python -m pytest -q` -> 548
+  passed).
+- **Not built / out of scope**: facebook/instagram identity lookup (see
+  above), any backfill mechanism for already-connected accounts (see
+  above — explicitly left for the client to decide), and showing this
+  identity anywhere besides the Connected Accounts screen (e.g. the
+  Composer's account picker, the Clients screen's per-client account
+  count) — those still show/key off `Account.name` exactly as before.
+
 ## Monitoring dashboard (extra, not in the spec)
 
 - `dashboard/` — a monitoring dashboard for the engine, plus (Phase 10b)

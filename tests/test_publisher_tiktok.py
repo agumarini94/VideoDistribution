@@ -214,3 +214,47 @@ class TestWebOAuthFlow:
 
         with pytest.raises(PermanentError):
             tiktok_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+
+class TestFetchAccountIdentity:
+    """
+    Phase 35: fetch_account_identity (GET /v2/user/info/), called by
+    dashboard/api.py right after a successful OAuth connect/reconnect —
+    never by publish() or the refresh paths.
+    """
+
+    def test_blank_access_token_is_permanent(self):
+        with pytest.raises(PermanentError):
+            tiktok_publisher.fetch_account_identity({"access_token": ""})
+
+    @responses.activate
+    def test_happy_path(self):
+        responses.add(
+            responses.GET,
+            tiktok_publisher._USER_INFO_URL,
+            json={"data": {"user": {"open_id": "abc", "display_name": "Acme Co", "username": "acmeco"}}},
+            status=200,
+        )
+
+        identity = tiktok_publisher.fetch_account_identity({"access_token": "acc-token"})
+
+        assert identity == {"display_name": "Acme Co", "handle": "acmeco"}
+        request = responses.calls[0].request
+        assert request.headers["Authorization"] == "Bearer acc-token"
+
+    @responses.activate
+    def test_http_401_raises_permanent(self):
+        responses.add(responses.GET, tiktok_publisher._USER_INFO_URL, status=401)
+        with pytest.raises(PermanentError):
+            tiktok_publisher.fetch_account_identity({"access_token": "acc-token"})
+
+    @responses.activate
+    def test_nested_error_code_raises(self):
+        responses.add(
+            responses.GET,
+            tiktok_publisher._USER_INFO_URL,
+            json={"error": {"code": "invalid_param", "message": "bad fields"}},
+            status=200,
+        )
+        with pytest.raises(PermanentError):
+            tiktok_publisher.fetch_account_identity({"access_token": "acc-token"})

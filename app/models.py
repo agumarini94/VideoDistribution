@@ -107,6 +107,26 @@ class Account(Base):
         ForeignKey("clients.id"), nullable=True
     )
 
+    # The *social network's own* identity for this account (Phase 35) —
+    # distinct from `name` above, which is an internal label we chose (e.g.
+    # "Main brand account" or the self-service "<Client name> (self-service)"
+    # convention from Phase 29a-f) and tells accounts apart in this app, not
+    # what the account is actually called on the platform. Resolves the gap
+    # flagged back in Phase 26 ("Connected accounts' @handle display — Account
+    # has no handle field, only name"). Populated best-effort right after a
+    # successful OAuth connect/reconnect by each publisher's
+    # fetch_account_identity() (see app/publishers/*.py and
+    # dashboard/api.py's OAuth callbacks) — never by publish() or any
+    # refresh path, and never required: a lookup failure leaves both null and
+    # only logs a warning (see dashboard/api.py), it never breaks the
+    # connection itself. Both null for every account connected before this
+    # phase, and for any account whose platform doesn't implement
+    # fetch_account_identity yet (facebook/instagram — Meta already stores a
+    # Page name on the credentials dict directly, so it was left out of this
+    # phase's scope).
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    handle: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

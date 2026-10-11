@@ -46,13 +46,23 @@ def _make_client_user(db_session, client_row, email="user@acme.test", password="
     return user
 
 
-def _make_account(db_session, client_row, platform="youtube", name="Acme Co (self-service)", credentials=None):
+def _make_account(
+    db_session,
+    client_row,
+    platform="youtube",
+    name="Acme Co (self-service)",
+    credentials=None,
+    display_name=None,
+    handle=None,
+):
     account = Account(
         platform=platform,
         name=name,
         credentials=credentials if credentials is not None else {"token": "secret-token", "refresh_token": "secret-refresh"},
         client_id=client_row.id if client_row else None,
         is_active=True,
+        display_name=display_name,
+        handle=handle,
     )
     db_session.add(account)
     db_session.commit()
@@ -68,7 +78,7 @@ class TestDisconnectHappyPath:
     def test_disconnect_clears_credentials_and_deactivates(self, client, db_session):
         acme = _make_client(db_session)
         _make_client_user(db_session, acme)
-        account = _make_account(db_session, acme)
+        account = _make_account(db_session, acme, display_name="Acme Co", handle="acmeco")
         _login(client, "user@acme.test", "password123")
 
         resp = client.post(f"/api/accounts/{account.id}/disconnect")
@@ -79,10 +89,18 @@ class TestDisconnectHappyPath:
         # its own docstring — so the API response itself can't reveal
         # whether they were cleared; assert against the DB row directly.
         assert "credentials" not in body
+        # display_name/handle (Phase 35) are cleared too — both in the
+        # response and the DB row — since they were looked up from the
+        # now-cleared credentials and would otherwise keep showing a stale
+        # identity for an account that's no longer actually connected.
+        assert body["display_name"] is None
+        assert body["handle"] is None
 
         db_session.refresh(account)
         assert account.is_active is False
         assert account.credentials == {}
+        assert account.display_name is None
+        assert account.handle is None
 
     def test_disconnect_response_has_no_credentials_field(self, client, db_session):
         acme = _make_client(db_session)
@@ -100,6 +118,8 @@ class TestDisconnectHappyPath:
             "created_at",
             "client_id",
             "client_name",
+            "display_name",
+            "handle",
         }
 
 

@@ -40,9 +40,23 @@ _FAKE_CREDENTIALS = {
 }
 
 
+_FAKE_IDENTITY = {"display_name": "Acme Co", "handle": "@acmeco"}
+
+
 @pytest.fixture(autouse=True)
 def _no_real_dispatch(monkeypatch):
     monkeypatch.setattr(dashboard_api.publish_job, "delay", lambda job_id: None)
+
+
+@pytest.fixture(autouse=True)
+def _stub_identity_lookup(monkeypatch):
+    # Phase 35: every callback test below exercises the real
+    # exchange->upsert_account path, which now also calls
+    # youtube_publisher.fetch_account_identity(credentials) — stub it to a
+    # fixed, successful identity by default so no test here accidentally
+    # makes a real googleapiclient HTTP call. See TestAccountIdentity below
+    # for the failure-doesn't-break-the-connection case, which overrides this.
+    monkeypatch.setattr(dashboard_api.youtube_publisher, "fetch_account_identity", lambda credentials: dict(_FAKE_IDENTITY))
 
 
 @pytest.fixture
@@ -200,6 +214,8 @@ class TestCallbackRoute:
         account = db_session.query(Account).filter(Account.platform == "youtube", Account.client_id == c.id).one()
         assert account.credentials == _FAKE_CREDENTIALS
         assert account.is_active is True
+        assert account.display_name == _FAKE_IDENTITY["display_name"]
+        assert account.handle == _FAKE_IDENTITY["handle"]
 
     def test_reconnecting_rotates_existing_account_instead_of_duplicating(self, client, db_session, monkeypatch):
         c = _make_client(db_session, name="Bloom Studio")
@@ -243,3 +259,36 @@ class TestCallbackRoute:
         )
         assert "reason=exchange_failed" in resp.headers["location"]
         assert db_session.query(Account).filter(Account.platform == "youtube").count() == 0
+
+
+class TestAccountIdentity:
+    """
+    Phase 35: fetch_account_identity is called right after exchange, but a
+    failure there must never break the connection itself — see
+    dashboard/api.py::_fetch_and_store_identity's docstring.
+    """
+
+    def test_identity_lookup_failure_still_creates_the_account(self, client, db_session, monkeypatch):
+        c = _make_client(db_session, name="Bloom Studio")
+        state = create_oauth_state_token({"client_id": c.id, "user_id": 1, "code_verifier": "verifier123"})
+
+        monkeypatch.setattr(
+            dashboard_api.youtube_publisher, "exchange_code_for_credentials", lambda *a, **k: dict(_FAKE_CREDENTIALS)
+        )
+
+        def failing_fetch_account_identity(credentials):
+            raise RuntimeError("insufficient scope")
+
+        monkeypatch.setattr(dashboard_api.youtube_publisher, "fetch_account_identity", failing_fetch_account_identity)
+
+        resp = client.get(
+            "/api/oauth/youtube/callback",
+            params={"code": "auth-code", "state": state},
+            follow_redirects=False,
+        )
+        assert "youtube_connect=success" in resp.headers["location"]
+
+        account = db_session.query(Account).filter(Account.platform == "youtube", Account.client_id == c.id).one()
+        assert account.is_active is True
+        assert account.display_name is None
+        assert account.handle is None

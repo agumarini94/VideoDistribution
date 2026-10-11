@@ -478,3 +478,58 @@ class TestWebOAuthFlow:
         )
         with pytest.raises(PermanentError, match="invalid_grant"):
             pinterest_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback")
+
+
+class TestFetchAccountIdentity:
+    """
+    Phase 35: fetch_account_identity (GET /v5/user_account), called by
+    dashboard/api.py right after a successful OAuth connect/reconnect —
+    never by publish() or the refresh paths. Needs the user_accounts:read
+    scope added to _OAUTH_SCOPES this same phase.
+    """
+
+    _USER_ACCOUNT_URL = f"{pinterest_publisher._API_BASE}/user_account"
+
+    def test_no_account_credentials_is_permanent(self):
+        with pytest.raises(PermanentError):
+            pinterest_publisher.fetch_account_identity(None)
+
+    @responses.activate
+    def test_happy_path_business_account_uses_business_name(self):
+        responses.add(
+            responses.GET,
+            self._USER_ACCOUNT_URL,
+            json={"username": "acmeco", "business_name": "Acme Co", "account_type": "BUSINESS"},
+            status=200,
+        )
+
+        identity = pinterest_publisher.fetch_account_identity({"access_token": "acc-token"})
+
+        assert identity == {"display_name": "Acme Co", "handle": "acmeco"}
+        request = responses.calls[0].request
+        assert request.headers["Authorization"] == "Bearer acc-token"
+
+    @responses.activate
+    def test_personal_account_falls_back_to_username(self):
+        responses.add(
+            responses.GET,
+            self._USER_ACCOUNT_URL,
+            json={"username": "acmeco", "account_type": "PINNER"},
+            status=200,
+        )
+
+        identity = pinterest_publisher.fetch_account_identity({"access_token": "acc-token"})
+
+        assert identity == {"display_name": "acmeco", "handle": "acmeco"}
+
+    @responses.activate
+    def test_http_401_raises_permanent(self):
+        responses.add(responses.GET, self._USER_ACCOUNT_URL, status=401)
+        with pytest.raises(PermanentError):
+            pinterest_publisher.fetch_account_identity({"access_token": "acc-token"})
+
+    @responses.activate
+    def test_http_500_raises_transient(self):
+        responses.add(responses.GET, self._USER_ACCOUNT_URL, status=500)
+        with pytest.raises(TransientError):
+            pinterest_publisher.fetch_account_identity({"access_token": "acc-token"})

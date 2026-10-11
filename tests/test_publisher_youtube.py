@@ -265,3 +265,65 @@ class TestWebOAuthFlow:
 
         with pytest.raises(PermanentError):
             youtube_publisher.exchange_code_for_credentials("auth-code", "http://localhost/callback", "verifier123")
+
+
+class _FakeChannelsResource:
+    def __init__(self, items):
+        self._items = items
+
+    def list(self, part, mine):
+        return _Execute(result={"items": self._items})
+
+
+class _FakeChannelsService:
+    def __init__(self, items):
+        self._channels = _FakeChannelsResource(items)
+
+    def channels(self):
+        return self._channels
+
+
+class TestFetchAccountIdentity:
+    """
+    Phase 35: fetch_account_identity (channels.list, mine=true), called by
+    dashboard/api.py right after a successful OAuth connect/reconnect —
+    never by publish() or the refresh paths. Credential loading
+    (Credentials.from_authorized_user_info) and the API itself (build) are
+    both monkeypatched, same spirit as TestShortsValidation/
+    TestPlaylistAssignment above.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_from_authorized_user_info(self, monkeypatch):
+        monkeypatch.setattr(
+            youtube_publisher.Credentials, "from_authorized_user_info", staticmethod(lambda info, scopes: _FakeCredentials())
+        )
+
+    def test_happy_path(self, monkeypatch):
+        fake_service = _FakeChannelsService([{"snippet": {"title": "Acme Co", "customUrl": "@acmeco"}}])
+        monkeypatch.setattr(youtube_publisher, "build", lambda *a, **k: fake_service)
+
+        identity = youtube_publisher.fetch_account_identity({"token": "abc"})
+
+        assert identity == {"display_name": "Acme Co", "handle": "@acmeco"}
+
+    def test_no_channel_items_returns_none_values(self, monkeypatch):
+        fake_service = _FakeChannelsService([])
+        monkeypatch.setattr(youtube_publisher, "build", lambda *a, **k: fake_service)
+
+        identity = youtube_publisher.fetch_account_identity({"token": "abc"})
+
+        assert identity == {"display_name": None, "handle": None}
+
+    def test_http_error_is_classified(self, monkeypatch):
+        import httplib2
+        from googleapiclient.errors import HttpError
+
+        class _FailingChannelsService:
+            def channels(self):
+                raise HttpError(httplib2.Response({"status": 403}), b'{"error": {"errors": [{"reason": "insufficientPermissions"}]}}')
+
+        monkeypatch.setattr(youtube_publisher, "build", lambda *a, **k: _FailingChannelsService())
+
+        with pytest.raises(PermanentError):
+            youtube_publisher.fetch_account_identity({"token": "abc"})

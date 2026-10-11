@@ -125,7 +125,15 @@ _FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded"}
 # Confirmed per CLAUDE.md Phase 29e point 1: minimal scopes only — reading
 # (public) boards and creating (public) pins. Not boards:read_secret or
 # pins:read — neither is needed by anything this module does.
-_OAUTH_SCOPES = "boards:read,pins:write"
+#
+# user_accounts:read (added Phase 35): GET /v5/user_account (
+# fetch_account_identity below) checks this scope specifically, separate
+# from boards:read/pins:write — without it the call 403s. Accounts
+# connected before this phase only hold the original two scopes and must
+# reconnect ("Connect Pinterest" again) to pick it up; there's no way to add
+# a scope to an already-issued access/refresh token pair short of a fresh
+# authorization (same caveat as Twitter's media.write addition, Phase 29b).
+_OAUTH_SCOPES = "boards:read,pins:write,user_accounts:read"
 
 # How often / how long to poll GET /v5/media/{id} while Pinterest processes
 # an uploaded video, before giving up — same constants/semantics as
@@ -425,6 +433,33 @@ def list_boards(credentials: dict) -> list[dict]:
         if not bookmark:
             break
     return boards
+
+
+def fetch_account_identity(credentials: dict) -> dict:
+    """
+    Looks up the just-connected Pinterest account's own display name/
+    username (GET /v5/user_account) right after a successful OAuth exchange,
+    so dashboard/api.py can show the real connected account instead of just
+    the internal Account.name (Phase 35). Needs the user_accounts:read scope
+    added to _OAUTH_SCOPES above this same phase — see its comment for the
+    reconnect caveat.
+
+    Never called from publish() or the refresh paths; a failure here is the
+    caller's (dashboard/api.py) problem to log and ignore, not a reason to
+    fail the OAuth connection — see its docstring. Like list_boards, a 401
+    here raises the default PermanentError, not TokenExpiredError: this
+    isn't part of the publish/retry pipeline.
+
+    Pinterest's /v5/user_account response has no single "display name"
+    field the way YouTube's/X's/TikTok's does — "business_name" is the
+    closest equivalent, but only present for business accounts, so it falls
+    back to "username" (same value as "handle" below) when absent.
+    """
+    values = _resolve_credentials(credentials)
+    response = requests.get(f"{_API_BASE}/user_account", headers=_auth_headers(values["access_token"]), timeout=30)
+    body = _raise_for_api_error(response, "looking up the authorized account")
+    username = body.get("username")
+    return {"display_name": body.get("business_name") or username, "handle": username}
 
 
 def token_expires_within(credentials: dict, seconds: int) -> bool:
