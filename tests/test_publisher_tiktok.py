@@ -229,18 +229,25 @@ class TestFetchAccountIdentity:
 
     @responses.activate
     def test_happy_path(self):
+        # "username" is deliberately NOT requested (and not in this mocked
+        # response either) — it requires the user.info.profile scope, which
+        # this app doesn't have; requesting it 401s the whole call instead
+        # of just omitting that one field. See fetch_account_identity's
+        # docstring. handle is therefore always None for TikTok.
         responses.add(
             responses.GET,
             tiktok_publisher._USER_INFO_URL,
-            json={"data": {"user": {"open_id": "abc", "display_name": "Acme Co", "username": "acmeco"}}},
+            json={"data": {"user": {"open_id": "abc", "display_name": "Acme Co", "avatar_url": "https://example.com/a.jpg"}}},
             status=200,
         )
 
         identity = tiktok_publisher.fetch_account_identity({"access_token": "acc-token"})
 
-        assert identity == {"display_name": "Acme Co", "handle": "acmeco"}
+        assert identity == {"display_name": "Acme Co", "handle": None}
         request = responses.calls[0].request
         assert request.headers["Authorization"] == "Bearer acc-token"
+        assert "fields=open_id%2Cdisplay_name%2Cavatar_url" in request.url
+        assert "username" not in request.url
 
     @responses.activate
     def test_http_401_raises_permanent(self):

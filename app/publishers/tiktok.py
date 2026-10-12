@@ -322,15 +322,19 @@ def fetch_post_status(access_token: str, publish_id: str) -> dict:
 
 def fetch_account_identity(credentials: dict) -> dict:
     """
-    Looks up the just-connected TikTok account's own display_name/username
+    Looks up the just-connected TikTok account's own display_name
     (GET /v2/user/info/) right after a successful OAuth exchange, so
     dashboard/api.py can show the real connected account instead of just
-    the internal Account.name (Phase 35). Covered by the already-requested
-    user.info.basic scope — no scope change needed.
+    the internal Account.name (Phase 35).
 
-    Never called from publish() or the refresh paths; a failure here is the
-    caller's (dashboard/api.py) problem to log and ignore, not a reason to
-    fail the OAuth connection — see its docstring.
+    Only requests open_id, display_name and avatar_url — the fields covered
+    by the already-granted user.info.basic scope. "username" was requested
+    here originally, but that field requires the separate user.info.profile
+    scope, which this app doesn't have; asking for it made the whole
+    request 401 with scope_not_authorized, so TikTok never returns even the
+    fields we are allowed to see. Fixed by dropping "username" from the
+    request. There is therefore no handle available for TikTok — "handle"
+    is always None here, deliberately, not a bug.
     """
     access_token = str(credentials.get("access_token", "")).strip()
     if not access_token:
@@ -338,11 +342,11 @@ def fetch_account_identity(credentials: dict) -> dict:
 
     headers = {"Authorization": f"Bearer {access_token}"}
     response = requests.get(
-        _USER_INFO_URL, headers=headers, params={"fields": "open_id,display_name,username"}, timeout=30
+        _USER_INFO_URL, headers=headers, params={"fields": "open_id,display_name,avatar_url"}, timeout=30
     )
     result = _raise_for_api_error(response, "looking up the authorized account")
     user = (result.get("data") or {}).get("user") or {}
-    return {"display_name": user.get("display_name"), "handle": user.get("username")}
+    return {"display_name": user.get("display_name"), "handle": None}
 
 
 def _raise_for_token_error(response: requests.Response, context: str) -> dict:

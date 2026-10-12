@@ -3033,10 +3033,22 @@ unit-tested without Redis or a worker running.
     Covered by the `users.read` scope already requested since Phase 21 —
     **no scope change needed**.
   - **tiktok.py**: `GET /v2/user/info/` (`fields=open_id,display_name,
-    username`) -> `data.user.display_name` / `data.user.username`. Covered
-    by the `user.info.basic` scope already requested since Phase 10 (TikTok
-    Login Kit requires it alongside `video.upload` regardless) — **no
-    scope change needed**.
+    avatar_url`) -> `data.user.display_name`; `handle` is always `None`.
+    **Corrected post-launch, same day**: originally also requested
+    `username` (for `handle`), but that field requires the separate
+    `user.info.profile` scope, which this app doesn't have — TikTok
+    rejects the whole request with `scope_not_authorized` (HTTP 401) when
+    any requested field needs a scope not granted, so asking for `username`
+    lost `display_name` too, not just the handle. Fixed by requesting only
+    the `user.info.basic`-scoped fields (`open_id,display_name,avatar_url`)
+    — the scope already requested since Phase 10 (TikTok Login Kit requires
+    it alongside `video.upload` regardless) — **no scope change needed**,
+    and `fetch_account_identity` now always returns `handle: None` for
+    TikTok rather than attempting it. `accountIdentityHtml` (`dashboard/
+    static/index.html`) already falls back to showing `display_name` alone
+    when `handle` is absent, so no frontend logic change was needed beyond
+    updating its comment — a TikTok row simply never has a second `@handle`
+    segment.
   - **pinterest.py**: `GET /v5/user_account` -> `business_name` (falls back
     to `username` when absent — Pinterest only sets `business_name` for
     Business accounts) / `username`. **Scope change needed and made**:
@@ -3132,6 +3144,90 @@ unit-tested without Redis or a worker running.
   identity anywhere besides the Connected Accounts screen (e.g. the
   Composer's account picker, the Clients screen's per-client account
   count) — those still show/key off `Account.name` exactly as before.
+
+### Phase 36 (current)
+- **Self-service "Remove" on Connected Accounts** — the destructive
+  counterpart to Phase 33's "Disconnect": once an account is already
+  disconnected (`is_active=False`), a `client_user` (or an admin) can now
+  permanently delete the `Account` row itself, not just deactivate it.
+- **`DELETE /api/accounts/{account_id}`** (`dashboard/api.py::delete_account`)
+  — unlike `disconnect_account` (client_user-only), this route is open to
+  **either** the owning `client_user` **or** an admin (Basic-Auth "ops" or
+  an admin `User` session) — an admin should be able to clean up a dead/
+  duplicate account on a client's behalf, since nothing about actually
+  destroying the row requires being scoped to that `Client` the way the
+  OAuth `/start` routes are. Anonymous gets the usual `401` (this path
+  isn't in `_PUBLIC_API_PATHS`); a `client_user` on another client's
+  account, or on an unscoped (`client_id=None`) one, gets `403`; an unknown
+  id gets `404`.
+  - **Blocked while any job is still in flight**: `_PENDING_JOB_STATUSES`
+    (`SCHEDULED`/`QUEUED`/`PROCESSING`) — a `409` naming how many pending
+    jobs exist ("Hay N publicaciones pendiente(s)..."), for both a
+    `client_user` and an admin alike, so the caller has a clear, actionable
+    fix (cancel them, or wait) instead of pulling credentials out from
+    under a job that might still need them mid-publish.
+  - **Decision made explicitly, per this phase's instruction, before
+    writing any code**: what to do with jobs that already finished
+    (`PUBLISHED`/`FAILED`/`NEEDS_USER_ACTION`) on the account being
+    deleted. Chose **unlink** (`Job.account_id = None`) over a logical
+    delete on the `Account` itself, for three reasons:
+    1. `Job.account_id` is already nullable and already means "no account
+       on record" for jobs that never had one (Phase 6) — reusing that
+       same meaning for "the account was later deleted" is a small
+       extension of an existing concept, not a new one.
+    2. `JobOut` (`dashboard/api.py`) has never surfaced `account_id`/
+       account name to the frontend at all — no currently-displayed job
+       history actually depends on the link surviving, so unlinking loses
+       nothing visible in the UI. `job.status`/`payload`/`error_message`/
+       timestamps are all untouched.
+    3. A logical-delete flag on `Account` (e.g. `deleted_at`) would
+       duplicate `is_active`'s existing job — Phase 33's "Disconnect"
+       already marks an account "gone" from the product's point of view —
+       while forcing every account listing/lookup in `dashboard/api.py` to
+       start filtering it out, for a "Remove" action whose entire point
+       (per the frontend's "No se puede deshacer" confirmation) is to be
+       irreversible anyway. It would also contradict the literal ask: a
+       `DELETE` that doesn't actually delete the row.
+    Practically, this isn't just a style choice: `Job.account_id`'s
+    `ForeignKey("accounts.id")` has no `ondelete=...`, so Postgres would
+    `RESTRICT` the `DELETE` outright if any `Job` row still pointed at
+    this `Account` — unlinking finished jobs first is required for the row
+    to actually delete, not optional.
+  - Implementation: a single `UPDATE jobs SET account_id = NULL WHERE
+    account_id = :id` (via `Query.update`, no per-row Python loop) right
+    before `db.delete(account)`, both committed together. Response
+    (`AccountDeleteOut`): `{id, deleted: true, jobs_unlinked: <n>}` — the
+    unlink count is returned so the frontend/caller can see it happened,
+    not just infer it.
+- **Frontend** (`dashboard/static/index.html`) — a "Remove" button next to
+  each **inactive** connected account in `renderAccounts()`'s account-row
+  list (the mirror image of "Disconnect", which only shows for an active
+  one — the two buttons are never both visible on the same row), shown
+  only for a `client_user` session (same `canConnectPlatforms` check
+  "Disconnect"/"Connect ..." already use — an admin manages this via the
+  API directly for now, no admin-facing button was added to this screen).
+  `removeAccount(id)` prompts `window.confirm("¿Eliminar esta cuenta? No se
+  puede deshacer.")` before firing `DELETE /api/accounts/{id}`, then
+  reloads via `loadAccounts()` — a `409` (pending jobs) surfaces
+  `fetchJson`'s error `detail` verbatim through the same `alert(...)` style
+  every other destructive action in this file already uses.
+- **Tests** — `tests/test_dashboard_accounts_delete.py` (FastAPI
+  `TestClient`, same reasoning as `tests/test_dashboard_accounts_disconnect.py`:
+  ownership scoping and the pending-jobs block are middleware + route-level
+  behavior). Covers: the happy path for a client_user, for admin Basic-Auth,
+  and for an admin `User` session, each actually removing the row; every
+  terminal status (`PUBLISHED`/`FAILED`/`NEEDS_USER_ACTION`) unlinking its
+  job (`account_id` -> `None`, status/payload unchanged) while the account
+  still deletes; every pending status (`SCHEDULED`/`QUEUED`/`PROCESSING`)
+  blocking with `409` and leaving the account untouched — for both a
+  client_user and an admin, and for a mix of one pending + one finished job
+  on the same account; and permissions (anonymous `401`, cross-tenant and
+  unscoped-account `403`, unknown id `404`). Whole suite green
+  (`.venv/bin/python -m pytest -q` -> 563 passed).
+- **Not built** (out of scope, follow-up candidate): a "Remove" affordance
+  for an admin in the dashboard UI itself (the endpoint already supports
+  it; only the frontend button is client_user-gated) — not added since the
+  phase brief scoped the UI change to the self-service flow.
 
 ## Monitoring dashboard (extra, not in the spec)
 

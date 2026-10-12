@@ -664,6 +664,25 @@ async function disconnectAccount(id) {
   }
 }
 
+async function removeAccount(id) {
+  // Phase 36 — the destructive counterpart to disconnectAccount above; see
+  // dashboard/api.py::delete_account. Only ever offered (below, in
+  // renderAccounts) once an account is already Inactive, so by the time
+  // this fires credentials are already cleared — this just permanently
+  // removes the row. A 409 here (pending/scheduled jobs still on this
+  // account) surfaces fetchJson's error detail verbatim via the alert
+  // below, same as every other action in this file.
+  if (!window.confirm("¿Eliminar esta cuenta? No se puede deshacer.")) {
+    return;
+  }
+  try {
+    await fetchJson(`/api/accounts/${id}`, { method: "DELETE" });
+    await loadAccounts();
+  } catch (e) {
+    alert(`Could not remove account: ${e.message}`);
+  }
+}
+
 async function logout() {
   try {
     await fetchJson("/api/auth/logout", { method: "POST" });
@@ -1264,8 +1283,11 @@ function accountIdentityHtml(a) {
   const parts = [];
   if (a.display_name) parts.push(escapeHtml(a.display_name));
   // YouTube's customUrl already comes "@"-prefixed from the API; X's/
-  // TikTok's/Pinterest's/Threads' username fields never do — only add our
-  // own "@" when the value doesn't already have one, so it never doubles up.
+  // Pinterest's/Threads' username fields never do — only add our own "@"
+  // when the value doesn't already have one, so it never doubles up.
+  // TikTok's handle is always null (fetch_account_identity only requests
+  // the user.info.basic-scoped fields, which don't include username — see
+  // its docstring), so a TikTok row falls through to display_name alone.
   if (a.handle) parts.push(escapeHtml(a.handle.startsWith("@") ? a.handle : `@${a.handle}`));
   return `<div class="account-sub">${parts.join(" · ")}</div>`;
 }
@@ -1315,6 +1337,11 @@ function renderAccounts() {
             ${
               canConnectPlatforms && a.is_active
                 ? `<button type="button" class="btn-secondary" data-disconnect-account="${a.id}" style="color:#7a3030;margin-left:10px;">Disconnect</button>`
+                : ""
+            }
+            ${
+              canConnectPlatforms && !a.is_active
+                ? `<button type="button" class="btn-secondary" data-remove-account="${a.id}" style="color:#7a3030;margin-left:10px;">Remove</button>`
                 : ""
             }
           </div>`
@@ -2063,6 +2090,9 @@ function renderContent() {
       el.innerHTML = renderAccounts();
       el.querySelectorAll("[data-disconnect-account]").forEach((btn) => {
         btn.addEventListener("click", () => disconnectAccount(Number(btn.getAttribute("data-disconnect-account"))));
+      });
+      el.querySelectorAll("[data-remove-account]").forEach((btn) => {
+        btn.addEventListener("click", () => removeAccount(Number(btn.getAttribute("data-remove-account"))));
       });
       break;
     case "approvals":

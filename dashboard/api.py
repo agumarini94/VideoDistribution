@@ -540,6 +540,12 @@ class AccountOut(BaseModel):
         )
 
 
+class AccountDeleteOut(BaseModel):
+    id: int
+    deleted: bool
+    jobs_unlinked: int
+
+
 class JobCreateOut(BaseModel):
     id: int
 
@@ -1774,6 +1780,92 @@ def disconnect_account(account_id: int, request: Request = None, db: Session = D
 
     client_name = db.get(Client, account.client_id).name if account.client_id is not None else None
     return AccountOut.from_account(account, client_name)
+
+
+# Jobs still in flight for an Account — a delete must never pull credentials
+# out from under one of these (see delete_account below). PUBLISHED/
+# NEEDS_USER_ACTION/FAILED are deliberately NOT here: they're terminal from
+# the engine's point of view (no more retries, no more credential use), so
+# they don't block deletion — they just get unlinked instead.
+_PENDING_JOB_STATUSES = (JobStatus.SCHEDULED, JobStatus.QUEUED, JobStatus.PROCESSING)
+
+
+@app.delete("/api/accounts/{account_id}", response_model=AccountDeleteOut)
+def delete_account(account_id: int, request: Request = None, db: Session = Depends(get_db)):
+    """
+    Permanently deletes an Account row (Phase 36) — the destructive
+    counterpart to disconnect_account (Phase 33), which only deactivates.
+    Owning client_user OR admin (Basic-Auth "ops" or an admin User session)
+    — unlike disconnect (client_user-only), an admin should be able to
+    clean up a dead/duplicate account on a client's behalf, since nothing
+    about actually destroying the row requires being scoped to that
+    Client. Anonymous gets enforce_auth's usual 401 (this path isn't in
+    _PUBLIC_API_PATHS).
+
+    **Blocked while any job is still in flight**
+    (SCHEDULED/QUEUED/PROCESSING, see _PENDING_JOB_STATUSES): a 409 naming
+    how many, so the caller has a clear, actionable fix (cancel them, or
+    wait for them to finish) rather than deleting credentials a queued
+    job might still need mid-publish, which would turn a clean, expected
+    failure (_resolve_account_credentials already raises PermanentError
+    for a missing Account) into a confusing surprise instead.
+
+    **Finished jobs (PUBLISHED/NEEDS_USER_ACTION/FAILED) are NOT a
+    blocker.** Decision for this phase, made explicitly rather than
+    picked by default — unlink them (Job.account_id = None) rather than
+    soft-deleting the Account itself:
+    - Job.account_id is already nullable and already means "no account on
+      record" for jobs that never had one; reusing that same meaning for
+      "the account was later deleted" is a small extension of an existing
+      concept, not a new one.
+    - JobOut (this file) doesn't surface account_id/name to the frontend
+      at all today — no currently-displayed job history actually depends
+      on the link surviving, so unlinking loses nothing visible.
+    - A logical-delete flag on Account (e.g. deleted_at) would duplicate
+      is_active's existing job — Phase 33's disconnect already marks an
+      account "gone" from the product's point of view — while forcing
+      every account listing/lookup in this file to start filtering it
+      out, for a "Remove" action whose entire point (per the frontend's
+      "No se puede deshacer" confirmation) is to be irreversible anyway.
+    - Practically: Account.id has no ondelete=... on Job.account_id's
+      ForeignKey, so Postgres would RESTRICT the DELETE outright if any
+      Job row still pointed at this Account — unlinking first isn't just
+      a style choice, it's required for the row to actually delete.
+    """
+    auth = _get_auth(request)
+    if auth.role not in ("client_user", "admin"):
+        raise HTTPException(status_code=403, detail="Only the owning client or an admin can delete an account.")
+
+    account = db.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+    if auth.role == "client_user" and account.client_id != auth.client_id:
+        raise HTTPException(status_code=403, detail="Cannot delete another client's account.")
+
+    pending_count = (
+        db.query(func.count(Job.id))
+        .filter(Job.account_id == account_id, Job.status.in_(_PENDING_JOB_STATUSES))
+        .scalar()
+    )
+    if pending_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Hay {pending_count} publicacion{'es' if pending_count != 1 else ''} "
+                "pendiente(s) para esta cuenta; cancelalas (o esperá a que terminen) "
+                "antes de eliminarla."
+            ),
+        )
+
+    jobs_unlinked = (
+        db.query(Job)
+        .filter(Job.account_id == account_id)
+        .update({Job.account_id: None}, synchronize_session=False)
+    )
+    db.delete(account)
+    db.commit()
+
+    return AccountDeleteOut(id=account_id, deleted=True, jobs_unlinked=jobs_unlinked)
 
 
 def _aggregate_client_counts(db: Session) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
