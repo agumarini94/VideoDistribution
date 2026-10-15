@@ -6,6 +6,15 @@ FROM python:3.13-slim
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser
 
+# ffmpeg bundles ffprobe, used by app/media_probe.py (youtube.py's Shorts
+# validation, Phase 15) to inspect a video's duration/dimensions before
+# upload. Single layer, --no-install-recommends, and clearing the apt list
+# cache afterward to avoid inflating the image with package index data that
+# serves no purpose once ffmpeg is installed.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Copy requirements first so `pip install` is only re-run when dependencies

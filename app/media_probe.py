@@ -37,8 +37,8 @@ def probe(path: str) -> dict:
     """
     if shutil.which("ffprobe") is None:
         raise PermanentError(
-            "ffprobe not found on PATH. Install ffmpeg (which bundles ffprobe), "
-            "e.g. `brew install ffmpeg`, to enable video probing."
+            "ffprobe not found on PATH. Install ffmpeg (which bundles ffprobe) "
+            "to enable video probing."
         )
 
     try:
